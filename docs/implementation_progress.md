@@ -166,3 +166,4 @@ Ez a dokumentum a `stylusnote_rendszerterv_v2.txt` alapján készült **17 lép�
   - [x] `AiCopilotExamParserTest` (2)
 - [x] **Műszerezett (`androidTest`) tesztek (`:app:connectedDebugAndroidTest`):** 8/8 teszt sikeres (`25097RP43G - Android 16`, `0` hiba, `0` kihagyás, benne az 5 natív `libink.so` Ink JNI teszttel)
 
+//
