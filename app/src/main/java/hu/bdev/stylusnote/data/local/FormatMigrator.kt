@@ -98,7 +98,7 @@ object FormatMigrator {
             1 -> BrushToolType.BALLPOINT_PEN
             2 -> BrushToolType.PENCIL
             3 -> BrushToolType.HIGHLIGHTER
-            4 -> BrushToolType.LASER
+            4 -> null // Legacy laser pointer retired in Phase II; fall back cleanly
             5 -> BrushToolType.VECTOR_ERASER
             6 -> BrushToolType.PRECISION_ERASER
             7 -> BrushToolType.LASSO
@@ -116,7 +116,6 @@ object FormatMigrator {
         BrushToolType.BALLPOINT_PEN -> 1
         BrushToolType.PENCIL -> 2
         BrushToolType.HIGHLIGHTER -> 3
-        BrushToolType.LASER -> 4
         BrushToolType.VECTOR_ERASER -> 5
         BrushToolType.PRECISION_ERASER -> 6
         BrushToolType.LASSO -> 7

@@ -45,8 +45,8 @@ data class NotebookCover(
     val subtitle: String = ""
 ) {
     companion object {
-        const val DEFAULT_PRIMARY_COLOR_ARGB: Int = 0xFF1F4E79.toInt()
-        const val DEFAULT_SPINE_COLOR_ARGB: Int = 0xFF133352.toInt()
+        const val DEFAULT_PRIMARY_COLOR_ARGB: Int = 0xFFA3ABB2.toInt()
+        const val DEFAULT_SPINE_COLOR_ARGB: Int = 0xFF52585E.toInt()
     }
 }
 

@@ -6,7 +6,11 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
+import android.graphics.Typeface
 import android.graphics.pdf.PdfDocument
+import android.text.Layout
+import android.text.StaticLayout
+import android.text.TextPaint
 import androidx.ink.geometry.MutableVec
 import androidx.ink.strokes.Stroke
 import hu.bdev.stylusnote.core.hardware.StylusPointSample
@@ -87,8 +91,7 @@ object StrokeOutlineExtractor {
                 BrushToolType.FOUNTAIN_PEN -> 0.5f + sample.pressure.coerceIn(0f, 1f) * 0.9f
                 BrushToolType.PENCIL -> (0.7f + (sample.tiltRadians / (PI.toFloat() * 0.5f)) * 0.8f)
                 BrushToolType.BALLPOINT_PEN,
-                BrushToolType.HIGHLIGHTER,
-                BrushToolType.LASER -> 1.0f
+                BrushToolType.HIGHLIGHTER -> 1.0f
                 else -> 1.0f
             }
             return (clampedBase * 0.5f * factor).coerceAtLeast(0.25f)
@@ -398,6 +401,32 @@ class PdfExportManager(
             }
 
             is PageObject.PdfPageRefObject -> Unit
+
+            is PageObject.FormattedTextObject -> {
+                val textPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = obj.canonicalColorArgb
+                    textSize = obj.fontSizePt.coerceIn(10f, 72f)
+                    typeface = Typeface.create("cursive", Typeface.ITALIC)
+                }
+                val layoutWidthPx = (obj.bounds.widthPt - 8f).roundToInt().coerceAtLeast(32)
+                val layout = StaticLayout.Builder
+                    .obtain(obj.text, 0, obj.text.length, textPaint, layoutWidthPx)
+                    .setAlignment(Layout.Alignment.ALIGN_NORMAL)
+                    .setLineSpacing(2f, 1.1f)
+                    .setIncludePad(false)
+                    .build()
+                canvas.save()
+                canvas.translate(obj.bounds.leftPt + 4f, obj.bounds.topPt + 4f)
+                if (abs(obj.rotationRadians) > 1e-4f) {
+                    canvas.rotate(
+                        (obj.rotationRadians * 180.0 / PI).toFloat(),
+                        obj.bounds.widthPt * 0.5f,
+                        obj.bounds.heightPt * 0.5f
+                    )
+                }
+                layout.draw(canvas)
+                canvas.restore()
+            }
         }
     }
 

@@ -2,9 +2,12 @@ package hu.bdev.stylusnote.ui.shelf
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -16,10 +19,12 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
@@ -33,32 +38,39 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.MenuBook
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.BookmarkBorder
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Folder
-import androidx.compose.material.icons.filled.Functions
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Inbox
 import androidx.compose.material.icons.filled.Label
 import androidx.compose.material.icons.filled.LightMode
-import androidx.compose.material.icons.filled.MenuBook
+import androidx.compose.material.icons.filled.MoreHoriz
+import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Splitscreen
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
@@ -82,6 +94,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -89,19 +102,32 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.drawscope.Stroke as ComposeDrawStroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.boundsInParent
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
 import androidx.ink.brush.InputToolType
 import androidx.ink.strokes.MutableStrokeInputBatch
 import androidx.ink.strokes.Stroke
@@ -119,8 +145,10 @@ import hu.bdev.stylusnote.core.math.CanvasTransformMatrix
 import hu.bdev.stylusnote.core.math.DocRect
 import hu.bdev.stylusnote.core.math.OledStrokeRenderCache
 import hu.bdev.stylusnote.core.math.ShapeMeta
+import hu.bdev.stylusnote.core.math.ShapeRecognizer
 import hu.bdev.stylusnote.data.export.ExportablePdfPage
 import hu.bdev.stylusnote.data.export.PdfExportManager
+import hu.bdev.stylusnote.data.export.PdfTileRenderer
 import hu.bdev.stylusnote.data.local.AppDatabase
 import hu.bdev.stylusnote.data.local.BookmarkEntity
 import hu.bdev.stylusnote.data.local.ChapterEntity
@@ -144,27 +172,34 @@ import hu.bdev.stylusnote.domain.model.PaperTemplateType
 import hu.bdev.stylusnote.domain.model.PersistedStrokeRecord
 import hu.bdev.stylusnote.domain.repository.CanvasStateHolder
 import hu.bdev.stylusnote.ui.canvas.DryInkRasterCache
-import hu.bdev.stylusnote.ui.canvas.FunctionPlotterDialog
 import hu.bdev.stylusnote.ui.canvas.HandwritingToLatexConverter
 import hu.bdev.stylusnote.ui.canvas.IndexedDryStroke
-import hu.bdev.stylusnote.ui.canvas.LaserTrailStateHolder
-import hu.bdev.stylusnote.ui.canvas.LatexConversionResult
+import hu.bdev.stylusnote.ui.canvas.LassoAutoFormatResult
+import hu.bdev.stylusnote.ui.canvas.LeftPageDrawerOverlay
+import hu.bdev.stylusnote.ui.canvas.LeftPagePullTab
 import hu.bdev.stylusnote.ui.canvas.PageObjectsOverlayLayer
 import hu.bdev.stylusnote.ui.canvas.StylusDrawingSurface
 import hu.bdev.stylusnote.ui.canvas.computeStrokeDocBounds
+import hu.bdev.stylusnote.ui.theme.StylusIcons
+import hu.bdev.stylusnote.ui.components.AiCopilotScope
 import hu.bdev.stylusnote.ui.components.AiCopilotSheet
+import hu.bdev.stylusnote.ui.components.AiFormattingMode
 import hu.bdev.stylusnote.ui.components.BrushPresetStore
 import hu.bdev.stylusnote.ui.components.BrushSettingsPopover
 import hu.bdev.stylusnote.ui.components.ConsentDialog
-import hu.bdev.stylusnote.ui.components.DockEdge
 import hu.bdev.stylusnote.ui.components.FloatingToolDock
 import hu.bdev.stylusnote.ui.components.PaperSettingsDialog
+import hu.bdev.stylusnote.ui.components.ToolDockPreferencesStore
+import hu.bdev.stylusnote.ui.components.ToolDockPrefs
 import hu.bdev.stylusnote.ui.theme.LocalStylusSurfacePalette
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.UUID
 import kotlin.math.roundToInt
 
@@ -173,57 +208,104 @@ data class OpenedPageTarget(
     val pageId: String
 )
 
-private enum class BookshelfTab(val label: String, val icon: ImageVector) {
-    FOLDERS("Mappák", Icons.Filled.Folder),
-    FAVORITES("Kedvencek", Icons.Filled.Star),
-    BOOKMARKS("Könyvjelzők", Icons.Filled.Bookmark),
-    TAGS("Címkék", Icons.Filled.Label)
+private sealed interface ShelfSidebarSelection {
+    data object All : ShelfSidebarSelection
+    data object Uncategorized : ShelfSidebarSelection
+    data object Bookmarks : ShelfSidebarSelection
+    data class Category(val folderId: String) : ShelfSidebarSelection
 }
 
-private val TAG_PALETTE = listOf(
-    0xFF1E88E5.toInt(),
-    0xFF43A047.toInt(),
-    0xFFE53935.toInt(),
-    0xFFFB8C00.toInt(),
-    0xFF8E24AA.toInt(),
-    0xFF00897B.toInt()
-)
+private enum class ShelfTypeFilter(val label: String) {
+    ALL("MIND"),
+    NOTES("JEGYZET"),
+    PDF("PDF")
+}
+
+private const val DROP_KEY_UNCATEGORIZED = "__UNCATEGORIZED__"
 
 /**
- * Full Bookshelf workspace supporting unlimited nested folders, colored tags, bookmarks,
- * Cover Studio customization, FTS4 accent-insensitive OCR search, and launching single-page or
- * side-by-side Split-Screen editors (Section 8).
+ * Full Bookshelf workspace using StarNote's 2-pane layout: left sidebar with search and
+ * drag-drop categories, and right grid with dashed creation tile and Moleskine notebook cards.
  */
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun BookshelfScreen(
     database: AppDatabase,
     isDarkTheme: Boolean,
     onToggleTheme: () -> Unit,
     onOpenSinglePage: (OpenedPageTarget) -> Unit,
-    onOpenSplitScreen: (OpenedPageTarget, OpenedPageTarget) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+    val surfacePalette = LocalStylusSurfacePalette.current
+    val dateFormatter = remember { SimpleDateFormat("yyyy/MM/dd", Locale.getDefault()) }
 
     val allFolders by database.folderDao().observeAllFolders().collectAsState(initial = emptyList())
     val allNotebooks by database.notebookDao().observeAllNotebooks().collectAsState(initial = emptyList())
     val allTags by database.tagDao().observeAllTags().collectAsState(initial = emptyList())
     val tagLinks by database.tagDao().observeAllNotebookTagLinks().collectAsState(initial = emptyList())
     val allBookmarks by database.bookmarkDao().observeAllBookmarks().collectAsState(initial = emptyList())
+    val pdfNotebookIdList by database.pageDao().observePdfNotebookIds().collectAsState(initial = emptyList())
+    val pdfNotebookIds = remember(pdfNotebookIdList) { pdfNotebookIdList.toSet() }
 
-    var activeTab by remember { mutableStateOf(BookshelfTab.FOLDERS) }
-    var currentFolderId by remember { mutableStateOf<String?>(null) }
-    var selectedTagId by remember { mutableStateOf<String?>(null) }
+    var sidebarSelection by remember { mutableStateOf<ShelfSidebarSelection>(ShelfSidebarSelection.All) }
+    var typeFilter by remember { mutableStateOf(ShelfTypeFilter.ALL) }
     var searchQuery by remember { mutableStateOf("") }
     var ocrHits by remember { mutableStateOf<List<PageSearchHit>>(emptyList()) }
 
     var showNewFolderDialog by remember { mutableStateOf(false) }
-    var showNewTagDialog by remember { mutableStateOf(false) }
     var editingNotebook by remember { mutableStateOf<NotebookEntity?>(null) }
     var creatingNewNotebook by remember { mutableStateOf(false) }
     var inspectingNotebook by remember { mutableStateOf<NotebookEntity?>(null) }
-    var splitPrimaryPending by remember { mutableStateOf<OpenedPageTarget?>(null) }
+    var moveTargetNotebook by remember { mutableStateOf<NotebookEntity?>(null) }
+    var showPdfImportDialog by remember { mutableStateOf(false) }
+    var pdfImportTargetNotebook by remember { mutableStateOf<NotebookEntity?>(null) }
+    var notebookLmExportTarget by remember { mutableStateOf<NotebookEntity?>(null) }
+    var bookPdfExportTarget by remember { mutableStateOf<NotebookEntity?>(null) }
+    var shelfNoticeHu by remember { mutableStateOf<String?>(null) }
+
+    val bookExportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/pdf")
+    ) { uri ->
+        val nb = bookPdfExportTarget
+        bookPdfExportTarget = null
+        if (uri != null && nb != null) {
+            scope.launch(Dispatchers.IO) {
+                val res = runCatching {
+                    val pages = database.pageDao().observePagesForNotebook(nb.id).first()
+                    context.contentResolver.openOutputStream(uri)?.use { out ->
+                        exportNotebookPagesToPdfStream(
+                            context = context,
+                            database = database,
+                            notebook = nb,
+                            pagesToExport = pages,
+                            outputStream = out
+                        )
+                    } ?: error("A célfájl nem írható.")
+                }
+                withContext(Dispatchers.Main) {
+                    shelfNoticeHu = res.fold(
+                        onSuccess = { "PDF sikeresen exportálva: ${nb.title}" },
+                        onFailure = { err -> err.message ?: "Sikertelen PDF export." }
+                    )
+                }
+            }
+        }
+    }
+
+    // Drag-and-drop state for moving notebooks onto sidebar categories or Uncategorized.
+    var rootWindowPos by remember { mutableStateOf(Offset.Zero) }
+    val dropTargetBounds = remember { mutableStateMapOf<String, Rect>() }
+    var draggingNotebook by remember { mutableStateOf<NotebookEntity?>(null) }
+    var dragPointerWindowOffset by remember { mutableStateOf(Offset.Zero) }
+
+    val hoveredDropKey = if (draggingNotebook != null) {
+        dropTargetBounds.entries.firstOrNull { (_, bounds) ->
+            bounds.contains(dragPointerWindowOffset)
+        }?.key
+    } else {
+        null
+    }
 
     LaunchedEffect(searchQuery) {
         ocrHits = if (searchQuery.isBlank()) {
@@ -234,60 +316,55 @@ fun BookshelfScreen(
     }
 
     val folderById = remember(allFolders) { allFolders.associateBy { it.id } }
-    val breadcrumbs = remember(currentFolderId, folderById) {
-        val trail = ArrayList<FolderEntity>()
-        var cursor = currentFolderId
-        var guard = 0
-        while (cursor != null && guard++ < 64) {
-            val folder = folderById[cursor] ?: break
-            trail.add(folder)
-            cursor = folder.parentId
-        }
-        trail.reversed()
-    }
-
-    val childFolders = remember(allFolders, currentFolderId) {
-        allFolders.filter { it.parentId == currentFolderId }
-    }
-
     val tagsByNotebookId = remember(tagLinks, allTags) {
         val tagMap = allTags.associateBy { it.id }
         tagLinks.groupBy { it.notebookId }
             .mapValues { (_, refs) -> refs.mapNotNull { tagMap[it.tagId] } }
     }
 
+    val uncategorizedCount = remember(allNotebooks) {
+        allNotebooks.count { it.folderId == null }
+    }
+    val folderCounts = remember(allNotebooks) {
+        allNotebooks.mapNotNull { it.folderId }.groupingBy { it }.eachCount()
+    }
+
     val visibleNotebooks = remember(
-        activeTab,
-        currentFolderId,
-        selectedTagId,
+        sidebarSelection,
+        typeFilter,
         searchQuery,
         allNotebooks,
-        tagsByNotebookId
+        pdfNotebookIds
     ) {
         val q = searchQuery.trim()
-        val base = if (q.isNotEmpty()) {
+        val scopedBySidebar = if (q.isNotEmpty()) {
             allNotebooks.filter { it.title.contains(q, ignoreCase = true) }
         } else {
-            when (activeTab) {
-                BookshelfTab.FOLDERS -> allNotebooks.filter { it.folderId == currentFolderId }
-                BookshelfTab.FAVORITES -> allNotebooks.filter { it.isFavorite }
-                BookshelfTab.TAGS -> {
-                    val filterTag = selectedTagId
-                    if (filterTag == null) allNotebooks
-                    else allNotebooks.filter { nb ->
-                        tagsByNotebookId[nb.id]?.any { it.id == filterTag } == true
-                    }
-                }
-                BookshelfTab.BOOKMARKS -> allNotebooks
+            when (val sel = sidebarSelection) {
+                ShelfSidebarSelection.All -> allNotebooks
+                ShelfSidebarSelection.Uncategorized -> allNotebooks.filter { it.folderId == null }
+                ShelfSidebarSelection.Bookmarks -> allNotebooks
+                is ShelfSidebarSelection.Category -> allNotebooks.filter { it.folderId == sel.folderId }
             }
         }
-        base
+        when (typeFilter) {
+            ShelfTypeFilter.ALL -> scopedBySidebar
+            ShelfTypeFilter.NOTES -> scopedBySidebar.filter { it.id !in pdfNotebookIds }
+            ShelfTypeFilter.PDF -> scopedBySidebar.filter { it.id in pdfNotebookIds }
+        }
+    }
+
+    val activeSectionTitle = when (val sel = sidebarSelection) {
+        ShelfSidebarSelection.All -> "Minden jegyzet"
+        ShelfSidebarSelection.Uncategorized -> "Kategorizálatlan"
+        ShelfSidebarSelection.Bookmarks -> "Könyvjelzők"
+        is ShelfSidebarSelection.Category -> folderById[sel.folderId]?.name ?: "Kategória"
     }
 
     fun openDefaultPageForNotebook(nb: NotebookEntity) {
         scope.launch {
             val pages = withContext(Dispatchers.IO) {
-                var existingId = nb.lastOpenedPageId
+                val existingId = nb.lastOpenedPageId
                 if (existingId != null && database.pageDao().getPageById(existingId) != null) {
                     return@withContext existingId
                 }
@@ -305,573 +382,725 @@ fun BookshelfScreen(
                 database.notebookDao().upsertNotebook(nb.copy(lastOpenedPageId = firstPage.id))
                 firstPage.id
             }
-            val target = OpenedPageTarget(notebookId = nb.id, pageId = pages)
-            val pending = splitPrimaryPending
-            if (pending != null) {
-                splitPrimaryPending = null
-                onOpenSplitScreen(pending, target)
-            } else {
-                onOpenSinglePage(target)
-            }
+            onOpenSinglePage(OpenedPageTarget(notebookId = nb.id, pageId = pages))
         }
     }
 
-    Scaffold(
-        modifier = modifier.fillMaxSize(),
-        containerColor = MaterialTheme.colorScheme.surface,
-        floatingActionButton = {
-            ExtendedFloatingActionButton(
-                onClick = { creatingNewNotebook = true },
-                shape = RoundedCornerShape(18.dp),
-                icon = { Icon(Icons.Filled.Add, contentDescription = null) },
-                text = { Text("Új jegyzetfüzet", fontWeight = FontWeight.SemiBold) }
+    fun moveNotebookToFolder(nb: NotebookEntity, targetFolderId: String?) {
+        if (nb.folderId == targetFolderId) return
+        scope.launch(Dispatchers.IO) {
+            database.notebookDao().upsertNotebook(
+                nb.copy(
+                    folderId = targetFolderId,
+                    updatedAtEpochMs = System.currentTimeMillis()
+                )
             )
         }
-    ) { innerPadding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .padding(horizontal = 24.dp, vertical = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
-        ) {
-            // Modern Bookshelf Top Header
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
+    }
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            .onGloballyPositioned { rootWindowPos = it.positionInWindow() }
+    ) {
+        Row(modifier = Modifier.fillMaxSize()) {
+            // Left StarNote-style Sidebar
+            Column(
+                modifier = Modifier
+                    .width(256.dp)
+                    .fillMaxHeight()
+                    .background(surfacePalette.sidebarBackground)
+                    .padding(horizontal = 14.dp, vertical = 18.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Surface(
-                        shape = RoundedCornerShape(16.dp),
-                        color = MaterialTheme.colorScheme.primaryContainer,
-                        modifier = Modifier.size(44.dp)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Icon(
-                                imageVector = Icons.Filled.MenuBook,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                                modifier = Modifier.size(24.dp)
-                            )
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = MaterialTheme.colorScheme.primaryContainer,
+                            modifier = Modifier.size(34.dp)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.MenuBook,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
                         }
-                    }
-                    Column {
                         Text(
                             text = "StylusNote",
-                            style = MaterialTheme.typography.headlineSmall,
-                            fontWeight = FontWeight.Bold
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
                         )
-                        Text(
-                            text = if (splitPrimaryPending != null) {
-                                "Split-Screen: válaszd ki a második oldalt"
-                            } else {
-                                "${allNotebooks.size} jegyzetfüzet • 144 Hz munkaterület"
-                            },
-                            style = MaterialTheme.typography.labelMedium,
-                            color = if (splitPrimaryPending != null) {
-                                MaterialTheme.colorScheme.primary
-                            } else {
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                            }
-                        )
-                    }
-                }
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    if (splitPrimaryPending != null) {
-                        FilledTonalButton(
-                            onClick = { splitPrimaryPending = null },
-                            shape = RoundedCornerShape(14.dp)
-                        ) {
-                            Text("Split megszakítása")
-                        }
-                    }
-                    FilledTonalButton(
-                        onClick = { showNewFolderDialog = true },
-                        shape = RoundedCornerShape(14.dp)
-                    ) {
-                        Icon(Icons.Filled.CreateNewFolder, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Új mappa")
-                    }
-                    FilledTonalButton(
-                        onClick = { showNewTagDialog = true },
-                        shape = RoundedCornerShape(14.dp)
-                    ) {
-                        Icon(Icons.Filled.Label, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Új címke")
                     }
                     Surface(
                         onClick = onToggleTheme,
                         shape = CircleShape,
-                        color = MaterialTheme.colorScheme.surfaceContainerHigh,
-                        modifier = Modifier.size(40.dp)
+                        color = MaterialTheme.colorScheme.surface,
+                        modifier = Modifier.size(34.dp)
                     ) {
                         Box(contentAlignment = Alignment.Center) {
                             Icon(
                                 imageVector = if (isDarkTheme) Icons.Filled.LightMode else Icons.Filled.DarkMode,
                                 contentDescription = "Téma váltása",
-                                modifier = Modifier.size(20.dp)
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(18.dp)
                             )
                         }
                     }
                 }
-            }
 
-            // Pill Search Bar + Segmented Navigation Bar
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                OutlinedTextField(
-                    value = searchQuery,
-                    onValueChange = { searchQuery = it },
-                    placeholder = { Text("Keresés címben vagy kézírott jegyzetekben...") },
-                    leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
-                    trailingIcon = {
-                        if (searchQuery.isNotEmpty()) {
-                            IconButton(onClick = { searchQuery = "" }) {
-                                Icon(Icons.Filled.Close, contentDescription = "Törlés")
-                            }
-                        }
-                    },
-                    singleLine = true,
-                    shape = RoundedCornerShape(28.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedContainerColor = MaterialTheme.colorScheme.surfaceContainerLow,
-                        unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerLow,
-                        unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
-                    ),
-                    modifier = Modifier.weight(1f)
-                )
-
+                // Search Pill at Top of Left Sidebar (StarNote layout)
                 Surface(
-                    shape = RoundedCornerShape(20.dp),
-                    color = MaterialTheme.colorScheme.surfaceContainerLow,
-                    modifier = Modifier.border(
-                        width = 1.dp,
-                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f),
-                        shape = RoundedCornerShape(20.dp)
-                    )
+                    shape = RoundedCornerShape(22.dp),
+                    color = MaterialTheme.colorScheme.surface,
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                    modifier = Modifier.fillMaxWidth()
                 ) {
                     Row(
                         modifier = Modifier
-                            .horizontalScroll(rememberScrollState())
-                            .padding(4.dp),
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 9.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        BookshelfTab.entries.forEach { tab ->
-                            val selected = activeTab == tab
-                            Surface(
-                                onClick = { activeTab = tab },
-                                shape = RoundedCornerShape(16.dp),
-                                color = if (selected) {
-                                    MaterialTheme.colorScheme.primaryContainer
-                                } else {
-                                    Color.Transparent
-                                }
+                        Icon(
+                            imageVector = Icons.Filled.Search,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Box(modifier = Modifier.weight(1f)) {
+                            if (searchQuery.isEmpty()) {
+                                Text(
+                                    text = "Keresés...",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            BasicTextField(
+                                value = searchQuery,
+                                onValueChange = { searchQuery = it },
+                                singleLine = true,
+                                textStyle = MaterialTheme.typography.bodyMedium.copy(
+                                    color = MaterialTheme.colorScheme.onSurface
+                                ),
+                                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                        if (searchQuery.isNotEmpty()) {
+                            IconButton(
+                                onClick = { searchQuery = "" },
+                                modifier = Modifier.size(20.dp)
                             ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = tab.icon,
-                                        contentDescription = null,
-                                        tint = if (selected) {
-                                            MaterialTheme.colorScheme.onPrimaryContainer
-                                        } else {
-                                            MaterialTheme.colorScheme.onSurfaceVariant
-                                        },
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                    Text(
-                                        text = tab.label,
-                                        style = MaterialTheme.typography.labelLarge,
-                                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
-                                        color = if (selected) {
-                                            MaterialTheme.colorScheme.onPrimaryContainer
-                                        } else {
-                                            MaterialTheme.colorScheme.onSurfaceVariant
-                                        }
-                                    )
-                                }
+                                Icon(
+                                    imageVector = Icons.Filled.Close,
+                                    contentDescription = "Törlés",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(15.dp)
+                                )
                             }
                         }
                     }
                 }
-            }
 
-            if (activeTab == BookshelfTab.FOLDERS && searchQuery.isBlank()) {
+                Spacer(modifier = Modifier.height(2.dp))
+
+                SidebarNavItem(
+                    label = "Minden jegyzet",
+                    icon = Icons.AutoMirrored.Filled.MenuBook,
+                    count = allNotebooks.size,
+                    selected = sidebarSelection == ShelfSidebarSelection.All,
+                    isDropHovered = false,
+                    onClick = { sidebarSelection = ShelfSidebarSelection.All }
+                )
+
+                SidebarNavItem(
+                    label = "Kategorizálatlan",
+                    icon = Icons.Filled.Inbox,
+                    count = uncategorizedCount,
+                    selected = sidebarSelection == ShelfSidebarSelection.Uncategorized,
+                    isDropHovered = hoveredDropKey == DROP_KEY_UNCATEGORIZED,
+                    onClick = { sidebarSelection = ShelfSidebarSelection.Uncategorized },
+                    modifier = Modifier.onGloballyPositioned { coords ->
+                        dropTargetBounds[DROP_KEY_UNCATEGORIZED] = coords.boundsInWindow()
+                    }
+                )
+
+                SidebarNavItem(
+                    label = "Könyvjelzők",
+                    icon = Icons.Filled.Bookmark,
+                    count = allBookmarks.size,
+                    selected = sidebarSelection == ShelfSidebarSelection.Bookmarks,
+                    isDropHovered = false,
+                    onClick = { sidebarSelection = ShelfSidebarSelection.Bookmarks }
+                )
+
+                HorizontalDivider(
+                    color = MaterialTheme.colorScheme.outlineVariant,
+                    modifier = Modifier.padding(vertical = 4.dp)
+                )
+
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState()),
+                        .padding(horizontal = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Surface(
-                        onClick = { currentFolderId = null },
-                        shape = RoundedCornerShape(12.dp),
-                        color = if (currentFolderId == null) {
-                            MaterialTheme.colorScheme.secondaryContainer
-                        } else {
-                            MaterialTheme.colorScheme.surfaceContainerLow
-                        }
+                    Text(
+                        text = "Kategóriák",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    IconButton(
+                        onClick = { showNewFolderDialog = true },
+                        modifier = Modifier.size(28.dp)
                     ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(4.dp)
-                        ) {
-                            Icon(Icons.Filled.Home, contentDescription = null, modifier = Modifier.size(15.dp))
-                            Text("Gyökér", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Medium)
-                        }
-                    }
-                    breadcrumbs.forEach { folder ->
                         Icon(
-                            Icons.Filled.ChevronRight,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(16.dp)
+                            imageVector = Icons.Filled.Add,
+                            contentDescription = "Új kategória",
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(19.dp)
                         )
-                        Surface(
-                            onClick = { currentFolderId = folder.id },
-                            shape = RoundedCornerShape(12.dp),
-                            color = if (folder.id == currentFolderId) {
-                                MaterialTheme.colorScheme.secondaryContainer
-                            } else {
-                                MaterialTheme.colorScheme.surfaceContainerLow
-                            }
-                        ) {
+                    }
+                }
+
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    if (allFolders.isEmpty()) {
+                        item(key = "empty_categories_hint") {
                             Text(
-                                text = folder.name,
-                                style = MaterialTheme.typography.labelMedium,
-                                fontWeight = FontWeight.Medium,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                text = "Nyomj a + gombra kategória létrehozásához, majd húzd rá a füzeteket.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)
+                            )
+                        }
+                    } else {
+                        items(allFolders, key = { it.id }) { folder ->
+                            DisposableEffect(folder.id) {
+                                onDispose { dropTargetBounds.remove(folder.id) }
+                            }
+                            val isSelected = (sidebarSelection as? ShelfSidebarSelection.Category)?.folderId == folder.id
+                            val isHovered = hoveredDropKey == folder.id
+                            val count = folderCounts[folder.id] ?: 0
+                            SidebarNavItem(
+                                label = folder.name,
+                                icon = Icons.Filled.Folder,
+                                iconTint = Color(folder.accentColorArgb),
+                                count = count,
+                                selected = isSelected,
+                                isDropHovered = isHovered,
+                                onClick = { sidebarSelection = ShelfSidebarSelection.Category(folder.id) },
+                                onDelete = {
+                                    if (isSelected) {
+                                        sidebarSelection = ShelfSidebarSelection.All
+                                    }
+                                    scope.launch(Dispatchers.IO) {
+                                        // Unassign notebooks before deleting because NotebookEntity.folderId cascades on delete.
+                                        allNotebooks
+                                            .filter { it.folderId == folder.id }
+                                            .forEach { childNb ->
+                                                database.notebookDao().upsertNotebook(
+                                                    childNb.copy(
+                                                        folderId = null,
+                                                        updatedAtEpochMs = System.currentTimeMillis()
+                                                    )
+                                                )
+                                            }
+                                        database.folderDao().deleteFolderById(folder.id)
+                                    }
+                                },
+                                modifier = Modifier.onGloballyPositioned { coords ->
+                                    dropTargetBounds[folder.id] = coords.boundsInWindow()
+                                }
                             )
                         }
                     }
                 }
-
-                if (childFolders.isNotEmpty()) {
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        childFolders.forEach { folder ->
-                            Surface(
-                                shape = RoundedCornerShape(16.dp),
-                                color = MaterialTheme.colorScheme.surfaceContainerLow,
-                                tonalElevation = 2.dp,
-                                modifier = Modifier
-                                    .border(
-                                        1.dp,
-                                        MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f),
-                                        RoundedCornerShape(16.dp)
-                                    )
-                                    .clickable { currentFolderId = folder.id }
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                ) {
-                                    Surface(
-                                        shape = RoundedCornerShape(10.dp),
-                                        color = Color(folder.accentColorArgb).copy(alpha = 0.16f),
-                                        modifier = Modifier.size(28.dp)
-                                    ) {
-                                        Box(contentAlignment = Alignment.Center) {
-                                            Icon(
-                                                imageVector = Icons.Filled.Folder,
-                                                contentDescription = null,
-                                                tint = Color(folder.accentColorArgb),
-                                                modifier = Modifier.size(17.dp)
-                                            )
-                                        }
-                                    }
-                                    Text(
-                                        folder.name,
-                                        style = MaterialTheme.typography.labelLarge,
-                                        fontWeight = FontWeight.Medium
-                                    )
-                                    IconButton(
-                                        onClick = {
-                                            scope.launch(Dispatchers.IO) {
-                                                database.folderDao().deleteFolderById(folder.id)
-                                            }
-                                        },
-                                        modifier = Modifier.size(20.dp)
-                                    ) {
-                                        Icon(
-                                            Icons.Filled.Delete,
-                                            contentDescription = "Mappa törlése",
-                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            modifier = Modifier.size(15.dp)
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
             }
 
-            if (activeTab == BookshelfTab.TAGS && searchQuery.isBlank()) {
+            VerticalDivider(thickness = 1.dp, color = MaterialTheme.colorScheme.outlineVariant)
+
+            // Right Main Workspace Area
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .background(MaterialTheme.colorScheme.background)
+                    .padding(horizontal = 24.dp, vertical = 18.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    FilterChip(
-                        selected = selectedTagId == null,
-                        onClick = { selectedTagId = null },
-                        label = { Text("Összes") }
-                    )
-                    allTags.forEach { tag ->
-                        FilterChip(
-                            selected = selectedTagId == tag.id,
-                            onClick = {
-                                selectedTagId = if (selectedTagId == tag.id) null else tag.id
-                            },
-                            leadingIcon = {
-                                Box(
-                                    modifier = Modifier
-                                        .size(10.dp)
-                                        .clip(CircleShape)
-                                        .background(Color(tag.colorArgb))
-                                )
-                            },
-                            label = { Text(tag.name) }
-                        )
-                    }
-                }
-            }
-
-            if (searchQuery.isNotBlank() && ocrHits.isNotEmpty()) {
-                Text(
-                    text = "Kézírás OCR találatok (${ocrHits.size})",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.primary
-                )
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(140.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    items(ocrHits, key = { "${it.notebookId}:${it.pageId}" }) { hit ->
-                        val nbTitle = allNotebooks.firstOrNull { it.id == hit.notebookId }?.title ?: "Füzet"
-                        Surface(
-                            shape = RoundedCornerShape(14.dp),
-                            color = MaterialTheme.colorScheme.surfaceContainerLow,
-                            tonalElevation = 2.dp,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable {
-                                    val target = OpenedPageTarget(hit.notebookId, hit.pageId)
-                                    val pending = splitPrimaryPending
-                                    if (pending != null) {
-                                        splitPrimaryPending = null
-                                        onOpenSplitScreen(pending, target)
-                                    } else {
-                                        onOpenSinglePage(target)
-                                    }
-                                }
-                        ) {
-                            Column(modifier = Modifier.padding(12.dp)) {
-                                Text(nbTitle, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
-                                Text(
-                                    text = hit.rawText,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (activeTab == BookshelfTab.BOOKMARKS && searchQuery.isBlank()) {
-                if (allBookmarks.isEmpty()) {
-                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                         Text(
-                            "Még nincsenek könyvjelzővel jelölt oldalak.",
+                            text = if (searchQuery.isBlank()) activeSectionTitle else "Keresési találatok",
+                            style = MaterialTheme.typography.headlineSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onBackground
+                        )
+                        val countLabel = if (sidebarSelection == ShelfSidebarSelection.Bookmarks && searchQuery.isBlank()) {
+                            "${allBookmarks.size} könyvjelző"
+                        } else {
+                            "${visibleNotebooks.size} elem"
+                        }
+                        Text(
+                            text = countLabel,
+                            style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
-                } else {
-                    LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        items(allBookmarks, key = { it.id }) { bm ->
-                            val nbTitle = allNotebooks.firstOrNull { it.id == bm.notebookId }?.title ?: "Füzet"
-                            Card(
-                                shape = RoundedCornerShape(16.dp),
-                                colors = CardDefaults.cardColors(
-                                    containerColor = MaterialTheme.colorScheme.surfaceContainerLow
-                                ),
+
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        // StarNote-style Segmented Pill Tabs: MIND | JEGYZET | PDF
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = surfacePalette.groupedCardBackground
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(4.dp),
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                ShelfTypeFilter.entries.forEach { filter ->
+                                    val selected = typeFilter == filter
+                                    Surface(
+                                        onClick = { typeFilter = filter },
+                                        shape = RoundedCornerShape(9.dp),
+                                        color = if (selected) {
+                                            MaterialTheme.colorScheme.surface
+                                        } else {
+                                            Color.Transparent
+                                        },
+                                        shadowElevation = if (selected) 2.dp else 0.dp
+                                    ) {
+                                        Text(
+                                            text = filter.label,
+                                            style = MaterialTheme.typography.labelLarge,
+                                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                                            color = if (selected) {
+                                                MaterialTheme.colorScheme.primary
+                                            } else {
+                                                MaterialTheme.colorScheme.onSurfaceVariant
+                                            },
+                                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 7.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        FilledTonalButton(
+                            onClick = {
+                                pdfImportTargetNotebook = null
+                                showPdfImportDialog = true
+                            },
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.PictureAsPdf,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("PDF import")
+                        }
+                    }
+                }
+
+                shelfNoticeHu?.let { notice ->
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = surfacePalette.activePillBackground,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = notice,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                modifier = Modifier.weight(1f)
+                            )
+                            IconButton(
+                                onClick = { shelfNoticeHu = null },
+                                modifier = Modifier.size(24.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Close,
+                                    contentDescription = "Bezárás",
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                if (searchQuery.isNotBlank() && ocrHits.isNotEmpty()) {
+                    Text(
+                        text = "Kézírás OCR találatok (${ocrHits.size})",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(132.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        items(ocrHits, key = { "${it.notebookId}:${it.pageId}" }) { hit ->
+                            val nbTitle = allNotebooks.firstOrNull { it.id == hit.notebookId }?.title ?: "Füzet"
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = surfacePalette.groupedCardBackground,
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .clickable {
-                                        val target = OpenedPageTarget(bm.notebookId, bm.pageId)
-                                        val pending = splitPrimaryPending
-                                        if (pending != null) {
-                                            splitPrimaryPending = null
-                                            onOpenSplitScreen(pending, target)
-                                        } else {
-                                            onOpenSinglePage(target)
-                                        }
+                                        onOpenSinglePage(OpenedPageTarget(hit.notebookId, hit.pageId))
                                     }
                             ) {
-                                Row(
-                                    modifier = Modifier.padding(14.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                                        modifier = Modifier.weight(1f)
-                                    ) {
-                                        Icon(
-                                            Icons.Filled.Bookmark,
-                                            contentDescription = null,
-                                            tint = Color(bm.colorArgb)
-                                        )
-                                        Column {
-                                            Text(bm.label, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-                                            Text(nbTitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        }
-                                    }
-                                    IconButton(
-                                        onClick = {
-                                            scope.launch(Dispatchers.IO) {
-                                                database.bookmarkDao().deleteBookmarkById(bm.id)
-                                            }
-                                        }
-                                    ) {
-                                        Icon(Icons.Filled.Delete, contentDescription = "Könyvjelző törlése")
-                                    }
+                                Column(modifier = Modifier.padding(12.dp)) {
+                                    Text(nbTitle, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                                    Text(
+                                        text = hit.rawText,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
                                 }
                             }
                         }
                     }
                 }
-            } else {
-                LazyVerticalGrid(
-                    columns = GridCells.Adaptive(minSize = 196.dp),
-                    contentPadding = PaddingValues(bottom = 92.dp),
-                    verticalArrangement = Arrangement.spacedBy(16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(16.dp),
-                    modifier = Modifier.fillMaxSize()
-                ) {
-                    items(visibleNotebooks, key = { it.id }) { notebook ->
-                        val attachedTags = tagsByNotebookId[notebook.id].orEmpty()
-                        Surface(
-                            shape = RoundedCornerShape(20.dp),
-                            color = MaterialTheme.colorScheme.surfaceContainerLow,
-                            tonalElevation = 2.dp,
-                            shadowElevation = 2.dp,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .border(
-                                    width = 1.dp,
-                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f),
-                                    shape = RoundedCornerShape(20.dp)
-                                )
-                        ) {
-                            Column(
-                                modifier = Modifier.padding(10.dp),
-                                verticalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                NotebookCoverPreviewCard(
-                                    title = notebook.title,
-                                    cover = notebook.cover,
+
+                if (sidebarSelection == ShelfSidebarSelection.Bookmarks && searchQuery.isBlank()) {
+                    if (allBookmarks.isEmpty()) {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text(
+                                text = "Még nincsenek könyvjelzővel jelölt oldalak.",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    } else {
+                        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            items(allBookmarks, key = { it.id }) { bm ->
+                                val nbTitle = allNotebooks.firstOrNull { it.id == bm.notebookId }?.title ?: "Füzet"
+                                Surface(
+                                    shape = RoundedCornerShape(14.dp),
+                                    color = surfacePalette.groupedCardBackground,
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .clickable { openDefaultPageForNotebook(notebook) }
+                                        .clickable {
+                                            onOpenSinglePage(OpenedPageTarget(bm.notebookId, bm.pageId))
+                                        }
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(14.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                            modifier = Modifier.weight(1f)
+                                        ) {
+                                            Icon(
+                                                Icons.Filled.Bookmark,
+                                                contentDescription = null,
+                                                tint = Color(bm.colorArgb)
+                                            )
+                                            Column {
+                                                Text(bm.label, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                                                Text(nbTitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            }
+                                        }
+                                        IconButton(
+                                            onClick = {
+                                                scope.launch(Dispatchers.IO) {
+                                                    database.bookmarkDao().deleteBookmarkById(bm.id)
+                                                }
+                                            }
+                                        ) {
+                                            Icon(Icons.Filled.Delete, contentDescription = "Könyvjelző törlése")
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    val showCreateTile = typeFilter != ShelfTypeFilter.PDF && searchQuery.isBlank()
+                    LazyVerticalGrid(
+                        columns = GridCells.Adaptive(minSize = 176.dp),
+                        contentPadding = PaddingValues(bottom = 28.dp),
+                        verticalArrangement = Arrangement.spacedBy(20.dp),
+                        horizontalArrangement = Arrangement.spacedBy(20.dp),
+                        modifier = Modifier.fillMaxSize()
+                    ) {
+                        if (showCreateTile) {
+                            item(key = "create_new_notebook_tile") {
+                                CreateNotebookDashedTile(
+                                    onClick = { creatingNewNotebook = true }
                                 )
+                            }
+                        }
+
+                        items(visibleNotebooks, key = { it.id }) { notebook ->
+                            val isPdfBook = notebook.id in pdfNotebookIds
+                            val isBeingDragged = draggingNotebook?.id == notebook.id
+                            var coverWindowTopLeft by remember { mutableStateOf(Offset.Zero) }
+                            var menuExpanded by remember(notebook.id) { mutableStateOf(false) }
+
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .alpha(if (isBeingDragged) 0.28f else 1f),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .onGloballyPositioned { coverWindowTopLeft = it.positionInWindow() }
+                                        .pointerInput(notebook.id) {
+                                            detectDragGesturesAfterLongPress(
+                                                onDragStart = { localOffset ->
+                                                    draggingNotebook = notebook
+                                                    dragPointerWindowOffset = coverWindowTopLeft + localOffset
+                                                },
+                                                onDrag = { change, dragAmount ->
+                                                    change.consume()
+                                                    dragPointerWindowOffset += dragAmount
+                                                },
+                                                onDragEnd = {
+                                                    val droppedKey = hoveredDropKey
+                                                    val dragged = draggingNotebook
+                                                    if (dragged != null && droppedKey != null) {
+                                                        val targetFolderId = if (droppedKey == DROP_KEY_UNCATEGORIZED) {
+                                                            null
+                                                        } else {
+                                                            droppedKey
+                                                        }
+                                                        moveNotebookToFolder(dragged, targetFolderId)
+                                                    }
+                                                    draggingNotebook = null
+                                                },
+                                                onDragCancel = { draggingNotebook = null }
+                                            )
+                                        }
+                                ) {
+                                    NotebookCoverPreviewCard(
+                                        title = notebook.title,
+                                        cover = notebook.cover,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable { openDefaultPageForNotebook(notebook) }
+                                    )
+                                }
+
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.SpaceBetween
                                 ) {
-                                    Surface(
-                                        onClick = { inspectingNotebook = notebook },
-                                        shape = RoundedCornerShape(10.dp),
-                                        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f)
+                                    Column(
+                                        modifier = Modifier.weight(1f),
+                                        verticalArrangement = Arrangement.spacedBy(2.dp)
                                     ) {
                                         Text(
-                                            text = "Oldalak",
-                                            style = MaterialTheme.typography.labelMedium,
-                                            fontWeight = FontWeight.Medium,
-                                            color = MaterialTheme.colorScheme.onSecondaryContainer,
-                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                                            text = notebook.title,
+                                            style = MaterialTheme.typography.titleSmall,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = MaterialTheme.colorScheme.onBackground,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        val dateText = remember(notebook.updatedAtEpochMs) {
+                                            dateFormatter.format(Date(notebook.updatedAtEpochMs))
+                                        }
+                                        Text(
+                                            text = if (isPdfBook) "PDF • $dateText" else dateText,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1
                                         )
                                     }
-                                    Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+
+                                    Box {
                                         IconButton(
-                                            onClick = {
-                                                scope.launch(Dispatchers.IO) {
-                                                    database.notebookDao().upsertNotebook(
-                                                        notebook.copy(isFavorite = !notebook.isFavorite)
-                                                    )
-                                                }
-                                            },
+                                            onClick = { menuExpanded = true },
                                             modifier = Modifier.size(32.dp)
                                         ) {
                                             Icon(
-                                                imageVector = if (notebook.isFavorite) Icons.Filled.Star else Icons.Filled.StarBorder,
-                                                contentDescription = "Kedvenc",
-                                                tint = if (notebook.isFavorite) Color(0xFFFFB300) else MaterialTheme.colorScheme.onSurfaceVariant,
-                                                modifier = Modifier.size(18.dp)
-                                            )
-                                        }
-                                        IconButton(
-                                            onClick = { editingNotebook = notebook },
-                                            modifier = Modifier.size(32.dp)
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Filled.Edit,
-                                                contentDescription = "Borító szerkesztése",
+                                                imageVector = Icons.Filled.MoreHoriz,
+                                                contentDescription = "Füzet műveletek",
                                                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                modifier = Modifier.size(18.dp)
+                                                modifier = Modifier.size(20.dp)
                                             )
                                         }
-                                    }
-                                }
-                                if (attachedTags.isNotEmpty()) {
-                                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                        attachedTags.take(3).forEach { t ->
-                                            Box(
-                                                modifier = Modifier
-                                                    .clip(RoundedCornerShape(8.dp))
-                                                    .background(Color(t.colorArgb).copy(alpha = 0.22f))
-                                                    .padding(horizontal = 7.dp, vertical = 2.dp)
-                                            ) {
-                                                Text(
-                                                    text = t.name,
-                                                    style = MaterialTheme.typography.labelSmall,
-                                                    maxLines = 1
-                                                )
-                                            }
+                                        DropdownMenu(
+                                            expanded = menuExpanded,
+                                            onDismissRequest = { menuExpanded = false }
+                                        ) {
+                                            DropdownMenuItem(
+                                                text = { Text("Borító és beállítások") },
+                                                leadingIcon = { Icon(Icons.Filled.Edit, contentDescription = null) },
+                                                onClick = {
+                                                    menuExpanded = false
+                                                    editingNotebook = notebook
+                                                }
+                                            )
+                                            DropdownMenuItem(
+                                                text = { Text("Oldalak és címkék") },
+                                                leadingIcon = { Icon(Icons.Filled.Description, contentDescription = null) },
+                                                onClick = {
+                                                    menuExpanded = false
+                                                    inspectingNotebook = notebook
+                                                }
+                                            )
+                                            DropdownMenuItem(
+                                                text = { Text("Áthelyezés kategóriába...") },
+                                                leadingIcon = { Icon(Icons.Filled.FolderOpen, contentDescription = null) },
+                                                onClick = {
+                                                    menuExpanded = false
+                                                    moveTargetNotebook = notebook
+                                                }
+                                            )
+                                            HorizontalDivider()
+                                            DropdownMenuItem(
+                                                text = { Text("Feltöltés NotebookLM-be...") },
+                                                leadingIcon = { Icon(Icons.Filled.AutoAwesome, contentDescription = null) },
+                                                onClick = {
+                                                    menuExpanded = false
+                                                    notebookLmExportTarget = notebook
+                                                }
+                                            )
+                                            DropdownMenuItem(
+                                                text = { Text("PDF importálása ebbe a füzetbe...") },
+                                                leadingIcon = { Icon(Icons.Filled.PictureAsPdf, contentDescription = null) },
+                                                onClick = {
+                                                    menuExpanded = false
+                                                    pdfImportTargetNotebook = notebook
+                                                    showPdfImportDialog = true
+                                                }
+                                            )
+                                            DropdownMenuItem(
+                                                text = { Text("PDF exportálása...") },
+                                                leadingIcon = { Icon(Icons.Filled.PictureAsPdf, contentDescription = null) },
+                                                onClick = {
+                                                    menuExpanded = false
+                                                    bookPdfExportTarget = notebook
+                                                    val safeName = notebook.title
+                                                        .ifBlank { "jegyzet" }
+                                                        .replace(Regex("[\\\\/:*?\"<>|]+"), "_")
+                                                    bookExportLauncher.launch("$safeName.pdf")
+                                                }
+                                            )
+                                            HorizontalDivider()
+                                            DropdownMenuItem(
+                                                text = {
+                                                    Text(
+                                                        "Törlés",
+                                                        color = MaterialTheme.colorScheme.error
+                                                    )
+                                                },
+                                                leadingIcon = {
+                                                    Icon(
+                                                        Icons.Filled.Delete,
+                                                        contentDescription = null,
+                                                        tint = MaterialTheme.colorScheme.error
+                                                    )
+                                                },
+                                                onClick = {
+                                                    menuExpanded = false
+                                                    scope.launch(Dispatchers.IO) {
+                                                        database.notebookDao().deleteNotebookById(notebook.id)
+                                                    }
+                                                }
+                                            )
                                         }
                                     }
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // Floating dragged notebook ghost preview crossing from grid to sidebar.
+        draggingNotebook?.let { dragged ->
+            val targetLabel = when (hoveredDropKey) {
+                null -> null
+                DROP_KEY_UNCATEGORIZED -> "Kategorizálatlan"
+                else -> folderById[hoveredDropKey]?.name
+            }
+            Column(
+                modifier = Modifier
+                    .zIndex(30f)
+                    .offset {
+                        IntOffset(
+                            x = (dragPointerWindowOffset.x - rootWindowPos.x - 72f).roundToInt(),
+                            y = (dragPointerWindowOffset.y - rootWindowPos.y - 96f).roundToInt()
+                        )
+                    }
+                    .width(132.dp)
+                    .graphicsLayer {
+                        scaleX = 0.96f
+                        scaleY = 0.96f
+                        alpha = 0.94f
+                    },
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                NotebookCoverPreviewCard(
+                    title = dragged.title,
+                    cover = dragged.cover,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                if (targetLabel != null) {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = MaterialTheme.colorScheme.primary
+                    ) {
+                        Text(
+                            text = targetLabel,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onPrimary,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
                     }
                 }
             }
@@ -880,16 +1109,19 @@ fun BookshelfScreen(
 
     if (showNewFolderDialog) {
         NewNameModalDialog(
-            title = "Új mappa létrehozása",
-            label = "Mappa neve",
+            title = "Új kategória létrehozása",
+            label = "Kategória neve",
             onConfirm = { name ->
                 val now = System.currentTimeMillis()
+                val accent = FOLDER_PALETTE[allFolders.size % FOLDER_PALETTE.size]
+                val newFolderId = UUID.randomUUID().toString()
                 scope.launch(Dispatchers.IO) {
                     database.folderDao().upsertFolder(
                         FolderEntity(
-                            id = UUID.randomUUID().toString(),
-                            parentId = currentFolderId,
+                            id = newFolderId,
+                            parentId = null,
                             name = name,
+                            accentColorArgb = accent,
                             createdAtEpochMs = now,
                             updatedAtEpochMs = now
                         )
@@ -901,28 +1133,20 @@ fun BookshelfScreen(
         )
     }
 
-    if (showNewTagDialog) {
-        NewNameModalDialog(
-            title = "Új címke létrehozása",
-            label = "Címke neve",
-            onConfirm = { name ->
-                val color = TAG_PALETTE[allTags.size % TAG_PALETTE.size]
-                scope.launch(Dispatchers.IO) {
-                    database.tagDao().upsertTag(
-                        TagEntity(
-                            id = UUID.randomUUID().toString(),
-                            name = name,
-                            colorArgb = color
-                        )
-                    )
-                }
-                showNewTagDialog = false
+    moveTargetNotebook?.let { targetNb ->
+        MoveNotebookCategoryDialog(
+            notebook = targetNb,
+            folders = allFolders,
+            onSelectFolder = { targetFolderId ->
+                moveNotebookToFolder(targetNb, targetFolderId)
+                moveTargetNotebook = null
             },
-            onDismiss = { showNewTagDialog = false }
+            onDismiss = { moveTargetNotebook = null }
         )
     }
 
     if (creatingNewNotebook) {
+        val defaultCategoryId = (sidebarSelection as? ShelfSidebarSelection.Category)?.folderId
         CoverDesignerDialog(
             initialTitle = "Új jegyzetfüzet",
             initialCover = NotebookCover(),
@@ -939,7 +1163,7 @@ fun BookshelfScreen(
                     database.notebookDao().upsertNotebook(
                         NotebookEntity(
                             id = nbId,
-                            folderId = currentFolderId,
+                            folderId = defaultCategoryId,
                             title = draft.title,
                             cover = draft.cover,
                             defaultCanvasMode = draft.canvasMode,
@@ -1008,17 +1232,7 @@ fun BookshelfScreen(
             onOpenPage = { pageId ->
                 val target = OpenedPageTarget(nb.id, pageId)
                 inspectingNotebook = null
-                val pending = splitPrimaryPending
-                if (pending != null) {
-                    splitPrimaryPending = null
-                    onOpenSplitScreen(pending, target)
-                } else {
-                    onOpenSinglePage(target)
-                }
-            },
-            onPickForSplitScreen = { pageId ->
-                splitPrimaryPending = OpenedPageTarget(nb.id, pageId)
-                inspectingNotebook = null
+                onOpenSinglePage(target)
             },
             onDeleteNotebook = {
                 scope.launch(Dispatchers.IO) {
@@ -1028,6 +1242,286 @@ fun BookshelfScreen(
             },
             onDismiss = { inspectingNotebook = null }
         )
+    }
+
+    if (showPdfImportDialog) {
+        val activeCatId = (sidebarSelection as? ShelfSidebarSelection.Category)?.folderId
+        SelectivePdfImportDialog(
+            database = database,
+            defaultFolderId = activeCatId,
+            targetNotebook = pdfImportTargetNotebook,
+            onImported = { notebookId, firstPageId ->
+                showPdfImportDialog = false
+                pdfImportTargetNotebook = null
+                onOpenSinglePage(OpenedPageTarget(notebookId = notebookId, pageId = firstPageId))
+            },
+            onDismiss = {
+                showPdfImportDialog = false
+                pdfImportTargetNotebook = null
+            }
+        )
+    }
+
+    notebookLmExportTarget?.let { targetNb ->
+        NotebookLmExportDialog(
+            notebook = targetNb,
+            database = database,
+            onDismiss = { notebookLmExportTarget = null }
+        )
+    }
+}
+
+private val FOLDER_PALETTE = listOf(
+    0xFF2B689C.toInt(),
+    0xFF2F8066.toInt(),
+    0xFFD97706.toInt(),
+    0xFF7C3AED.toInt(),
+    0xFF0F766E.toInt(),
+    0xFFC2410C.toInt()
+)
+
+@Composable
+private fun SidebarNavItem(
+    label: String,
+    icon: ImageVector,
+    count: Int,
+    selected: Boolean,
+    isDropHovered: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    iconTint: Color? = null,
+    onDelete: (() -> Unit)? = null
+) {
+    val surfacePalette = LocalStylusSurfacePalette.current
+    val bgColor = when {
+        isDropHovered -> MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)
+        selected -> surfacePalette.activePillBackground
+        else -> Color.Transparent
+    }
+    val borderStroke = if (isDropHovered) {
+        BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary)
+    } else {
+        null
+    }
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(12.dp),
+        color = bgColor,
+        border = borderStroke,
+        modifier = modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = iconTint ?: if (selected) {
+                    MaterialTheme.colorScheme.primary
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+                modifier = Modifier.size(18.dp)
+            )
+            Text(
+                text = label,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = if (selected || isDropHovered) FontWeight.SemiBold else FontWeight.Medium,
+                color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+            Text(
+                text = count.toString(),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (onDelete != null) {
+                IconButton(
+                    onClick = onDelete,
+                    modifier = Modifier.size(22.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Delete,
+                        contentDescription = "Kategória törlése",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(14.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CreateNotebookDashedTile(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val dashColor = MaterialTheme.colorScheme.outlineVariant
+    val containerColor = LocalStylusSurfacePalette.current.groupedCardBackground.copy(alpha = 0.45f)
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(0.74f)
+                .clip(RoundedCornerShape(14.dp))
+                .background(containerColor)
+                .clickable(onClick = onClick),
+            contentAlignment = Alignment.Center
+        ) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val strokeWidth = 1.6.dp.toPx()
+                val radius = 14.dp.toPx()
+                drawRoundRect(
+                    color = dashColor,
+                    cornerRadius = CornerRadius(radius, radius),
+                    style = ComposeDrawStroke(
+                        width = strokeWidth,
+                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(12f, 10f), 0f)
+                    )
+                )
+            }
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Surface(
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
+                    modifier = Modifier.size(44.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.Filled.Add,
+                            contentDescription = "Létrehozás",
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+                }
+                Text(
+                    text = "Létrehozás",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+        }
+        Spacer(modifier = Modifier.height(34.dp))
+    }
+}
+
+@Composable
+private fun MoveNotebookCategoryDialog(
+    notebook: NotebookEntity,
+    folders: List<FolderEntity>,
+    onSelectFolder: (String?) -> Unit,
+    onDismiss: () -> Unit
+) {
+    ModalBackdropBox(onDismiss = onDismiss) {
+        Surface(
+            modifier = Modifier
+                .safeDrawingPadding()
+                .padding(24.dp)
+                .widthIn(min = 320.dp, max = 440.dp)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null
+                ) {},
+            shape = RoundedCornerShape(18.dp),
+            tonalElevation = 8.dp
+        ) {
+            Column(
+                modifier = Modifier.padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "Áthelyezés: ${notebook.title}",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                Surface(
+                    onClick = { onSelectFolder(null) },
+                    shape = RoundedCornerShape(12.dp),
+                    color = if (notebook.folderId == null) {
+                        LocalStylusSurfacePalette.current.activePillBackground
+                    } else {
+                        Color.Transparent
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Icon(Icons.Filled.Inbox, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Text("Kategorizálatlan", modifier = Modifier.weight(1f))
+                        if (notebook.folderId == null) {
+                            Icon(
+                                Icons.Filled.Check,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                }
+                LazyColumn(
+                    modifier = Modifier.height(220.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    items(folders, key = { it.id }) { folder ->
+                        val isCurrent = notebook.folderId == folder.id
+                        Surface(
+                            onClick = { onSelectFolder(folder.id) },
+                            shape = RoundedCornerShape(12.dp),
+                            color = if (isCurrent) {
+                                LocalStylusSurfacePalette.current.activePillBackground
+                            } else {
+                                Color.Transparent
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Icon(
+                                    Icons.Filled.Folder,
+                                    contentDescription = null,
+                                    tint = Color(folder.accentColorArgb),
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Text(folder.name, modifier = Modifier.weight(1f))
+                                if (isCurrent) {
+                                    Icon(
+                                        Icons.Filled.Check,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    TextButton(onClick = onDismiss) { Text("Mégse") }
+                }
+            }
+        }
     }
 }
 
@@ -1090,7 +1584,6 @@ private fun NotebookDetailsDialog(
     allTags: List<TagEntity>,
     attachedTags: List<TagEntity>,
     onOpenPage: (String) -> Unit,
-    onPickForSplitScreen: (String) -> Unit,
     onDeleteNotebook: () -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -1269,12 +1762,6 @@ private fun NotebookDetailsDialog(
                                             contentDescription = "Könyvjelző"
                                         )
                                     }
-                                    IconButton(onClick = { onPickForSplitScreen(page.id) }) {
-                                        Icon(
-                                            imageVector = Icons.Filled.Splitscreen,
-                                            contentDescription = "Split-Screen társoldal választása"
-                                        )
-                                    }
                                 }
                             }
                         }
@@ -1293,114 +1780,37 @@ private fun NotebookDetailsDialog(
 }
 
 /**
- * Hosts either a single active notebook page or two side-by-side notebook pages in Split-Screen
- * mode with an adjustable divider and strictly independent [CanvasStateHolder] and
- * [StrokeJournal] instances per pane (Section 8).
+ * Single-pane 144 Hz notebook workspace hosting [CanvasStateHolder], [DryInkRasterCache],
+ * [StrokeJournal], AI Copilot, and tool overlays.
  */
 @Composable
-fun SplitScreenCanvasWorkspace(
+fun NotebookWorkspaceScreen(
     database: AppDatabase,
-    primaryTarget: OpenedPageTarget,
-    secondaryTarget: OpenedPageTarget?,
+    target: OpenedPageTarget,
     penButtonToggleTick: Long,
     isDarkTheme: Boolean,
     onToggleTheme: () -> Unit,
+    onSelectPageTarget: (OpenedPageTarget) -> Unit,
     onExitToBookshelf: () -> Unit,
-    onCloseSecondaryPane: () -> Unit,
-    onSelectSecondaryFromBookshelf: () -> Unit,
     showDebugOverlay: Boolean = false,
     onToggleDebugOverlay: () -> Unit = {},
     benchmarkStrokeCount: Int = 0,
     modifier: Modifier = Modifier
 ) {
-    var focusedPane by remember { mutableIntStateOf(0) }
-    var splitFraction by remember { mutableFloatStateOf(0.5f) }
-    var containerWidthPx by remember { mutableFloatStateOf(1280f) }
-
-    val cacheBudgetPerPane = if (secondaryTarget != null) {
-        DryInkRasterCache.DEFAULT_MAX_CACHE_BYTES / 2L
-    } else {
-        DryInkRasterCache.DEFAULT_MAX_CACHE_BYTES
-    }
-
-    Row(
-        modifier = modifier
-            .fillMaxSize()
-            .onSizeChanged { size ->
-                if (size.width > 0) containerWidthPx = size.width.toFloat()
-            }
-    ) {
-        Box(
-            modifier = Modifier
-                .weight(if (secondaryTarget != null) splitFraction else 1f)
-                .fillMaxHeight()
-        ) {
-            NotebookPagePane(
-                database = database,
-                target = primaryTarget,
-                cacheBudgetBytes = cacheBudgetPerPane,
-                penButtonToggleTick = if (focusedPane == 0 || secondaryTarget == null) penButtonToggleTick else 0L,
-                isDarkTheme = isDarkTheme,
-                showDebugOverlay = showDebugOverlay,
-                benchmarkStrokeCount = benchmarkStrokeCount,
-                onToggleTheme = onToggleTheme,
-                onToggleDebugOverlay = onToggleDebugOverlay,
-                onFocused = { focusedPane = 0 },
-                onBackToShelf = onExitToBookshelf,
-                onSplitAction = if (secondaryTarget == null) onSelectSecondaryFromBookshelf else onCloseSecondaryPane,
-                isSplitActive = secondaryTarget != null,
-                modifier = Modifier.fillMaxSize()
-            )
-        }
-
-        if (secondaryTarget != null) {
-            Box(
-                modifier = Modifier
-                    .width(10.dp)
-                    .fillMaxHeight()
-                    .background(MaterialTheme.colorScheme.outlineVariant)
-                    .pointerInput(Unit) {
-                        detectHorizontalDragGestures { change, dragAmount ->
-                            change.consume()
-                            val deltaFraction = dragAmount / containerWidthPx.coerceAtLeast(1f)
-                            splitFraction = (splitFraction + deltaFraction).coerceIn(0.28f, 0.72f)
-                        }
-                    },
-                contentAlignment = Alignment.Center
-            ) {
-                Box(
-                    modifier = Modifier
-                        .width(4.dp)
-                        .height(44.dp)
-                        .clip(RoundedCornerShape(2.dp))
-                        .background(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.65f))
-                )
-            }
-
-            Box(
-                modifier = Modifier
-                    .weight(1f - splitFraction)
-                    .fillMaxHeight()
-            ) {
-                NotebookPagePane(
-                    database = database,
-                    target = secondaryTarget,
-                    cacheBudgetBytes = cacheBudgetPerPane,
-                    penButtonToggleTick = if (focusedPane == 1) penButtonToggleTick else 0L,
-                    isDarkTheme = isDarkTheme,
-                    showDebugOverlay = showDebugOverlay,
-                    benchmarkStrokeCount = 0,
-                    onToggleTheme = onToggleTheme,
-                    onToggleDebugOverlay = onToggleDebugOverlay,
-                    onFocused = { focusedPane = 1 },
-                    onBackToShelf = onCloseSecondaryPane,
-                    onSplitAction = onCloseSecondaryPane,
-                    isSplitActive = true,
-                    modifier = Modifier.fillMaxSize()
-                )
-            }
-        }
-    }
+    NotebookPagePane(
+        database = database,
+        target = target,
+        cacheBudgetBytes = DryInkRasterCache.DEFAULT_MAX_CACHE_BYTES,
+        penButtonToggleTick = penButtonToggleTick,
+        isDarkTheme = isDarkTheme,
+        showDebugOverlay = showDebugOverlay,
+        benchmarkStrokeCount = benchmarkStrokeCount,
+        onToggleTheme = onToggleTheme,
+        onToggleDebugOverlay = onToggleDebugOverlay,
+        onSelectPageTarget = onSelectPageTarget,
+        onBackToShelf = onExitToBookshelf,
+        modifier = modifier.fillMaxSize()
+    )
 }
 
 @Composable
@@ -1414,10 +1824,8 @@ private fun NotebookPagePane(
     benchmarkStrokeCount: Int,
     onToggleTheme: () -> Unit,
     onToggleDebugOverlay: () -> Unit,
-    onFocused: () -> Unit,
+    onSelectPageTarget: (OpenedPageTarget) -> Unit,
     onBackToShelf: () -> Unit,
-    onSplitAction: () -> Unit,
-    isSplitActive: Boolean,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -1430,7 +1838,6 @@ private fun NotebookPagePane(
         DryInkRasterCache(maxCacheBytes = cacheBudgetBytes)
     }
     val oledStrokeCache = remember(target) { OledStrokeRenderCache() }
-    val laserStateHolder = remember(target) { LaserTrailStateHolder() }
     val presetStore = remember(context) { BrushPresetStore(context.applicationContext) }
     val presets by presetStore.presetsFlow.collectAsState(initial = BrushPresetStore.defaultPresets)
 
@@ -1438,11 +1845,10 @@ private fun NotebookPagePane(
     var brushConfig by remember(target) { mutableStateOf(BrushConfig()) }
     var lastDrawingTool by remember(target) { mutableStateOf(BrushToolType.FOUNTAIN_PEN) }
     var lastEraserTool by remember(target) { mutableStateOf(BrushToolType.PRECISION_ERASER) }
-    var dockEdge by remember(target) { mutableStateOf(DockEdge.TOP) }
+    val toolDockPrefsStore = remember(context) { ToolDockPreferencesStore(context.applicationContext) }
+    val dockPrefs by toolDockPrefsStore.prefsFlow.collectAsState(initial = ToolDockPrefs())
     var showBrushSettings by remember(target) { mutableStateOf(false) }
     var showPaperSettings by remember(target) { mutableStateOf(false) }
-    var showFunctionPlotter by remember(target) { mutableStateOf(false) }
-    var plotterInitialExpr by remember(target) { mutableStateOf("sin(x)") }
     var showAiCopilot by remember(target) { mutableStateOf(false) }
     var showConsentDialog by remember(target) { mutableStateOf(false) }
     var selectedObjectId by remember(target) { mutableStateOf<String?>(null) }
@@ -1451,8 +1857,13 @@ private fun NotebookPagePane(
 
     var notebookTitle by remember(target) { mutableStateOf("Jegyzetfüzet") }
     var pageNumber by remember(target) { mutableIntStateOf(1) }
+    var currentPageEntity by remember(target) { mutableStateOf<PageEntity?>(null) }
+    val notebookPages by database.pageDao()
+        .observePagesForNotebook(target.notebookId)
+        .collectAsState(initial = emptyList())
+    var showLeftPageDrawer by remember(target.notebookId) { mutableStateOf(false) }
+    var topToolbarBoundsPx by remember { mutableStateOf(Rect.Zero) }
     var isReadOnlyPage by remember(target) { mutableStateOf(false) }
-    var notebookOcrTexts by remember(target) { mutableStateOf<List<String>>(emptyList()) }
 
     val aiConsentStore = remember(context) { AiConsentStore(context.applicationContext) }
     val modelCatalog = remember { ModelCatalog() }
@@ -1460,7 +1871,10 @@ private fun NotebookPagePane(
         GeminiClient(consentStore = aiConsentStore, modelCatalog = modelCatalog)
     }
     val consentState by aiConsentStore.stateFlow.collectAsState(initial = AiConsentState())
-    val pdfExportManager = remember(context) { PdfExportManager(context.applicationContext) }
+    val pdfTileRenderer = remember(context) { PdfTileRenderer(context.filesDir) }
+    val pdfExportManager = remember(context, pdfTileRenderer) {
+        PdfExportManager(context.applicationContext, pdfTileRenderer)
+    }
 
     val palette = LocalStylusSurfacePalette.current
     var viewportSize by remember { mutableStateOf(IntSize.Zero) }
@@ -1529,6 +1943,8 @@ private fun NotebookPagePane(
                         paperConfig = paperConfig,
                         strokes = currentPersistedStrokes(),
                         objects = canvasStateHolder.allPageObjects(),
+                        backgroundPdfAssetId = currentPageEntity?.pdfAssetId,
+                        backgroundPdfPageIndex = currentPageEntity?.pdfPageIndex,
                         liveInkStrokesById = liveStrokes
                     )
                     context.contentResolver.openOutputStream(uri)?.use { out ->
@@ -1577,11 +1993,8 @@ private fun NotebookPagePane(
 
         val nb = withContext(Dispatchers.IO) { database.notebookDao().getNotebookById(target.notebookId) }
         val page = withContext(Dispatchers.IO) { database.pageDao().getPageById(target.pageId) }
-        val ocrTexts = withContext(Dispatchers.IO) {
-            database.pageTextSearchDao().getRecognizedTextsForNotebook(target.notebookId)
-        }
-        notebookOcrTexts = ocrTexts
         if (nb != null) notebookTitle = nb.title
+        currentPageEntity = page
         if (page != null) {
             pageNumber = page.pageIndexInNotebook + 1
             paperConfig = page.pageSizePreset.toPagePaperConfig(
@@ -1629,7 +2042,7 @@ private fun NotebookPagePane(
     val canRedo = canvasStateHolder.canRedo
 
     fun selectTool(nextTool: BrushToolType) {
-        if (nextTool.isDrawingBrush && !nextTool.isLaser) {
+        if (nextTool.isDrawingBrush) {
             lastDrawingTool = nextTool
         } else if (nextTool.isEraser) {
             lastEraserTool = nextTool
@@ -1642,18 +2055,10 @@ private fun NotebookPagePane(
                     colorArgb = BrushConfig.DEFAULT_HIGHLIGHTER_COLOR_ARGB,
                     opacity = BrushConfig.HIGHLIGHTER_OPACITY
                 )
-            nextTool == BrushToolType.LASER ->
-                brushConfig.copy(
-                    toolType = BrushToolType.LASER,
-                    colorArgb = BrushConfig.DEFAULT_LASER_COLOR_ARGB,
-                    sizePt = brushConfig.sizePt.coerceIn(3f, 8f)
-                )
             else ->
                 brushConfig.copy(
                     toolType = nextTool,
-                    colorArgb = if (brushConfig.toolType == BrushToolType.HIGHLIGHTER ||
-                        brushConfig.toolType == BrushToolType.LASER
-                    ) {
+                    colorArgb = if (brushConfig.toolType == BrushToolType.HIGHLIGHTER) {
                         BrushConfig.DEFAULT_INK_COLOR_ARGB
                     } else {
                         brushConfig.colorArgb
@@ -1677,18 +2082,7 @@ private fun NotebookPagePane(
         }
     }
 
-    Box(
-        modifier = modifier.pointerInput(target) {
-            awaitPointerEventScope {
-                while (true) {
-                    val event = awaitPointerEvent()
-                    if (event.changes.any { it.pressed }) {
-                        onFocused()
-                    }
-                }
-            }
-        }
-    ) {
+    Box(modifier = modifier.fillMaxSize()) {
         StylusDrawingSurface(
             transformMatrix = transformMatrix,
             paperConfig = paperConfig,
@@ -1697,7 +2091,6 @@ private fun NotebookPagePane(
             dryStrokeStore = canvasStateHolder,
             dryInkRasterCache = dryInkRasterCache,
             oledStrokeCache = oledStrokeCache,
-            laserStateHolder = laserStateHolder,
             journalCommitSink = strokeJournal,
             onTogglePenEraser = {
                 val next = if (brushConfig.toolType.isEraser) lastDrawingTool else lastEraserTool
@@ -1717,6 +2110,60 @@ private fun NotebookPagePane(
             },
             onViewportSizeChanged = { viewportSize = it },
             onViewportTransformChanged = { syncZoomPercentFromMatrix() },
+            onAiAutoFormatLassoSelection = { selectedIds, onFormatted ->
+                if (selectedIds.isEmpty()) {
+                    onFormatted(false)
+                } else {
+                    coroutineScope.launch {
+                        val selectedRecords = selectedIds.mapNotNull { id ->
+                            canvasStateHolder.getStroke(id)?.let { entry ->
+                                val strokeColor = entry.stroke.brush.colorIntArgb
+                                StrokeBinarySerializer.fromIndexedDryStroke(
+                                    entry = entry,
+                                    brushConfig = brushConfig.copy(colorArgb = strokeColor),
+                                    shapeMeta = canvasStateHolder.getShapeMeta(id)
+                                )
+                            }
+                        }
+                        if (selectedRecords.isEmpty()) {
+                            onFormatted(false)
+                            return@launch
+                        }
+                        val isLocalSingleShape = selectedRecords.size == 1 &&
+                            ShapeRecognizer.recognize(
+                                samples = selectedRecords.first().samples,
+                                requireHoldAtEnd = false,
+                                minConfidence = 0.74f
+                            ) != null
+                        if (!isLocalSingleShape && !consentState.isReadyForUserInitiatedCall) {
+                            showConsentDialog = true
+                            onFormatted(false)
+                            return@launch
+                        }
+                        copilotNoticeBannerHu = "AI formázás folyamatban..."
+                        when (
+                            val res = HandwritingToLatexConverter.autoFormatLassoSelection(
+                                selectedStrokes = selectedRecords,
+                                geminiClient = geminiClient,
+                                canvasStateHolder = canvasStateHolder,
+                                context = context,
+                                journalSink = strokeJournal
+                            )
+                        ) {
+                            is LassoAutoFormatResult.Success -> {
+                                res.createdObjectId?.let { selectedObjectId = it }
+                                historyRevisionTick++
+                                copilotNoticeBannerHu = res.noticeHu
+                                onFormatted(true)
+                            }
+                            is LassoAutoFormatResult.Failure -> {
+                                copilotNoticeBannerHu = res.messageHu
+                                onFormatted(false)
+                            }
+                        }
+                    }
+                }
+            },
             externalDrawVersionTick = externalDrawTick,
             modifier = Modifier.fillMaxSize()
         )
@@ -1759,31 +2206,39 @@ private fun NotebookPagePane(
                         }
                     }
                 },
-                onPlotFromLatex = { latexObj ->
-                    plotterInitialExpr = latexObj.latexSource
-                    showFunctionPlotter = true
-                },
                 modifier = Modifier.fillMaxSize()
             )
         }
 
         CanvasTopToolbar(
             notebookTitle = notebookTitle,
-            pageNumber = pageNumber,
             zoomPercentProvider = { currentZoomPercent },
-            isSplitActive = isSplitActive,
             onBackToShelf = onBackToShelf,
             onZoomOut = { applyStepZoom(0.8f) },
             onResetZoom = { fitPageToViewportNow() },
             onZoomIn = { applyStepZoom(1.25f) },
-            onOpenFunctionPlotter = { showFunctionPlotter = true },
             onOpenAiCopilot = { showAiCopilot = true },
-            onSplitAction = onSplitAction,
             modifier = Modifier
                 .align(Alignment.TopStart)
-                .safeDrawingPadding()
-                .padding(12.dp)
+                .padding(start = 10.dp, top = 8.dp)
+                .onGloballyPositioned { coords ->
+                    topToolbarBoundsPx = coords.boundsInParent()
+                }
         )
+
+        if (benchmarkStrokeCount == 0 && paperConfig.canvasMode == CanvasMode.FIXED_PAGE) {
+            val activeIdx = notebookPages.indexOfFirst { it.id == target.pageId }
+            val currentIdxOneBased = if (activeIdx >= 0) activeIdx + 1 else pageNumber
+            val totalPageCount = notebookPages.size.coerceAtLeast(currentIdxOneBased)
+            LeftPagePullTab(
+                currentPageIndexOneBased = currentIdxOneBased,
+                totalPages = totalPageCount,
+                onOpenDrawer = { showLeftPageDrawer = true },
+                modifier = Modifier
+                    .align(Alignment.CenterStart)
+                    .padding(start = 0.dp)
+            )
+        }
 
         copilotNoticeBannerHu?.let { notice ->
             Surface(
@@ -1824,13 +2279,18 @@ private fun NotebookPagePane(
 
         FloatingToolDock(
             brushConfig = brushConfig,
-            dockEdge = dockEdge,
+            lastDrawingTool = lastDrawingTool,
+            lastEraserTool = lastEraserTool,
+            dockPrefs = dockPrefs,
+            avoidTopLeftRectPx = topToolbarBoundsPx,
             viewportSize = viewportSize,
             canUndo = canUndo,
             canRedo = canRedo,
             isDarkTheme = isDarkTheme,
             showDebugOverlay = showDebugOverlay,
-            onDockEdgeChanged = { dockEdge = it },
+            onUpdateDockPrefs = { next ->
+                coroutineScope.launch { toolDockPrefsStore.savePrefs(next) }
+            },
             onSelectTool = { selectTool(it) },
             onOpenSettings = { showBrushSettings = true },
             onOpenPaperSettings = { showPaperSettings = true },
@@ -1863,6 +2323,61 @@ private fun NotebookPagePane(
             )
         }
 
+        if (showLeftPageDrawer && paperConfig.canvasMode == CanvasMode.FIXED_PAGE) {
+            LeftPageDrawerOverlay(
+                pages = notebookPages,
+                activePageId = target.pageId,
+                onSelectPage = { nextPageId ->
+                    if (nextPageId != target.pageId) {
+                        coroutineScope.launch {
+                            withContext(Dispatchers.IO) {
+                                strokeJournal.flushAndSync()
+                                database.notebookDao().getNotebookById(target.notebookId)?.let { nb ->
+                                    database.notebookDao().upsertNotebook(nb.copy(lastOpenedPageId = nextPageId))
+                                }
+                            }
+                            onSelectPageTarget(OpenedPageTarget(target.notebookId, nextPageId))
+                        }
+                    }
+                },
+                onAddNewPage = {
+                    coroutineScope.launch {
+                        val newPageId = withContext(Dispatchers.IO) {
+                            strokeJournal.flushAndSync()
+                            val now = System.currentTimeMillis()
+                            val nb = database.notebookDao().getNotebookById(target.notebookId)
+                            val createdId = UUID.randomUUID().toString()
+                            val nextIndex = (notebookPages.maxOfOrNull { it.pageIndexInNotebook } ?: -1) + 1
+                            val resolvedPreset = currentPageEntity?.pageSizePreset
+                                ?: PageSizePreset.entries.firstOrNull {
+                                    it.dimensionsPt == paperConfig.pageDimensions
+                                } ?: PageSizePreset.A4_PORTRAIT
+                            database.pageDao().upsertPage(
+                                PageEntity(
+                                    id = createdId,
+                                    notebookId = target.notebookId,
+                                    pageIndexInNotebook = nextIndex,
+                                    canvasMode = CanvasMode.FIXED_PAGE,
+                                    pageSizePreset = resolvedPreset,
+                                    templateType = paperConfig.templateType,
+                                    createdAtEpochMs = now,
+                                    updatedAtEpochMs = now
+                                )
+                            )
+                            if (nb != null) {
+                                database.notebookDao().upsertNotebook(
+                                    nb.copy(lastOpenedPageId = createdId, updatedAtEpochMs = now)
+                                )
+                            }
+                            createdId
+                        }
+                        onSelectPageTarget(OpenedPageTarget(target.notebookId, newPageId))
+                    }
+                },
+                onDismiss = { showLeftPageDrawer = false }
+            )
+        }
+
         if (showPaperSettings) {
             PaperSettingsDialog(
                 currentConfig = paperConfig,
@@ -1886,73 +2401,83 @@ private fun NotebookPagePane(
             )
         }
 
-        if (showFunctionPlotter) {
-            FunctionPlotterDialog(
-                initialExpression = plotterInitialExpr,
-                onDismiss = { showFunctionPlotter = false },
-                onInsertPlot = { expr, xMin, xMax, yMin, yMax ->
-                    val plotObj = PageObject.FunctionPlotObject(
-                        id = UUID.randomUUID().toString(),
-                        zOrder = canvasStateHolder.allocateObjectZOrder(),
-                        bounds = DocRect(90f, 120f, 390f, 340f),
-                        expression = expr,
-                        domainMinX = xMin,
-                        domainMaxX = xMax,
-                        rangeMinY = yMin,
-                        rangeMaxY = yMax,
-                        canonicalColorArgb = brushConfig.colorArgb
-                    )
-                    canvasStateHolder.addPageObject(plotObj)
-                    selectedObjectId = plotObj.id
-                    historyRevisionTick++
-                    coroutineScope.launch { strokeJournal.appendAddObject(plotObj) }
-                }
-            )
-        }
-
         if (showAiCopilot) {
             AiCopilotSheet(
                 notebookTitle = notebookTitle,
+                pageNumber = pageNumber,
+                totalPageCount = notebookPages.size.coerceAtLeast(1),
                 consentState = consentState,
-                currentPageStrokes = currentPersistedStrokes(),
-                notebookOcrTexts = notebookOcrTexts,
                 onOpenConsentSettings = { showConsentDialog = true },
-                onConvertStrokesToLatex = {
-                    val result = HandwritingToLatexConverter.convertLassoToLatex(
-                        selectedStrokes = currentPersistedStrokes(),
-                        geminiClient = geminiClient,
-                        canvasStateHolder = canvasStateHolder,
-                        context = context,
-                        journalSink = strokeJournal
-                    )
-                    when (result) {
-                        is LatexConversionResult.Success -> {
-                            dryInkRasterCache.clearAll()
-                            externalDrawTick++
-                            historyRevisionTick++
-                            selectedObjectId = result.latexObject.id
-                            result.modelSwitchedNoticeHu ?: "Képlet vektoros LaTeX objektummá alakítva (${result.modelIdUsed})."
+                onFormatWithAi = { aiScope, mode ->
+                    runCatching {
+                        val formatText = (mode == AiFormattingMode.FULL_HANDWRITING_AND_FIGURES)
+                        var totalTexts = 0
+                        var totalFormulas = 0
+                        var totalShapes = 0
+
+                        val targets = when (aiScope) {
+                            AiCopilotScope.CURRENT_PAGE -> listOfNotNull(
+                                currentPageEntity ?: notebookPages.firstOrNull { it.id == target.pageId }
+                            )
+                            AiCopilotScope.ENTIRE_WORKBOOK -> notebookPages.ifEmpty {
+                                listOfNotNull(currentPageEntity)
+                            }
                         }
-                        is LatexConversionResult.InvalidLatexError -> result.messageHu
+
+                        for (pageEntity in targets) {
+                            if (pageEntity.id == target.pageId) {
+                                val summary = HandwritingToLatexConverter.formatPageStrokesStructured(
+                                    pageStrokes = currentPersistedStrokes(),
+                                    formatText = formatText,
+                                    geminiClient = geminiClient,
+                                    canvasStateHolder = canvasStateHolder,
+                                    journalSink = strokeJournal,
+                                    context = context
+                                ).getOrThrow()
+                                totalTexts += summary.formattedTextCount
+                                totalFormulas += summary.formattedFormulaCount
+                                totalShapes += summary.formattedShapeCount
+                                dryInkRasterCache.clearAll()
+                                externalDrawTick++
+                                historyRevisionTick++
+                            } else {
+                                val pageDir = File(context.filesDir, "pages/${pageEntity.id}")
+                                val bgJournal = StrokeJournal(pageDirectory = pageDir)
+                                val summary = withContext(Dispatchers.IO) {
+                                    val rec = bgJournal.openAndRecover()
+                                    try {
+                                        if (rec.isReadOnly || rec.strokes.isEmpty()) {
+                                            hu.bdev.stylusnote.ui.canvas.PageFormatSummary(0, 0, 0)
+                                        } else {
+                                            val maxZ = rec.objects.maxOfOrNull { it.zOrder } ?: 1_000_000L
+                                            HandwritingToLatexConverter.formatPageStrokesStructured(
+                                                pageStrokes = rec.strokes,
+                                                formatText = formatText,
+                                                geminiClient = geminiClient,
+                                                canvasStateHolder = null,
+                                                journalSink = bgJournal,
+                                                context = context,
+                                                startingZOrder = maxZ
+                                            ).getOrThrow()
+                                        }
+                                    } finally {
+                                        bgJournal.closeBlocking(compactBeforeClose = !rec.isReadOnly)
+                                    }
+                                }
+                                totalTexts += summary.formattedTextCount
+                                totalFormulas += summary.formattedFormulaCount
+                                totalShapes += summary.formattedShapeCount
+                            }
+                        }
+
+                        val total = totalTexts + totalFormulas + totalShapes
+                        if (total == 0) {
+                            "Nem található formázható elem a kiválasztott hatókörben."
+                        } else {
+                            "Kész (${targets.size} oldal): $totalTexts szöveg, $totalFormulas képlet, $totalShapes alakzat formázva."
+                        }
                     }
                 },
-                onInsertDerivationCard = { cardTitle, cardBody ->
-                    val card = PageObject.DerivationCardObject(
-                        id = UUID.randomUUID().toString(),
-                        zOrder = canvasStateHolder.allocateObjectZOrder(),
-                        bounds = DocRect(72f, 120f, 432f, 310f),
-                        title = cardTitle,
-                        stepsMarkdownLatex = cardBody
-                    )
-                    canvasStateHolder.addPageObject(card)
-                    selectedObjectId = card.id
-                    historyRevisionTick++
-                    strokeJournal.appendAddObject(card)
-                },
-                onExportPagePdf = {
-                    exportPdfLauncher.launch("${notebookTitle.ifBlank { "oldal" }}.pdf")
-                },
-                geminiClient = geminiClient,
                 onDismiss = { showAiCopilot = false }
             )
         }
@@ -1992,27 +2517,23 @@ private fun NotebookPagePane(
 @Composable
 private fun CanvasTopToolbar(
     notebookTitle: String,
-    pageNumber: Int,
     zoomPercentProvider: () -> Int,
-    isSplitActive: Boolean,
     onBackToShelf: () -> Unit,
     onZoomOut: () -> Unit,
     onResetZoom: () -> Unit,
     onZoomIn: () -> Unit,
-    onOpenFunctionPlotter: () -> Unit,
     onOpenAiCopilot: () -> Unit,
-    onSplitAction: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Surface(
         modifier = modifier.graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen },
-        shape = RoundedCornerShape(24.dp),
-        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f),
-        tonalElevation = 4.dp,
-        shadowElevation = 6.dp,
-        border = androidx.compose.foundation.BorderStroke(
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
+        tonalElevation = 3.dp,
+        shadowElevation = 5.dp,
+        border = BorderStroke(
             width = 1.dp,
-            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+            color = MaterialTheme.colorScheme.outlineVariant
         )
     ) {
         Row(
@@ -2024,12 +2545,12 @@ private fun CanvasTopToolbar(
         ) {
             IconButton(
                 onClick = onBackToShelf,
-                modifier = Modifier.size(36.dp)
+                modifier = Modifier.size(34.dp)
             ) {
                 Icon(
                     imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                     contentDescription = "Vissza a polcra",
-                    modifier = Modifier.size(20.dp)
+                    modifier = Modifier.size(18.dp)
                 )
             }
 
@@ -2039,26 +2560,13 @@ private fun CanvasTopToolbar(
                 fontWeight = FontWeight.SemiBold,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.widthIn(max = 280.dp)
+                modifier = Modifier.widthIn(max = 260.dp)
             )
-
-            Surface(
-                shape = CircleShape,
-                color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.8f)
-            ) {
-                Text(
-                    text = "$pageNumber. o.",
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.Medium,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer,
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-                )
-            }
 
             VerticalDivider(
                 modifier = Modifier
                     .padding(horizontal = 4.dp)
-                    .height(20.dp)
+                    .height(18.dp)
             )
 
             Surface(
@@ -2072,12 +2580,12 @@ private fun CanvasTopToolbar(
                 ) {
                     IconButton(
                         onClick = onZoomOut,
-                        modifier = Modifier.size(30.dp)
+                        modifier = Modifier.size(28.dp)
                     ) {
                         Icon(
                             imageVector = Icons.Default.Remove,
                             contentDescription = "Kicsinyítés",
-                            modifier = Modifier.size(16.dp)
+                            modifier = Modifier.size(15.dp)
                         )
                     }
 
@@ -2088,12 +2596,12 @@ private fun CanvasTopToolbar(
 
                     IconButton(
                         onClick = onZoomIn,
-                        modifier = Modifier.size(30.dp)
+                        modifier = Modifier.size(28.dp)
                     ) {
                         Icon(
                             imageVector = Icons.Default.Add,
                             contentDescription = "Nagyítás",
-                            modifier = Modifier.size(16.dp)
+                            modifier = Modifier.size(15.dp)
                         )
                     }
                 }
@@ -2102,40 +2610,32 @@ private fun CanvasTopToolbar(
             VerticalDivider(
                 modifier = Modifier
                     .padding(horizontal = 4.dp)
-                    .height(20.dp)
+                    .height(18.dp)
             )
 
-            IconButton(
-                onClick = onOpenFunctionPlotter,
-                modifier = Modifier.size(36.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Functions,
-                    contentDescription = "Függvényrajzoló",
-                    modifier = Modifier.size(20.dp)
-                )
-            }
-
-            IconButton(
+            Surface(
                 onClick = onOpenAiCopilot,
-                modifier = Modifier.size(36.dp)
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.primaryContainer
             ) {
-                Icon(
-                    imageVector = Icons.Default.AutoAwesome,
-                    contentDescription = "AI Segéd",
-                    modifier = Modifier.size(20.dp)
-                )
-            }
-
-            IconButton(
-                onClick = onSplitAction,
-                modifier = Modifier.size(36.dp)
-            ) {
-                Icon(
-                    imageVector = if (isSplitActive) Icons.Default.Close else Icons.Default.Splitscreen,
-                    contentDescription = if (isSplitActive) "Osztott nézet bezárása" else "Osztott nézet",
-                    modifier = Modifier.size(20.dp)
-                )
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                ) {
+                    Icon(
+                        imageVector = StylusIcons.StarFourPoint,
+                        contentDescription = "AI funkciók",
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Text(
+                        text = "AI",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
             }
         }
     }

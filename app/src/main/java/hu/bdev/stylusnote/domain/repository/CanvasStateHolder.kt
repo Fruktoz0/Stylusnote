@@ -669,6 +669,40 @@ class CanvasStateHolder(
     }
 
     /**
+     * Replaces one or more freehand strokes (e.g. a multi-stroke hand-drawn shape inside a lasso
+     * selection) with a single snapped geometric [Stroke] atomically in one [CanvasAction.CompositeAction].
+     */
+    fun replaceStrokesWithSnappedShape(
+        strokeIds: Collection<String>,
+        snappedStroke: Stroke,
+        shapeMeta: ShapeMeta
+    ): IndexedDryStroke? = synchronized(stateLock) {
+        val removed = strokeIds.distinct().mapNotNull { strokesById[it] }
+        if (removed.isEmpty()) return null
+        val maxZ = removed.maxOf { it.zIndex }
+        val isHighlighter = removed.all { it.isHighlighter }
+        val snappedEntry = IndexedDryStroke(
+            id = uuidGenerator(),
+            stroke = snappedStroke,
+            bounds = computeStrokeDocBounds(snappedStroke),
+            zIndex = maxZ,
+            isHighlighter = isHighlighter
+        )
+        shapeMetaById[snappedEntry.id] = shapeMeta
+
+        val action = CanvasAction.CompositeAction(
+            actions = listOf(
+                CanvasAction.RemovedStrokes(removed),
+                CanvasAction.AddedStrokes(listOf(snappedEntry))
+            ),
+            description = "Alakzat formázás (${shapeMeta.shapeType.displayName})"
+        )
+        applyForwardLocked(action)
+        pushUndoActionLocked(action)
+        snappedEntry
+    }
+
+    /**
      * Begins coalescing a continuous eraser gesture (`ACTION_DOWN`..`ACTION_UP`) so multiple
      * vector deletions or chained precision splits become one Undo step on [finishEraserSession].
      */

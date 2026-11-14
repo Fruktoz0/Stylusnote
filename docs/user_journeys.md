@@ -36,19 +36,18 @@ sequenceDiagram
 
 ---
 
-## 2. Lasszó → Natív LaTeX Konverzió és Undo
+## 2. Lasszó Szellemkép-mentes Mozgatás és `✨ AI` Automatikus Formázás
 
 ```mermaid
 flowchart LR
-    A["Lasszó kijelölés (≥60% pont bent)"] --> B["Világos módú nagyfelbontású Bitmap renderelés (OLED módtól függetlenül)"]
-    B --> C{"AiConsentStore engedélyezve?"}
-    C -- Nem --> D["ConsentDialog (EEA/UK vs. free tier tájékoztató)"]
-    D -- Elfogadva --> E
-    C -- Igen --> E["GeminiClient (Flash modell, JSON {latex})"]
-    E --> F["Kódkerítés tisztítás + jlatexmath-android validálás"]
-    F -- Hibás LaTeX --> G["Hibaüzenet; eredeti kézírás érintetlen"]
-    F -- Érvényes --> H["LatexOverlayNode beszúrása CompositeAction(RemovedStrokes + AddedObject)"]
-    H --> I["Undo esetén egyetlen lépésben visszaáll az eredeti kézírás"]
+    A["Lasszó kijelölés (≥60% pont bent)"] --> M["Húzás közben excludedStrokeIds → eredeti hely üres, nincs szellemkép"]
+    A --> AI{"✨ AI gomb (LassoSelectionActionBar)"}
+    AI -- 1 vonás és alakzat (<10 ms helyi) --> SH["ShapeRecognizer → vektoros vonal / kör / háromszög / téglalap / nyíl"]
+    AI -- Összetett kijelölés (768 px PNG) --> G{"Gemini Flash JSON besorolás"}
+    G -- formula --> L["jlatexmath validálás → LatexObject"]
+    G -- text --> T["FormattedTextObject (HandwritingFontFamily emberi íráshoz hasonló stílus)"]
+    G -- shape --> SH2["Vektoros alakzat + ShapeMeta"]
+    L & T & SH2 --> U["Atomikus CompositeAction + StrokeJournal → 1 lépéses Undo"]
 ```
 
 ---
@@ -84,5 +83,31 @@ flowchart LR
     E -- Nem (Végtelen vászon / lasszó húzás / túlnagyítva) --> G["PaperBackgroundRenderer kötegelt rajz + 512x512 LRU csempék"]
     C --> H["100 ms inaktivitás (settleRunnable)"]
     H --> I["Háttérszálas rebakeSettledScale → éles csempék + GPU Snapshot frissítése"]
+```
+
+---
+
+## 5. Könyvespolc Drag & Drop Rendszerezés, Szelektív PDF és NotebookLM Megosztás
+
+```mermaid
+flowchart TD
+    B1["Könyvespolc (2 panel, bal oldali Kereső + Kategóriák)"] --> B2["Füzet hosszan nyomása → Drag & Drop kategóriára (NotebookEntity.folderId)"]
+    B1 --> B3["Könyv '...' menü → Feltöltés NotebookLM-be..."]
+    B3 --> B4["Teljes könyv / Csak adott oldal → PdfExportManager → FileProvider → Intent.ACTION_SEND"]
+    B1 --> B5["Szelektív PDF Import (parsePageSelectionSpec: pl. '1-3, 5')"]
+    B5 --> B6["PdfTileRenderer → kiválasztott oldalak füzetbe vagy új jegyzetbe"]
+```
+
+---
+
+## 6. Lebegő Eszköztár, 2 Lépcsős Ecsetfül és AI Formázó (Oldal / Munkafüzet)
+
+```mermaid
+flowchart LR
+    T1["FloatingToolDock: globális (x,y) + összecsukott/nyitott állapot (ToolDockPreferencesStore)"] --> T2["Összecsukva: Toll | Radír | Vissza + Megnyitás"]
+    T1 --> T3["Eszköz hosszú érintése → 2 lépcsős BrushSettingsPopover (312 dp lényegi fül ⇄ 472 dp teljes stúdió)"]
+    A1["Bal felső AI gomb → AiCopilotSheet (ESC / backdrop zárás)"] --> A2["Hatókör: Csak adott oldal / Teljes munkafüzet"]
+    A2 --> A3["1. Teljes formázás (HandwritingFontFamily szöveg + ábrák + képletek)"]
+    A2 --> A4["2. Csak alakzatok és képletek (kézírásos folyószöveg érintetlen marad)"]
 ```
 

@@ -212,6 +212,27 @@ class StrokeJournal(
         }
     }
 
+    override fun onStrokesTransformed(strokeIds: List<String>, affine: AffineTransform2D) {
+        if (strokeIds.isEmpty()) return
+        scope.launch {
+            appendTransformStrokes(strokeIds, affine)
+        }
+    }
+
+    override fun onStrokesRecolored(strokeIds: List<String>, canonicalColorArgb: Int) {
+        if (strokeIds.isEmpty()) return
+        scope.launch {
+            appendRecolorStrokes(strokeIds, canonicalColorArgb)
+        }
+    }
+
+    override fun onStrokesDeleted(strokeIds: List<String>) {
+        if (strokeIds.isEmpty()) return
+        scope.launch {
+            appendRemoveStrokes(strokeIds)
+        }
+    }
+
     suspend fun appendAddStrokes(records: List<PersistedStrokeRecord>) {
         if (records.isEmpty()) return
         val encodedFrames = records.map { rec ->

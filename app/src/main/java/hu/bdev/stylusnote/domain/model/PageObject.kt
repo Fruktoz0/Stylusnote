@@ -167,5 +167,25 @@ sealed interface PageObject {
             bounds = affine.transformRect(bounds)
         )
     }
+
+    /**
+     * AI-formatted handwritten text object rendered in human-like cursive typography on the canvas
+     * and exported as italic serif/cursive text in vector PDFs.
+     */
+    data class FormattedTextObject(
+        override val id: String,
+        override val zOrder: Long,
+        override val bounds: DocRect,
+        val text: String,
+        val fontSizePt: Float = 18f,
+        val canonicalColorArgb: Int = BrushConfig.DEFAULT_INK_COLOR_ARGB,
+        val rotationRadians: Float = 0f,
+        val sourceStrokeIds: List<String> = emptyList()
+    ) : PageObject {
+        override fun transform(affine: AffineTransform2D): PageObject = copy(
+            bounds = affine.transformRect(bounds),
+            fontSizePt = (fontSizePt * affine.averageScaleFactor()).coerceIn(10f, 96f)
+        )
+    }
 }
 

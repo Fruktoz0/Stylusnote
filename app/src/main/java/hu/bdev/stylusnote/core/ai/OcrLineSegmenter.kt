@@ -70,7 +70,7 @@ data class SegmentedOcrLine(
 
 /**
  * SpatialIndex-backed handwriting line segmenter (Section 7):
- * - Excludes highlighters, lasers, snapped geometric shapes, oversize diagrams, and Layer-5 objects.
+ * - Excludes highlighters, snapped geometric shapes, oversize diagrams, and Layer-5 objects.
  * - Separates small Hungarian diacritic/dot strokes (`'`, `"`, `¨`, `.`) and attaches them to the
  *   immediately underlying text line.
  * - Clusters strokes by vertical overlap & center distance via [SpatialIndex], orders lines top-to-bottom,
@@ -93,7 +93,6 @@ class OcrLineSegmenter(
 
         when (record.brushConfig.toolType) {
             BrushToolType.HIGHLIGHTER,
-            BrushToolType.LASER,
             BrushToolType.VECTOR_ERASER,
             BrushToolType.PRECISION_ERASER,
             BrushToolType.LASSO -> return false

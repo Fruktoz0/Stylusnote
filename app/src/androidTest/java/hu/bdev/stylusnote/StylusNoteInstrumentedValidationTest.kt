@@ -167,13 +167,12 @@ class StylusNoteInstrumentedValidationTest {
     }
 
     @Test
-    fun brushConfigCreatesAllFiveInkBrushesAndHighlighterUsesDiscardSelfOverlap() {
+    fun brushConfigCreatesAllFourInkBrushesAndHighlighterUsesDiscardSelfOverlap() {
         val brushTypes = listOf(
             BrushToolType.FOUNTAIN_PEN,
             BrushToolType.BALLPOINT_PEN,
             BrushToolType.PENCIL,
-            BrushToolType.HIGHLIGHTER,
-            BrushToolType.LASER
+            BrushToolType.HIGHLIGHTER
         )
         for (type in brushTypes) {
             val inkBrush = BrushConfig(toolType = type, sizePt = 4f).toInkBrush()

@@ -1,7 +1,5 @@
 package hu.bdev.stylusnote.ui.components
 
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -13,7 +11,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -23,34 +20,22 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
-import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Category
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Description
-import androidx.compose.material.icons.filled.Download
-import androidx.compose.material.icons.filled.Functions
-import androidx.compose.material.icons.filled.PictureAsPdf
-import androidx.compose.material.icons.filled.Psychology
-import androidx.compose.material.icons.filled.Quiz
+import androidx.compose.material.icons.filled.Draw
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -63,8 +48,6 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
@@ -75,10 +58,8 @@ import hu.bdev.stylusnote.core.ai.GeminiJsonCodec
 import hu.bdev.stylusnote.core.ai.UserInitiatedAiTrigger
 import hu.bdev.stylusnote.domain.model.PersistedStrokeRecord
 import hu.bdev.stylusnote.ui.canvas.HandwritingToLatexConverter
-import kotlinx.coroutines.Dispatchers
+import hu.bdev.stylusnote.ui.theme.StylusIcons
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import java.nio.charset.StandardCharsets
 
 data class ExamFlashcard(
     val front: String,
@@ -284,52 +265,46 @@ object AiCopilotController {
         """{"type":"object","properties":{"title":{"type":"string"},"flashcards":{"type":"array","items":{"type":"object","properties":{"front":{"type":"string"},"back":{"type":"string"},"topicTag":{"type":"string"}},"required":["front","back"]}},"questions":{"type":"array","items":{"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"}},"correctIndex":{"type":"integer"},"explanation":{"type":"string"}},"required":["question","options","correctIndex"]}}},"required":["title","flashcards","questions"]}"""
 }
 
+enum class AiCopilotScope(val labelHu: String) {
+    CURRENT_PAGE("Csak az adott oldal"),
+    ENTIRE_WORKBOOK("Teljes munkafüzet")
+}
+
+enum class AiFormattingMode(
+    val titleHu: String,
+    val descriptionHu: String
+) {
+    FULL_HANDWRITING_AND_FIGURES(
+        titleHu = "1. Teljes tartalom formázása (kézírásos szöveg + ábrák + képletek)",
+        descriptionHu = "A kijelölt hatókörben gépelt, emberi íráshoz hasonló stílusra alakítja a szöveget, és szépen formázza a vonalakat, ábrákat és képleteket."
+    ),
+    SHAPES_AND_FORMULAS_ONLY(
+        titleHu = "2. Csak alakzatok és képletek formázása",
+        descriptionHu = "A kézzel írt szöveg érintetlen marad; csak az ábrákat, vonalakat és matematikai képleteket javítja ki."
+    )
+}
+
 /**
- * Full-featured Hybrid AI Copilot sheet supporting Handwriting -> Markdown (+ MD/PDF export),
- * Magic Circle / Lasso -> LaTeX, and Exam Mode (Flashcards + Quiz) with ESC & backdrop dismissal
- * (Section 7 & UX Rule 11).
+ * Focused StarNote AI Formatting modal preserving Privacy/BYOK Settings, scope selection
+ * (current page vs entire workbook), and the 2 formatting modes with ESC & backdrop dismissal
+ * (Rule 11).
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AiCopilotSheet(
     notebookTitle: String,
+    pageNumber: Int,
+    totalPageCount: Int,
     consentState: AiConsentState,
-    currentPageStrokes: List<PersistedStrokeRecord>,
-    notebookOcrTexts: List<String>,
     onOpenConsentSettings: () -> Unit,
-    onConvertStrokesToLatex: suspend () -> String,
-    onInsertDerivationCard: suspend (title: String, bodyMarkdown: String) -> Unit,
-    onExportPagePdf: () -> Unit,
-    geminiClient: GeminiClient,
+    onFormatWithAi: suspend (scope: AiCopilotScope, mode: AiFormattingMode) -> Result<String>,
     onDismiss: () -> Unit
 ) {
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-
-    var selectedTab by remember { mutableIntStateOf(0) }
+    val coroutineScope = rememberCoroutineScope()
+    var selectedScope by remember { mutableStateOf(AiCopilotScope.CURRENT_PAGE) }
     var isRunning by remember { mutableStateOf(false) }
-    var statusErrorHu by remember { mutableStateOf<String?>(null) }
-
-    var generatedMarkdown by remember { mutableStateOf("") }
-    var magicExplanation by remember { mutableStateOf<MagicCircleExplanation?>(null) }
-    var examPack by remember { mutableStateOf<ExamStudyPack?>(null) }
-
-    val exportMarkdownLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.CreateDocument("text/markdown")
-    ) { uri ->
-        if (uri != null && generatedMarkdown.isNotBlank()) {
-            scope.launch(Dispatchers.IO) {
-                runCatching {
-                    context.contentResolver.openOutputStream(uri)?.use { out ->
-                        out.write(generatedMarkdown.toByteArray(StandardCharsets.UTF_8))
-                        out.flush()
-                    }
-                }.onFailure { err ->
-                    statusErrorHu = err.message ?: "Markdown mentési hiba."
-                }
-            }
-        }
-    }
+    var statusMessageHu by remember { mutableStateOf<String?>(null) }
+    var isErrorStatus by remember { mutableStateOf(false) }
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -342,7 +317,7 @@ fun AiCopilotSheet(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color.Black.copy(alpha = 0.50f))
+                .background(Color.Black.copy(alpha = 0.45f))
                 .onPreviewKeyEvent { keyEvent ->
                     if (keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.Escape) {
                         onDismiss()
@@ -361,23 +336,25 @@ fun AiCopilotSheet(
         ) {
             Surface(
                 modifier = Modifier
-                    .widthIn(max = 760.dp)
+                    .widthIn(max = 640.dp)
                     .fillMaxWidth()
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null,
                         onClick = {}
                     ),
-                shape = RoundedCornerShape(22.dp),
+                shape = RoundedCornerShape(24.dp),
                 tonalElevation = 6.dp,
-                shadowElevation = 18.dp
+                shadowElevation = 18.dp,
+                color = MaterialTheme.colorScheme.surface
             ) {
                 Column(
                     modifier = Modifier
-                        .padding(20.dp)
+                        .padding(22.dp)
                         .verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
+                    // Header
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
@@ -385,21 +362,29 @@ fun AiCopilotSheet(
                     ) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            Icon(
-                                imageVector = Icons.Default.AutoAwesome,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.primary
-                            )
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = MaterialTheme.colorScheme.primaryContainer
+                            ) {
+                                Icon(
+                                    imageVector = StylusIcons.StarFourPoint,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    modifier = Modifier
+                                        .padding(8.dp)
+                                        .size(22.dp)
+                                )
+                            }
                             Column {
                                 Text(
-                                    text = "AI Copilot",
+                                    text = "AI Formázó",
                                     style = MaterialTheme.typography.titleLarge,
                                     fontWeight = FontWeight.SemiBold
                                 )
                                 Text(
-                                    text = notebookTitle,
+                                    text = "$notebookTitle • $pageNumber / ${totalPageCount.coerceAtLeast(1)}. oldal",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -407,7 +392,10 @@ fun AiCopilotSheet(
                         }
                         Row {
                             IconButton(onClick = onOpenConsentSettings) {
-                                Icon(Icons.Default.Settings, contentDescription = "AI adatvédelmi és kulcs beállítások")
+                                Icon(
+                                    Icons.Default.Settings,
+                                    contentDescription = "AI beállítások és API-kulcs"
+                                )
                             }
                             IconButton(onClick = onDismiss) {
                                 Icon(Icons.Default.Close, contentDescription = "Bezárás")
@@ -415,197 +403,163 @@ fun AiCopilotSheet(
                         }
                     }
 
-                    if (!consentState.isReadyForUserInitiatedCall) {
-                        Surface(
-                            color = MaterialTheme.colorScheme.secondaryContainer,
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.fillMaxWidth()
+                    // Settings & Privacy Status Card
+                    Surface(
+                        color = if (consentState.isReadyForUserInitiatedCall) {
+                            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
+                        } else {
+                            MaterialTheme.colorScheme.secondaryContainer
+                        },
+                        shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .border(
+                                1.dp,
+                                MaterialTheme.colorScheme.outlineVariant,
+                                RoundedCornerShape(16.dp)
+                            )
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Row(
-                                modifier = Modifier.padding(12.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
+                            Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    text = "Az AI funkciók alapból kikapcsoltak. Bekapcsoláshoz fogadd el az adatvédelmi tájékoztatót és adj meg egy BYOK API-kulcsot.",
+                                    text = "AI adatvédelem és BYOK API-beállítások",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.Medium
+                                )
+                                Text(
+                                    text = if (consentState.isReadyForUserInitiatedCall) {
+                                        "Aktív • Modell: ${consentState.selectedModelIdOverride ?: "automatikus Flash"}"
+                                    } else {
+                                        "Kikapcsolva: fogadd el a feltételeket és add meg az API-kulcsot."
+                                    },
                                     style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(10.dp))
+                            OutlinedButton(
+                                onClick = onOpenConsentSettings,
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Text("Beállítások")
+                            }
+                        }
+                    }
+
+                    // Scope Selector
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            text = "Érintett hatókör",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Medium
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            AiCopilotScope.entries.forEach { scopeOption ->
+                                val selected = selectedScope == scopeOption
+                                FilterChip(
+                                    selected = selected,
+                                    enabled = !isRunning,
+                                    onClick = { selectedScope = scopeOption },
+                                    label = {
+                                        val suffix = if (scopeOption == AiCopilotScope.CURRENT_PAGE) {
+                                            " ($pageNumber. o.)"
+                                        } else {
+                                            " (${totalPageCount.coerceAtLeast(1)} oldal)"
+                                        }
+                                        Text(scopeOption.labelHu + suffix)
+                                    },
                                     modifier = Modifier.weight(1f)
                                 )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Button(onClick = onOpenConsentSettings) {
-                                    Text("Beállítás")
-                                }
                             }
                         }
                     }
 
-                    PrimaryTabRow(selectedTabIndex = selectedTab) {
-                        Tab(
-                            selected = selectedTab == 0,
-                            onClick = { selectedTab = 0 },
-                            text = { Text("Jegyzet → MD") },
-                            icon = { Icon(Icons.Default.Description, contentDescription = null, modifier = Modifier.size(18.dp)) }
-                        )
-                        Tab(
-                            selected = selectedTab == 1,
-                            onClick = { selectedTab = 1 },
-                            text = { Text("Magyarázat & LaTeX") },
-                            icon = { Icon(Icons.Default.Psychology, contentDescription = null, modifier = Modifier.size(18.dp)) }
-                        )
-                        Tab(
-                            selected = selectedTab == 2,
-                            onClick = { selectedTab = 2 },
-                            text = { Text("Vizsgamód") },
-                            icon = { Icon(Icons.Default.Quiz, contentDescription = null, modifier = Modifier.size(18.dp)) }
-                        )
-                    }
-
-                    when (selectedTab) {
-                        0 -> {
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Button(
-                                    enabled = !isRunning && consentState.isReadyForUserInitiatedCall,
-                                    onClick = {
-                                        scope.launch {
-                                            isRunning = true
-                                            statusErrorHu = null
-                                            AiCopilotController.convertPagesToStructuredMarkdown(
-                                                pageStrokeBatches = listOf(currentPageStrokes),
-                                                notebookTitle = notebookTitle,
-                                                geminiClient = geminiClient
-                                            ).onSuccess { md ->
-                                                generatedMarkdown = md
-                                            }.onFailure { err ->
-                                                statusErrorHu = err.message ?: "Sikertelen Markdown konverzió."
-                                            }
-                                            isRunning = false
-                                        }
-                                    }
-                                ) {
-                                    Text("Oldal átalakítása Markdownba")
-                                }
-                                if (generatedMarkdown.isNotBlank()) {
-                                    OutlinedButton(
-                                        onClick = { exportMarkdownLauncher.launch("${notebookTitle.ifBlank { "jegyzet" }}.md") }
-                                    ) {
-                                        Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(16.dp))
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                        Text("Export MD")
-                                    }
-                                    OutlinedButton(onClick = onExportPagePdf) {
-                                        Icon(Icons.Default.PictureAsPdf, contentDescription = null, modifier = Modifier.size(16.dp))
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                        Text("Export PDF")
-                                    }
-                                }
-                            }
-                            if (generatedMarkdown.isNotBlank()) {
-                                Surface(
-                                    shape = RoundedCornerShape(12.dp),
-                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Text(
-                                        text = generatedMarkdown,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        fontFamily = FontFamily.Monospace,
-                                        modifier = Modifier.padding(12.dp)
+                    // Two Formatting Actions
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        AiFormattingMode.entries.forEach { mode ->
+                            val enabled = !isRunning && consentState.isReadyForUserInitiatedCall
+                            Surface(
+                                shape = RoundedCornerShape(16.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.36f),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .border(
+                                        1.dp,
+                                        MaterialTheme.colorScheme.outlineVariant,
+                                        RoundedCornerShape(16.dp)
                                     )
-                                }
-                            }
-                        }
-
-                        1 -> {
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Button(
-                                    enabled = !isRunning && consentState.isReadyForUserInitiatedCall,
-                                    onClick = {
-                                        scope.launch {
-                                            isRunning = true
-                                            statusErrorHu = null
-                                            AiCopilotController.explainWithMagicCircle(
-                                                circledStrokes = currentPageStrokes,
-                                                geminiClient = geminiClient
-                                            ).onSuccess { exp ->
-                                                magicExplanation = exp
-                                            }.onFailure { err ->
-                                                statusErrorHu = err.message ?: "Sikertelen magyarázat kérés."
-                                            }
-                                            isRunning = false
-                                        }
-                                    }
-                                ) {
-                                    Text("Magic Circle: Magyarázd el")
-                                }
-                                OutlinedButton(
-                                    enabled = !isRunning && consentState.isReadyForUserInitiatedCall,
-                                    onClick = {
-                                        scope.launch {
-                                            isRunning = true
-                                            statusErrorHu = null
-                                            runCatching { onConvertStrokesToLatex() }
-                                                .onSuccess { msg -> statusErrorHu = msg }
-                                                .onFailure { err -> statusErrorHu = err.message }
-                                            isRunning = false
-                                        }
-                                    }
-                                ) {
-                                    Icon(Icons.Default.Functions, contentDescription = null, modifier = Modifier.size(16.dp))
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text("Képlet → Vektoros LaTeX")
-                                }
-                            }
-
-                            magicExplanation?.let { exp ->
-                                MagicCircleCardContent(
-                                    explanation = exp,
-                                    onInsertToPage = {
-                                        scope.launch {
-                                            val body = buildString {
-                                                appendLine(exp.summaryMarkdown)
-                                                if (exp.examples.isNotEmpty()) {
-                                                    appendLine()
-                                                    appendLine("Példák:")
-                                                    exp.examples.forEach { appendLine("• $it") }
-                                                }
-                                            }.trim()
-                                            onInsertDerivationCard(exp.title, body)
-                                            onDismiss()
-                                        }
-                                    }
-                                )
-                            }
-                        }
-
-                        2 -> {
-                            Button(
-                                enabled = !isRunning && consentState.isReadyForUserInitiatedCall,
-                                onClick = {
-                                    scope.launch {
-                                        isRunning = true
-                                        statusErrorHu = null
-                                        AiCopilotController.generateExamStudyPack(
-                                            notebookTitle = notebookTitle,
-                                            ocrTexts = notebookOcrTexts,
-                                            pageStrokeBatches = listOf(currentPageStrokes),
-                                            geminiClient = geminiClient
-                                        ).onSuccess { pack ->
-                                            examPack = pack
-                                        }.onFailure { err ->
-                                            statusErrorHu = err.message ?: "Sikertelen vizsgagenerálás."
-                                        }
-                                        isRunning = false
-                                    }
-                                }
                             ) {
-                                Text("Flashcardok és kvíz generálása")
-                            }
-
-                            examPack?.let { pack ->
-                                ExamPackInteractiveView(pack = pack)
+                                Column(
+                                    modifier = Modifier.padding(14.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = if (mode == AiFormattingMode.FULL_HANDWRITING_AND_FIGURES) {
+                                                Icons.Default.Draw
+                                            } else {
+                                                Icons.Default.Category
+                                            },
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Text(
+                                            text = mode.titleHu,
+                                            style = MaterialTheme.typography.titleSmall,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                    }
+                                    Text(
+                                        text = mode.descriptionHu,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.End
+                                    ) {
+                                        Button(
+                                            enabled = enabled,
+                                            shape = RoundedCornerShape(12.dp),
+                                            onClick = {
+                                                coroutineScope.launch {
+                                                    isRunning = true
+                                                    statusMessageHu = null
+                                                    isErrorStatus = false
+                                                    onFormatWithAi(selectedScope, mode)
+                                                        .onSuccess { summary ->
+                                                            statusMessageHu = summary
+                                                            isErrorStatus = false
+                                                        }
+                                                        .onFailure { err ->
+                                                            statusMessageHu = err.message ?: "Sikertelen AI formázás."
+                                                            isErrorStatus = true
+                                                        }
+                                                    isRunning = false
+                                                }
+                                            }
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.AutoAwesome,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text("Futtatás")
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -613,162 +567,35 @@ fun AiCopilotSheet(
                     if (isRunning) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
                             CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                            Text("Gemini feldolgozás folyamatban...", style = MaterialTheme.typography.bodySmall)
-                        }
-                    }
-
-                    statusErrorHu?.let { msg ->
-                        Text(
-                            text = msg,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun MagicCircleCardContent(
-    explanation: MagicCircleExplanation,
-    onInsertToPage: () -> Unit
-) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
-        )
-    ) {
-        Column(
-            modifier = Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Text(
-                text = explanation.title,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold
-            )
-            Text(text = explanation.summaryMarkdown, style = MaterialTheme.typography.bodyMedium)
-            if (explanation.examples.isNotEmpty()) {
-                HorizontalDivider()
-                Text(
-                    text = "Példák:",
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.Medium
-                )
-                explanation.examples.forEach { ex ->
-                    Text(text = "• $ex", style = MaterialTheme.typography.bodySmall)
-                }
-            }
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                TextButton(onClick = onInsertToPage) {
-                    Text("Beszúrás kártyaként az oldalra")
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun ExamPackInteractiveView(pack: ExamStudyPack) {
-    val flippedCards = remember(pack) { mutableStateMapOf<Int, Boolean>() }
-    val selectedOptions = remember(pack) { mutableStateMapOf<Int, Int>() }
-
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text(
-            text = pack.title,
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.SemiBold
-        )
-
-        if (pack.flashcards.isNotEmpty()) {
-            Text("Tanulókártyák (koppints a megfordításhoz):", style = MaterialTheme.typography.labelLarge)
-            pack.flashcards.forEachIndexed { idx, card ->
-                val isFlipped = flippedCards[idx] == true
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { flippedCards[idx] = !isFlipped }
-                ) {
-                    Column(modifier = Modifier.padding(12.dp)) {
-                        if (card.topicTag.isNotBlank()) {
                             Text(
-                                text = card.topicTag,
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.primary
+                                text = "AI felismerés és formázás folyamatban (${selectedScope.labelHu})...",
+                                style = MaterialTheme.typography.bodySmall
                             )
                         }
-                        Text(
-                            text = if (isFlipped) card.back else card.front,
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = if (isFlipped) FontWeight.Normal else FontWeight.Medium
-                        )
                     }
-                }
-            }
-        }
 
-        if (pack.questions.isNotEmpty()) {
-            Text("Feleletválasztós teszt:", style = MaterialTheme.typography.labelLarge)
-            pack.questions.forEachIndexed { qIdx, q ->
-                val chosen = selectedOptions[qIdx]
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(12.dp))
-                ) {
-                    Column(
-                        modifier = Modifier.padding(12.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Text(
-                            text = "${qIdx + 1}. ${q.question}",
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.Medium
-                        )
-                        q.options.forEachIndexed { optIdx, optText ->
-                            val isSelected = chosen == optIdx
-                            val isCorrect = optIdx == q.correctIndex
-                            val badgeColor = when {
-                                chosen == null -> Color.Transparent
-                                isCorrect -> Color(0xFF2E7D32).copy(alpha = 0.16f)
-                                isSelected -> MaterialTheme.colorScheme.error.copy(alpha = 0.16f)
-                                else -> Color.Transparent
-                            }
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .background(badgeColor, RoundedCornerShape(8.dp))
-                                    .clickable { selectedOptions[qIdx] = optIdx }
-                                    .padding(horizontal = 10.dp, vertical = 6.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "${'A' + optIdx}) $optText",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    modifier = Modifier.weight(1f)
-                                )
-                                if (chosen != null && isCorrect) {
-                                    Icon(
-                                        imageVector = Icons.Default.CheckCircle,
-                                        contentDescription = null,
-                                        tint = Color(0xFF2E7D32),
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                }
-                            }
-                        }
-                        if (chosen != null && q.explanation.isNotBlank()) {
+                    statusMessageHu?.let { msg ->
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = if (isErrorStatus) {
+                                MaterialTheme.colorScheme.errorContainer
+                            } else {
+                                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.65f)
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
                             Text(
-                                text = q.explanation,
+                                text = msg,
                                 style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                color = if (isErrorStatus) {
+                                    MaterialTheme.colorScheme.onErrorContainer
+                                } else {
+                                    MaterialTheme.colorScheme.onPrimaryContainer
+                                },
+                                modifier = Modifier.padding(12.dp)
                             )
                         }
                     }

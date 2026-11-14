@@ -24,14 +24,13 @@ enum class BrushToolType(val displayName: String) {
     BALLPOINT_PEN("Golyóstoll"),
     PENCIL("Ceruza"),
     HIGHLIGHTER("Kiemelő"),
-    LASER("Lézer"),
     VECTOR_ERASER("Vektoros radír"),
     PRECISION_ERASER("Precíziós radír"),
     LASSO("Lasszó");
 
     val isDrawingBrush: Boolean
         get() = when (this) {
-            FOUNTAIN_PEN, BALLPOINT_PEN, PENCIL, HIGHLIGHTER, LASER -> true
+            FOUNTAIN_PEN, BALLPOINT_PEN, PENCIL, HIGHLIGHTER -> true
             VECTOR_ERASER, PRECISION_ERASER, LASSO -> false
         }
 
@@ -40,9 +39,6 @@ enum class BrushToolType(val displayName: String) {
 
     val isHighlighter: Boolean
         get() = this == HIGHLIGHTER
-
-    val isLaser: Boolean
-        get() = this == LASER
 }
 
 /**
@@ -122,7 +118,6 @@ data class BrushConfig(
         private const val MIN_BRUSH_EPSILON: Float = 0.01f
         const val DEFAULT_INK_COLOR_ARGB: Int = 0xFF14171C.toInt()
         const val DEFAULT_HIGHLIGHTER_COLOR_ARGB: Int = 0xFFFFEB3B.toInt()
-        const val DEFAULT_LASER_COLOR_ARGB: Int = 0xFFFF2D55.toInt()
 
         private val cachedPencilFamily: BrushFamily by lazy { buildTiltSensitivePencilFamily() }
 
@@ -135,7 +130,6 @@ data class BrushConfig(
             BrushToolType.BALLPOINT_PEN -> StockBrushes.marker()
             BrushToolType.PENCIL -> cachedPencilFamily
             BrushToolType.HIGHLIGHTER -> StockBrushes.highlighter(selfOverlap = SelfOverlap.DISCARD)
-            BrushToolType.LASER -> StockBrushes.marker()
             BrushToolType.VECTOR_ERASER,
             BrushToolType.PRECISION_ERASER,
             BrushToolType.LASSO -> StockBrushes.marker()

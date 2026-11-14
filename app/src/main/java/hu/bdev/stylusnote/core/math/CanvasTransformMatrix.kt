@@ -289,7 +289,8 @@ class CanvasTransformMatrix(
     fun screenPxToDocSize(sizePx: Float): Float = sizePx / _scale
 
     companion object {
-        const val MIN_SCALE: Float = 0.25f
+        // Prevent extreme zoom-out where too many 512x512 dry-ink tiles enter viewport simultaneously.
+        const val MIN_SCALE: Float = 0.65f
         const val MAX_SCALE: Float = 5.0f
 
         const val MM_TO_PT: Float = 72f / 25.4f

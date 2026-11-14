@@ -379,6 +379,9 @@ interface PageDao {
     @Query("SELECT * FROM pages WHERE needsOcrSync = 1 ORDER BY updatedAtEpochMs ASC")
     suspend fun getPagesNeedingOcr(): List<PageEntity>
 
+    @Query("SELECT DISTINCT notebookId FROM pages WHERE pdfAssetId IS NOT NULL")
+    fun observePdfNotebookIds(): Flow<List<String>>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertPage(page: PageEntity)
 

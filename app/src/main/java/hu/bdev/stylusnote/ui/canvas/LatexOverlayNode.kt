@@ -63,6 +63,7 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -75,23 +76,37 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.ink.brush.InputToolType
+import androidx.ink.strokes.Stroke as InkStroke
 import hu.bdev.stylusnote.core.ai.FunctionEvaluator
 import hu.bdev.stylusnote.core.ai.FunctionParseException
 import hu.bdev.stylusnote.core.ai.GeminiClient
 import hu.bdev.stylusnote.core.ai.UserInitiatedAiTrigger
+import hu.bdev.stylusnote.core.hardware.StylusPointSample
+import hu.bdev.stylusnote.core.hardware.toStrokeInputBatch
 import hu.bdev.stylusnote.core.math.CanvasTransformMatrix
 import hu.bdev.stylusnote.core.math.ColorLuminanceInverter
+import hu.bdev.stylusnote.core.math.DocPoint
 import hu.bdev.stylusnote.core.math.DocRect
+import hu.bdev.stylusnote.core.math.RecognizedShapeType
+import hu.bdev.stylusnote.core.math.ShapeMeta
+import hu.bdev.stylusnote.core.math.ShapeRecognizer
 import hu.bdev.stylusnote.data.export.StrokeOutlineExtractor
+import hu.bdev.stylusnote.data.local.StrokeBinarySerializer
 import hu.bdev.stylusnote.data.local.StrokeJournal
 import hu.bdev.stylusnote.domain.model.AffineTransform2D
 import hu.bdev.stylusnote.domain.model.BrushConfig
 import hu.bdev.stylusnote.domain.model.PageObject
 import hu.bdev.stylusnote.domain.model.PersistedStrokeRecord
 import hu.bdev.stylusnote.domain.repository.CanvasStateHolder
+import hu.bdev.stylusnote.ui.theme.HandwritingFontFamily
+import org.json.JSONObject
 import ru.noties.jlatexmath.JLatexMathDrawable
+import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -247,6 +262,22 @@ sealed interface LatexConversionResult {
 
     data class InvalidLatexError(val messageHu: String) : LatexConversionResult
 }
+
+sealed interface LassoAutoFormatResult {
+    data class Success(
+        val noticeHu: String,
+        val createdObjectId: String? = null
+    ) : LassoAutoFormatResult
+
+    data class Failure(val messageHu: String) : LassoAutoFormatResult
+}
+
+data class PageFormatSummary(
+    val formattedTextCount: Int,
+    val formattedFormulaCount: Int,
+    val formattedShapeCount: Int,
+    val modelIdUsed: String? = null
+)
 
 /**
  * Orchestrates Lasso -> canonical light-mode Bitmap -> Gemini JSON -> native JLaTeXMath validation ->
@@ -452,6 +483,481 @@ object HandwritingToLatexConverter {
         """{"type":"object","properties":{"latex":{"type":"string"}},"required":["latex"]}"""
     private const val DERIVATION_RESPONSE_SCHEMA =
         """{"type":"object","properties":{"title":{"type":"string"},"steps":{"type":"string"}},"required":["title","steps"]}"""
+    private const val LASSO_AUTO_FORMAT_SCHEMA =
+        """{"type":"object","properties":{"kind":{"type":"string","enum":["formula","text","shape"]},"latex":{"type":"string"},"text":{"type":"string"},"shapeType":{"type":"string","enum":["line","rectangle","circle","ellipse","triangle","arrow"]}},"required":["kind"]}"""
+    private const val PAGE_FORMAT_SCHEMA =
+        """{"type":"object","properties":{"elements":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string","enum":["text","formula","shape"]},"box":{"type":"array","items":{"type":"number"}},"text":{"type":"string"},"latex":{"type":"string"},"shapeType":{"type":"string","enum":["line","rectangle","circle","ellipse","triangle","arrow"]}},"required":["kind","box"]}}},"required":["elements"]}"""
+
+    private const val LASSO_FAST_EDGE_PX = 768
+
+    /**
+     * Quickly classifies and formats the active Lasso stroke selection:
+     * 1) Runs <10 ms local geometric recognition via [ShapeRecognizer] on single strokes first;
+     * 2) Falls back to a compact 768 px Gemini Flash JSON classification producing a
+     *    [PageObject.LatexObject], a handwriting-styled [PageObject.FormattedTextObject], or a
+     *    snapped vector shape.
+     */
+    suspend fun autoFormatLassoSelection(
+        selectedStrokes: List<PersistedStrokeRecord>,
+        geminiClient: GeminiClient,
+        canvasStateHolder: CanvasStateHolder,
+        context: Context? = null,
+        journalSink: StrokeJournal? = null
+    ): LassoAutoFormatResult {
+        if (selectedStrokes.isEmpty()) {
+            return LassoAutoFormatResult.Failure("Nincs kijelölt vonás.")
+        }
+
+        // Fast local path (<10 ms) when a single freehand stroke is already a clean geometric primitive.
+        if (selectedStrokes.size == 1) {
+            val single = selectedStrokes.first()
+            val localShape = ShapeRecognizer.recognize(
+                samples = single.samples,
+                requireHoldAtEnd = false,
+                minConfidence = 0.74f
+            )
+            if (localShape != null) {
+                val snappedRecord = buildSnappedStrokeRecord(
+                    templateRecord = single,
+                    shapeMeta = localShape.shapeMeta,
+                    snappedSamples = localShape.snappedSamples
+                )
+                val (snappedEntry, _) = StrokeBinarySerializer.toIndexedDryStroke(snappedRecord)
+                canvasStateHolder.replaceStrokesWithSnappedShape(
+                    strokeIds = listOf(single.id),
+                    snappedStroke = snappedEntry.stroke,
+                    shapeMeta = localShape.shapeMeta
+                )
+                journalSink?.appendRemoveStrokes(listOf(single.id))
+                journalSink?.appendAddStrokes(listOf(snappedRecord))
+                return LassoAutoFormatResult.Success(
+                    noticeHu = "Alakzat kiegyenesítve (${localShape.shapeMeta.shapeType.displayName})."
+                )
+            }
+        }
+
+        val bitmap = renderStrokesToCanonicalLightBitmap(
+            strokes = selectedStrokes,
+            targetLongEdgePx = LASSO_FAST_EDGE_PX
+        )
+        val pngBytes = try {
+            GeminiClient.prepareInlinePngBytes(bitmap, targetLongEdgePx = LASSO_FAST_EDGE_PX)
+        } finally {
+            if (!bitmap.isRecycled) bitmap.recycle()
+        }
+
+        val response = runCatching {
+            geminiClient.generateContent(
+                trigger = UserInitiatedAiTrigger.LASSO_AUTO_FORMAT,
+                promptText = "Osztályozd a képen látható kijelölést (`formula`, `text`, vagy `shape`), " +
+                    "majd add vissza a tisztázott eredményt JSON-ban. " +
+                    "Ha `formula`: töltsd ki a `latex` mezőt pontos LaTeX-szel (határolók nélkül). " +
+                    "Ha `text`: töltsd ki a `text` mezőt pontos magyar/angol szöveggel sortöréseket megőrizve. " +
+                    "Ha `shape`: válassz `shapeType`-ot (`line`, `rectangle`, `circle`, `ellipse`, `triangle`, `arrow`).",
+                inlinePngImages = listOf(pngBytes),
+                responseMimeType = "application/json",
+                responseSchemaJson = LASSO_AUTO_FORMAT_SCHEMA,
+                systemInstruction = "Villámgyors jegyzet-digitalizáló asszisztens vagy. Mindig rövid, pontos JSON objektummal válaszolj."
+            )
+        }.getOrElse { err ->
+            return LassoAutoFormatResult.Failure(err.message ?: "Sikertelen AI felismerés.")
+        }
+
+        val bounds = mergeStrokeDocRects(selectedStrokes)
+        val strokeIds = selectedStrokes.map { it.id }
+        val canonicalColor = selectedStrokes.first().canonicalColorArgb
+        val json = runCatching { JSONObject(GeminiClient.stripMarkdownCodeFences(response.text)) }
+            .getOrNull()
+            ?: return LassoAutoFormatResult.Failure("Érvénytelen AI válaszformátum.")
+
+        val kind = json.optString("kind").trim().lowercase()
+        val latexRaw = json.optString("latex").trim()
+        val textRaw = json.optString("text").trim()
+        val shapeRaw = json.optString("shapeType").trim()
+
+        return when (kind) {
+            "shape" -> {
+                val shapeType = parseRecognizedShapeType(shapeRaw) ?: RecognizedShapeType.RECTANGLE
+                val meta = buildShapeMetaForBounds(shapeType, bounds)
+                val tpl = selectedStrokes.first().samples.firstOrNull() ?: defaultTemplateSample(bounds)
+                val snappedSamples = meta.generateSamples(tpl)
+                val snappedRecord = buildSnappedStrokeRecord(selectedStrokes.first(), meta, snappedSamples)
+                val (snappedEntry, _) = StrokeBinarySerializer.toIndexedDryStroke(snappedRecord)
+                canvasStateHolder.replaceStrokesWithSnappedShape(
+                    strokeIds = strokeIds,
+                    snappedStroke = snappedEntry.stroke,
+                    shapeMeta = meta
+                )
+                journalSink?.appendRemoveStrokes(strokeIds)
+                journalSink?.appendAddStrokes(listOf(snappedRecord))
+                LassoAutoFormatResult.Success("Alakzat formázva (${shapeType.displayName}).")
+            }
+
+            "formula", "latex" -> {
+                val validation = LatexSyntaxValidator.validate(latexRaw, context)
+                if (validation.isValid) {
+                    val latexObj = PageObject.LatexObject(
+                        id = java.util.UUID.randomUUID().toString(),
+                        zOrder = canvasStateHolder.allocateObjectZOrder(),
+                        bounds = bounds,
+                        latexSource = validation.normalizedLatex,
+                        fontSizePt = (bounds.heightPt * 0.65f).coerceIn(14f, 42f),
+                        canonicalColorArgb = canonicalColor,
+                        sourceStrokeIds = strokeIds
+                    )
+                    canvasStateHolder.replaceStrokesWithPageObject(strokeIds, latexObj)
+                    journalSink?.appendRemoveStrokes(strokeIds)
+                    journalSink?.appendAddObject(latexObj)
+                    LassoAutoFormatResult.Success("Képlet LaTeX formátumra alakítva.", latexObj.id)
+                } else {
+                    val fallbackText = textRaw.ifBlank { latexRaw }
+                    if (fallbackText.isBlank()) {
+                        return LassoAutoFormatResult.Failure(
+                            validation.errorMessageHu ?: "Nem sikerült felismerni a kijelölést."
+                        )
+                    }
+                    val textObj = buildFormattedTextObject(
+                        bounds = bounds,
+                        text = fallbackText,
+                        zOrder = canvasStateHolder.allocateObjectZOrder(),
+                        canonicalColorArgb = canonicalColor,
+                        sourceStrokeIds = strokeIds
+                    )
+                    canvasStateHolder.replaceStrokesWithPageObject(strokeIds, textObj)
+                    journalSink?.appendRemoveStrokes(strokeIds)
+                    journalSink?.appendAddObject(textObj)
+                    LassoAutoFormatResult.Success("Szöveg rendezett kézírásos stílusra alakítva.", textObj.id)
+                }
+            }
+
+            else -> {
+                val cleanedText = textRaw.ifBlank { latexRaw }
+                if (cleanedText.isBlank()) {
+                    return LassoAutoFormatResult.Failure("Nem található felismerhető szöveg a kijelölésben.")
+                }
+                val textObj = buildFormattedTextObject(
+                    bounds = bounds,
+                    text = cleanedText,
+                    zOrder = canvasStateHolder.allocateObjectZOrder(),
+                    canonicalColorArgb = canonicalColor,
+                    sourceStrokeIds = strokeIds
+                )
+                canvasStateHolder.replaceStrokesWithPageObject(strokeIds, textObj)
+                journalSink?.appendRemoveStrokes(strokeIds)
+                journalSink?.appendAddObject(textObj)
+                LassoAutoFormatResult.Success("Szöveg rendezett kézírásos stílusra alakítva.", textObj.id)
+            }
+        }
+    }
+
+    /**
+     * Formats all elements on a page using Vision AI (`formatText = true` converts handwritten prose
+     * to [PageObject.FormattedTextObject], math to [PageObject.LatexObject], and diagrams/lines to
+     * crisp vector shapes; `formatText = false` preserves handwritten prose and only formats formulas
+     * and geometric figures).
+     *
+     * Pass [canvasStateHolder] when mutating the currently displayed page, or omit it to mutate a
+     * closed workbook page directly through [journalSink].
+     */
+    suspend fun formatPageStrokesStructured(
+        pageStrokes: List<PersistedStrokeRecord>,
+        formatText: Boolean,
+        geminiClient: GeminiClient,
+        canvasStateHolder: CanvasStateHolder? = null,
+        journalSink: StrokeJournal? = null,
+        context: Context? = null,
+        startingZOrder: Long = 1_000_000L
+    ): Result<PageFormatSummary> = runCatching {
+        if (pageStrokes.isEmpty()) {
+            return@runCatching PageFormatSummary(0, 0, 0)
+        }
+
+        val frame = computeStrokeCanvasFrame(pageStrokes)
+        val bitmap = renderStrokesToCanonicalLightBitmap(
+            strokes = pageStrokes,
+            targetLongEdgePx = GeminiClient.DEFAULT_INLINE_IMAGE_LONG_EDGE_PX
+        )
+        val pngBytes = try {
+            GeminiClient.prepareInlinePngBytes(bitmap, targetLongEdgePx = GeminiClient.DEFAULT_INLINE_IMAGE_LONG_EDGE_PX)
+        } finally {
+            if (!bitmap.isRecycled) bitmap.recycle()
+        }
+
+        val modeInstruction = if (formatText) {
+            "Az oldalon látható ÖSSZES elemet azonosítsd: `text` (kézzel írt bekezdések/listák), " +
+                "`formula` (matematikai képletek LaTeX-ben), és `shape` (vonalak, nyilak, téglalapok, körök, háromszögek). "
+        } else {
+            "Az oldalon kizárólag a `formula` (matematikai képletek LaTeX-ben) és `shape` (ábrák, nyilak, téglalapok, körök, háromszögek, vonalak) elemeket add vissza; " +
+                "a sima kézírott folyószöveget hagyd figyelmen kívül! "
+        }
+
+        val response = geminiClient.generateContent(
+            trigger = UserInitiatedAiTrigger.HANDWRITING_TO_MARKDOWN,
+            promptText = modeInstruction +
+                "Minden elemhez add meg a `box` [yMin, xMin, yMax, xMax] határoló dobozát 0..1000 skálán a képhez képest, " +
+                "továbbá a megfelelő `text`, `latex` vagy `shapeType` mezőt.",
+            inlinePngImages = listOf(pngBytes),
+            responseMimeType = "application/json",
+            responseSchemaJson = PAGE_FORMAT_SCHEMA,
+            systemInstruction = "Precíz jegyzet- és ábrafelismerő vagy. Pontos 0..1000-es koordinátájú JSON-t adj vissza."
+        )
+
+        val root = JSONObject(GeminiClient.stripMarkdownCodeFences(response.text))
+        val array = root.optJSONArray("elements")
+            ?: return@runCatching PageFormatSummary(0, 0, 0, response.modelIdUsed)
+
+        val consumedStrokeIds = LinkedHashSet<String>()
+        var nextZ = startingZOrder
+        var textCount = 0
+        var formulaCount = 0
+        var shapeCount = 0
+
+        for (i in 0 until array.length()) {
+            val item = array.optJSONObject(i) ?: continue
+            val kind = item.optString("kind").trim().lowercase()
+            if (!formatText && kind == "text") continue
+
+            val boxArr = item.optJSONArray("box") ?: continue
+            if (boxArr.length() < 4) continue
+            val yMin = boxArr.optDouble(0, 0.0).toFloat().coerceIn(0f, 1000f) / 1000f
+            val xMin = boxArr.optDouble(1, 0.0).toFloat().coerceIn(0f, 1000f) / 1000f
+            val yMax = boxArr.optDouble(2, 1000.0).toFloat().coerceIn(0f, 1000f) / 1000f
+            val xMax = boxArr.optDouble(3, 1000.0).toFloat().coerceIn(0f, 1000f) / 1000f
+            val rawBox = DocRect(
+                leftPt = frame.leftPt + min(xMin, xMax) * frame.widthPt,
+                topPt = frame.topPt + min(yMin, yMax) * frame.heightPt,
+                rightPt = max(frame.leftPt + min(xMin, xMax) * frame.widthPt + 28f, frame.leftPt + max(xMin, xMax) * frame.widthPt),
+                bottomPt = max(frame.topPt + min(yMin, yMax) * frame.heightPt + 24f, frame.topPt + max(yMin, yMax) * frame.heightPt)
+            )
+
+            val matchBox = rawBox.inflate(14f)
+            val matchedStrokes = pageStrokes.filter { s ->
+                !consumedStrokeIds.contains(s.id) &&
+                    matchBox.contains((s.bounds.leftPt + s.bounds.rightPt) * 0.5f, (s.bounds.topPt + s.bounds.bottomPt) * 0.5f)
+            }
+            if (matchedStrokes.isEmpty() && array.length() > 1) continue
+
+            val targetStrokes = matchedStrokes.ifEmpty {
+                pageStrokes.filter { !consumedStrokeIds.contains(it.id) }
+            }
+            if (targetStrokes.isEmpty()) continue
+            val targetIds = targetStrokes.map { it.id }
+            val tightBounds = mergeStrokeDocRects(targetStrokes)
+            val canonicalColor = targetStrokes.first().canonicalColorArgb
+            val zOrder = canvasStateHolder?.allocateObjectZOrder() ?: (++nextZ)
+
+            when (kind) {
+                "shape" -> {
+                    val shapeType = parseRecognizedShapeType(item.optString("shapeType"))
+                        ?: RecognizedShapeType.RECTANGLE
+                    val meta = buildShapeMetaForBounds(shapeType, tightBounds)
+                    val tpl = targetStrokes.first().samples.firstOrNull() ?: defaultTemplateSample(tightBounds)
+                    val snappedSamples = meta.generateSamples(tpl)
+                    val snappedRecord = buildSnappedStrokeRecord(targetStrokes.first(), meta, snappedSamples)
+                    if (canvasStateHolder != null) {
+                        val (snappedEntry, _) = StrokeBinarySerializer.toIndexedDryStroke(snappedRecord)
+                        canvasStateHolder.replaceStrokesWithSnappedShape(targetIds, snappedEntry.stroke, meta)
+                    }
+                    journalSink?.appendRemoveStrokes(targetIds)
+                    journalSink?.appendAddStrokes(listOf(snappedRecord))
+                    consumedStrokeIds.addAll(targetIds)
+                    shapeCount++
+                }
+
+                "formula", "latex" -> {
+                    val rawLatex = item.optString("latex").trim()
+                    val validation = LatexSyntaxValidator.validate(rawLatex, context)
+                    if (validation.isValid) {
+                        val obj = PageObject.LatexObject(
+                            id = java.util.UUID.randomUUID().toString(),
+                            zOrder = zOrder,
+                            bounds = tightBounds,
+                            latexSource = validation.normalizedLatex,
+                            fontSizePt = (tightBounds.heightPt * 0.65f).coerceIn(14f, 42f),
+                            canonicalColorArgb = canonicalColor,
+                            sourceStrokeIds = targetIds
+                        )
+                        canvasStateHolder?.replaceStrokesWithPageObject(targetIds, obj)
+                        journalSink?.appendRemoveStrokes(targetIds)
+                        journalSink?.appendAddObject(obj)
+                        consumedStrokeIds.addAll(targetIds)
+                        formulaCount++
+                    }
+                }
+
+                "text" -> if (formatText) {
+                    val textVal = item.optString("text").trim()
+                    if (textVal.isNotEmpty()) {
+                        val obj = buildFormattedTextObject(
+                            bounds = tightBounds,
+                            text = textVal,
+                            zOrder = zOrder,
+                            canonicalColorArgb = canonicalColor,
+                            sourceStrokeIds = targetIds
+                        )
+                        canvasStateHolder?.replaceStrokesWithPageObject(targetIds, obj)
+                        journalSink?.appendRemoveStrokes(targetIds)
+                        journalSink?.appendAddObject(obj)
+                        consumedStrokeIds.addAll(targetIds)
+                        textCount++
+                    }
+                }
+            }
+        }
+
+        PageFormatSummary(
+            formattedTextCount = textCount,
+            formattedFormulaCount = formulaCount,
+            formattedShapeCount = shapeCount,
+            modelIdUsed = response.modelIdUsed
+        )
+    }
+
+    private fun computeStrokeCanvasFrame(strokes: List<PersistedStrokeRecord>): DocRect {
+        var minX = Float.POSITIVE_INFINITY
+        var minY = Float.POSITIVE_INFINITY
+        var maxX = Float.NEGATIVE_INFINITY
+        var maxY = Float.NEGATIVE_INFINITY
+        for (s in strokes) {
+            val pad = s.sizePt
+            minX = min(minX, s.bounds.leftPt - pad)
+            minY = min(minY, s.bounds.topPt - pad)
+            maxX = max(maxX, s.bounds.rightPt + pad)
+            maxY = max(maxY, s.bounds.bottomPt + pad)
+        }
+        val docW = (maxX - minX).coerceAtLeast(24f) + 24f
+        val docH = (maxY - minY).coerceAtLeast(24f) + 24f
+        val originX = minX - 12f
+        val originY = minY - 12f
+        return DocRect(originX, originY, originX + docW, originY + docH)
+    }
+
+    private fun buildFormattedTextObject(
+        bounds: DocRect,
+        text: String,
+        zOrder: Long,
+        canonicalColorArgb: Int,
+        sourceStrokeIds: List<String>
+    ): PageObject.FormattedTextObject {
+        val lines = text.lines().size.coerceAtLeast(1)
+        val estimatedPt = ((bounds.heightPt / lines) * 0.62f).coerceIn(14f, 34f)
+        return PageObject.FormattedTextObject(
+            id = java.util.UUID.randomUUID().toString(),
+            zOrder = zOrder,
+            bounds = bounds,
+            text = text,
+            fontSizePt = estimatedPt,
+            canonicalColorArgb = canonicalColorArgb,
+            sourceStrokeIds = sourceStrokeIds
+        )
+    }
+
+    private fun parseRecognizedShapeType(raw: String): RecognizedShapeType? = when (raw.trim().lowercase()) {
+        "line" -> RecognizedShapeType.LINE
+        "arrow" -> RecognizedShapeType.ARROW
+        "circle" -> RecognizedShapeType.CIRCLE
+        "ellipse", "oval" -> RecognizedShapeType.ELLIPSE
+        "triangle" -> RecognizedShapeType.TRIANGLE
+        "rectangle", "rect", "square", "box" -> RecognizedShapeType.RECTANGLE
+        else -> null
+    }
+
+    private fun buildShapeMetaForBounds(shapeType: RecognizedShapeType, bounds: DocRect): ShapeMeta {
+        val cx = (bounds.leftPt + bounds.rightPt) * 0.5f
+        val cy = (bounds.topPt + bounds.bottomPt) * 0.5f
+        val pts: List<DocPoint> = when (shapeType) {
+            RecognizedShapeType.LINE, RecognizedShapeType.ARROW -> {
+                if (bounds.widthPt >= bounds.heightPt * 0.6f) {
+                    listOf(DocPoint(bounds.leftPt, cy), DocPoint(bounds.rightPt, cy))
+                } else {
+                    listOf(DocPoint(cx, bounds.topPt), DocPoint(cx, bounds.bottomPt))
+                }
+            }
+            RecognizedShapeType.CIRCLE -> {
+                val r = (min(bounds.widthPt, bounds.heightPt) * 0.5f).coerceAtLeast(10f)
+                listOf(DocPoint(cx, cy), DocPoint(cx + r, cy))
+            }
+            RecognizedShapeType.ELLIPSE -> listOf(
+                DocPoint(cx, cy),
+                DocPoint(bounds.rightPt, cy),
+                DocPoint(cx, bounds.bottomPt)
+            )
+            RecognizedShapeType.TRIANGLE -> listOf(
+                DocPoint(cx, bounds.topPt),
+                DocPoint(bounds.rightPt, bounds.bottomPt),
+                DocPoint(bounds.leftPt, bounds.bottomPt)
+            )
+            RecognizedShapeType.RECTANGLE -> listOf(
+                DocPoint(bounds.leftPt, bounds.topPt),
+                DocPoint(bounds.rightPt, bounds.topPt),
+                DocPoint(bounds.rightPt, bounds.bottomPt),
+                DocPoint(bounds.leftPt, bounds.bottomPt)
+            )
+        }
+        return ShapeMeta(shapeType = shapeType, controlPoints = pts, rotationRadians = 0f)
+    }
+
+    private fun defaultTemplateSample(bounds: DocRect) = StylusPointSample(
+        xPt = bounds.leftPt,
+        yPt = bounds.topPt,
+        elapsedTimeMillis = 0L,
+        pressure = 0.6f,
+        tiltRadians = 0f,
+        orientationRadians = 0f,
+        isEraserTool = false
+    )
+
+    private fun buildSnappedStrokeRecord(
+        templateRecord: PersistedStrokeRecord,
+        shapeMeta: ShapeMeta,
+        snappedSamples: List<StylusPointSample>
+    ): PersistedStrokeRecord {
+        val newId = java.util.UUID.randomUUID().toString()
+        val inkInputs = runCatching {
+            snappedSamples.toStrokeInputBatch(InputToolType.STYLUS)
+        }.getOrNull()
+        val encodedInputs = inkInputs?.let { batch ->
+            runCatching {
+                val inkStroke = InkStroke(
+                    brush = templateRecord.brushConfig.toInkBrush(templateRecord.canonicalColorArgb),
+                    inputs = batch
+                )
+                StrokeBinarySerializer.fromIndexedDryStroke(
+                    entry = IndexedDryStroke(
+                        id = newId,
+                        stroke = inkStroke,
+                        bounds = mergeSamplesBounds(snappedSamples),
+                        zIndex = templateRecord.zOrder,
+                        isHighlighter = templateRecord.layer == hu.bdev.stylusnote.domain.model.StrokeLayerType.HIGHLIGHTER
+                    ),
+                    brushConfig = templateRecord.brushConfig,
+                    shapeMeta = shapeMeta
+                )
+            }.getOrNull()
+        }
+        return encodedInputs ?: templateRecord.copy(
+            id = newId,
+            inkEncodedInputs = null,
+            samples = snappedSamples,
+            bounds = mergeSamplesBounds(snappedSamples),
+            shapeMeta = shapeMeta
+        )
+    }
+
+    private fun mergeSamplesBounds(samples: List<StylusPointSample>): DocRect {
+        if (samples.isEmpty()) return DocRect(0f, 0f, 24f, 24f)
+        var minX = Float.POSITIVE_INFINITY
+        var minY = Float.POSITIVE_INFINITY
+        var maxX = Float.NEGATIVE_INFINITY
+        var maxY = Float.NEGATIVE_INFINITY
+        for (s in samples) {
+            minX = min(minX, s.xPt)
+            minY = min(minY, s.yPt)
+            maxX = max(maxX, s.xPt)
+            maxY = max(maxY, s.yPt)
+        }
+        return DocRect(minX, minY, max(maxX, minX + 4f), max(maxY, minY + 4f))
+    }
 }
 
 /**
@@ -469,7 +975,6 @@ fun PageObjectsOverlayLayer(
     onUpdateObject: (PageObject) -> Unit,
     onDeleteObject: (String) -> Unit,
     onRequestStepByStep: (PageObject.LatexObject) -> Unit,
-    onPlotFromLatex: (PageObject.LatexObject) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val snapshot = transformMatrix.snapshot()
@@ -525,8 +1030,7 @@ fun PageObjectsOverlayLayer(
                         isSelected = isSelected,
                         onUpdateObject = onUpdateObject,
                         onDelete = { onDeleteObject(obj.id) },
-                        onRequestStepByStep = { onRequestStepByStep(obj) },
-                        onPlotFromLatex = { onPlotFromLatex(obj) }
+                        onRequestStepByStep = { onRequestStepByStep(obj) }
                     )
 
                     is PageObject.DerivationCardObject -> DerivationCardNode(
@@ -547,6 +1051,15 @@ fun PageObjectsOverlayLayer(
                     )
 
                     is PageObject.PdfPageRefObject -> Unit
+
+                    is PageObject.FormattedTextObject -> FormattedTextOverlayNode(
+                        textObject = obj,
+                        scale = scale,
+                        isOledMode = isOledMode,
+                        isSelected = isSelected,
+                        onUpdateObject = onUpdateObject,
+                        onDelete = { onDeleteObject(obj.id) }
+                    )
                 }
             }
         }
@@ -562,8 +1075,7 @@ fun LatexOverlayNode(
     isSelected: Boolean,
     onUpdateObject: (PageObject.LatexObject) -> Unit,
     onDelete: () -> Unit,
-    onRequestStepByStep: () -> Unit,
-    onPlotFromLatex: () -> Unit
+    onRequestStepByStep: () -> Unit
 ) {
     LocalContext.current
     val effectiveColorArgb = remember(latexObject.canonicalColorArgb, isOledMode) {
@@ -639,15 +1151,6 @@ fun LatexOverlayNode(
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text("Levezetés")
-                    }
-                    TextButton(onClick = onPlotFromLatex) {
-                        Icon(
-                            imageVector = Icons.Default.ShowChart,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Grafikon")
                     }
                     // Color swatches (canonical light colors)
                     LATEX_COLOR_SWATCHES.forEach { swatchArgb ->
@@ -891,183 +1394,126 @@ fun FunctionPlotNode(
     }
 }
 
-/**
- * Interactive vector function plotter dialog supporting ESC and backdrop dismiss (UX Rule 11).
- */
-@Composable
-fun FunctionPlotterDialog(
-    initialExpression: String = "sin(x)",
-    onDismiss: () -> Unit,
-    onInsertPlot: (expression: String, xMin: Float, xMax: Float, yMin: Float, yMax: Float) -> Unit
-) {
-    var expressionInput by remember(initialExpression) { mutableStateOf(initialExpression) }
-    var xMinInput by remember { mutableStateOf("-6.28") }
-    var xMaxInput by remember { mutableStateOf("6.28") }
-    var yMinInput by remember { mutableStateOf("-3") }
-    var yMaxInput by remember { mutableStateOf("3") }
-    var errorHu by remember { mutableStateOf<String?>(null) }
-
-    Dialog(
-        onDismissRequest = onDismiss,
-        properties = DialogProperties(
-            usePlatformDefaultWidth = false,
-            dismissOnBackPress = true,
-            dismissOnClickOutside = true
-        )
-    ) {
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(Color.Black.copy(alpha = 0.48f))
-                .onPreviewKeyEvent { keyEvent ->
-                    if (keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.Escape) {
-                        onDismiss()
-                        true
-                    } else {
-                        false
-                    }
-                }
-                .clickable(
-                    interactionSource = remember { MutableInteractionSource() },
-                    indication = null,
-                    onClick = onDismiss
-                )
-                .padding(24.dp),
-            contentAlignment = Alignment.Center
-        ) {
-            Surface(
-                modifier = Modifier
-                    .widthIn(max = 520.dp)
-                    .fillMaxWidth()
-                    .clickable(
-                        interactionSource = remember { MutableInteractionSource() },
-                        indication = null,
-                        onClick = {}
-                    ),
-                shape = RoundedCornerShape(18.dp),
-                tonalElevation = 6.dp
-            ) {
-                Column(
-                    modifier = Modifier.padding(20.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Icon(Icons.Default.Functions, contentDescription = null)
-                            Text(
-                                text = "Vektoros függvényrajzoló",
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                        }
-                        IconButton(onClick = onDismiss) {
-                            Icon(Icons.Default.Close, contentDescription = "Bezárás")
-                        }
-                    }
-
-                    OutlinedTextField(
-                        value = expressionInput,
-                        onValueChange = {
-                            expressionInput = it
-                            errorHu = null
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        label = { Text("Képlet f(x) = ... (pl. 2x^2 - 3, sin(x)/x, 1/x)") }
-                    )
-
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedTextField(
-                            value = xMinInput,
-                            onValueChange = { xMinInput = it },
-                            modifier = Modifier.weight(1f),
-                            singleLine = true,
-                            label = { Text("X min") },
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal)
-                        )
-                        OutlinedTextField(
-                            value = xMaxInput,
-                            onValueChange = { xMaxInput = it },
-                            modifier = Modifier.weight(1f),
-                            singleLine = true,
-                            label = { Text("X max") },
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal)
-                        )
-                        OutlinedTextField(
-                            value = yMinInput,
-                            onValueChange = { yMinInput = it },
-                            modifier = Modifier.weight(1f),
-                            singleLine = true,
-                            label = { Text("Y min") },
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal)
-                        )
-                        OutlinedTextField(
-                            value = yMaxInput,
-                            onValueChange = { yMaxInput = it },
-                            modifier = Modifier.weight(1f),
-                            singleLine = true,
-                            label = { Text("Y max") },
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal)
-                        )
-                    }
-
-                    errorHu?.let { msg ->
-                        Text(
-                            text = msg,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.error
-                        )
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.End
-                    ) {
-                        OutlinedButton(onClick = onDismiss) {
-                            Text("Mégse")
-                        }
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Button(
-                            onClick = {
-                                val xMin = xMinInput.trim().replace(',', '.').toFloatOrNull()
-                                val xMax = xMaxInput.trim().replace(',', '.').toFloatOrNull()
-                                val yMin = yMinInput.trim().replace(',', '.').toFloatOrNull()
-                                val yMax = yMaxInput.trim().replace(',', '.').toFloatOrNull()
-                                if (xMin == null || xMax == null || yMin == null || yMax == null ||
-                                    xMax <= xMin || yMax <= yMin
-                                ) {
-                                    errorHu = "Érvénytelen tartomány (min < max szükséges)."
-                                    return@Button
-                                }
-                                try {
-                                    FunctionEvaluator.compile(expressionInput)
-                                    onInsertPlot(expressionInput.trim(), xMin, xMax, yMin, yMax)
-                                    onDismiss()
-                                } catch (e: FunctionParseException) {
-                                    errorHu = e.message ?: "Hibás kifejezés."
-                                }
-                            }
-                        ) {
-                            Text("Beszúrás a lapra")
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 private val LATEX_COLOR_SWATCHES = listOf(
     BrushConfig.DEFAULT_INK_COLOR_ARGB,
     0xFF1D4ED8.toInt(),
     0xFF047857.toInt(),
     0xFFB91C1C.toInt()
 )
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun FormattedTextOverlayNode(
+    textObject: PageObject.FormattedTextObject,
+    scale: Float,
+    isOledMode: Boolean,
+    isSelected: Boolean,
+    onUpdateObject: (PageObject.FormattedTextObject) -> Unit,
+    onDelete: () -> Unit
+) {
+    val effectiveColorArgb = remember(textObject.canonicalColorArgb, isOledMode) {
+        if (isOledMode) {
+            ColorLuminanceInverter.invertArgbLuminance(textObject.canonicalColorArgb)
+        } else {
+            textObject.canonicalColorArgb
+        }
+    }
+    val scaledFontSp = (textObject.fontSizePt * scale * 0.72f).coerceIn(11f, 84f).sp
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .then(
+                if (isSelected) {
+                    Modifier.border(
+                        1.5.dp,
+                        MaterialTheme.colorScheme.primary,
+                        RoundedCornerShape(8.dp)
+                    )
+                } else {
+                    Modifier
+                }
+            )
+            .padding(4.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+                .graphicsLayer {
+                    if (abs(textObject.rotationRadians) > 1e-4f) {
+                        rotationZ = (textObject.rotationRadians * 180.0 / PI).toFloat()
+                    }
+                },
+            contentAlignment = Alignment.TopStart
+        ) {
+            Text(
+                text = textObject.text,
+                color = Color(effectiveColorArgb),
+                fontFamily = HandwritingFontFamily,
+                fontSize = scaledFontSp,
+                lineHeight = scaledFontSp * 1.25f
+            )
+        }
+
+        if (isSelected) {
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                tonalElevation = 4.dp,
+                shadowElevation = 6.dp
+            ) {
+                FlowRow(
+                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    LATEX_COLOR_SWATCHES.forEach { swatchArgb ->
+                        Box(
+                            modifier = Modifier
+                                .size(22.dp)
+                                .clip(CircleShape)
+                                .background(Color(swatchArgb))
+                                .border(
+                                    width = if (textObject.canonicalColorArgb == swatchArgb) 2.dp else 1.dp,
+                                    color = MaterialTheme.colorScheme.outline,
+                                    shape = CircleShape
+                                )
+                                .clickable {
+                                    onUpdateObject(textObject.copy(canonicalColorArgb = swatchArgb))
+                                }
+                        )
+                    }
+                    IconButton(
+                        onClick = {
+                            onUpdateObject(
+                                textObject.copy(fontSizePt = (textObject.fontSizePt + 2f).coerceAtMost(72f))
+                            )
+                        },
+                        modifier = Modifier.size(28.dp)
+                    ) {
+                        Icon(Icons.Default.Add, contentDescription = "Szöveg nagyítása", modifier = Modifier.size(16.dp))
+                    }
+                    IconButton(
+                        onClick = {
+                            onUpdateObject(
+                                textObject.copy(fontSizePt = (textObject.fontSizePt - 2f).coerceAtLeast(10f))
+                            )
+                        },
+                        modifier = Modifier.size(28.dp)
+                    ) {
+                        Icon(Icons.Default.Remove, contentDescription = "Szöveg kicsinyítése", modifier = Modifier.size(16.dp))
+                    }
+                    IconButton(onClick = onDelete, modifier = Modifier.size(28.dp)) {
+                        Icon(
+                            Icons.Default.Delete,
+                            contentDescription = "Szöveg törlése",
+                            tint = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
 

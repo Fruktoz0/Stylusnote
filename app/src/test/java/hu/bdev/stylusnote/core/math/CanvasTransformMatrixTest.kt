@@ -99,5 +99,12 @@ class CanvasTransformMatrixTest {
         assertEquals(2880f - bottomRight.xPx, topLeft.xPx, 1e-2f)
         assertEquals(1800f - bottomRight.yPx, topLeft.yPx, 1e-2f)
     }
+
+    @Test
+    fun pinchZoomOutIsClampedAt65Percent() {
+        val matrix = CanvasTransformMatrix(initialScale = 1.0f)
+        matrix.zoomAroundScreenPoint(focalXPx = 500f, focalYPx = 500f, zoomFactor = 0.1f)
+        assertEquals(0.65f, matrix.scale, 1e-6f)
+    }
 }
 

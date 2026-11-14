@@ -44,6 +44,7 @@ object StrokeBinarySerializer {
     private const val OBJECT_TAG_FUNCTION_PLOT: Int = 2
     private const val OBJECT_TAG_DERIVATION_CARD: Int = 3
     private const val OBJECT_TAG_PDF_PAGE_REF: Int = 4
+    private const val OBJECT_TAG_FORMATTED_TEXT: Int = 5
 
     fun encodeStrokeRecord(record: PersistedStrokeRecord): ByteArray {
         val baos = ByteArrayOutputStream(256)
@@ -262,6 +263,7 @@ object StrokeBinarySerializer {
             is PageObject.FunctionPlotObject -> OBJECT_TAG_FUNCTION_PLOT
             is PageObject.DerivationCardObject -> OBJECT_TAG_DERIVATION_CARD
             is PageObject.PdfPageRefObject -> OBJECT_TAG_PDF_PAGE_REF
+            is PageObject.FormattedTextObject -> OBJECT_TAG_FORMATTED_TEXT
         }
         out.writeByte(tag)
         writeIdentifier(out, obj.id)
@@ -305,6 +307,16 @@ object StrokeBinarySerializer {
                 writeUtfString(out, obj.pdfAssetRelativePath)
                 out.writeInt(obj.pageIndexZeroBased)
                 out.writeBoolean(obj.invertInOledMode)
+            }
+            is PageObject.FormattedTextObject -> {
+                writeUtfString(out, obj.text)
+                out.writeFloat(obj.fontSizePt)
+                out.writeInt(obj.canonicalColorArgb)
+                out.writeFloat(obj.rotationRadians)
+                out.writeInt(obj.sourceStrokeIds.size)
+                for (srcId in obj.sourceStrokeIds) {
+                    writeIdentifier(out, srcId)
+                }
             }
         }
 
@@ -382,6 +394,27 @@ object StrokeBinarySerializer {
                 pageIndexZeroBased = input.readInt(),
                 invertInOledMode = input.readBoolean()
             )
+            OBJECT_TAG_FORMATTED_TEXT -> {
+                val text = readUtfString(input)
+                val fontSize = input.readFloat()
+                val color = input.readInt()
+                val rotation = input.readFloat()
+                val srcCount = input.readInt().coerceAtLeast(0)
+                val srcIds = ArrayList<String>(srcCount)
+                for (i in 0 until srcCount) {
+                    srcIds.add(readIdentifier(input))
+                }
+                PageObject.FormattedTextObject(
+                    id = id,
+                    zOrder = zOrder,
+                    bounds = bounds,
+                    text = text,
+                    fontSizePt = fontSize,
+                    canonicalColorArgb = color,
+                    rotationRadians = rotation,
+                    sourceStrokeIds = srcIds
+                )
+            }
             else -> throw IOException("Unknown PageObject tag: $tag")
         }
     }

@@ -6,25 +6,28 @@ Ez a dokumentum a `stylusnote_rendszerterv_v2.txt` alapján készült **17 lép�
 
 ## 1. Aktuális Átadási Állapot (Current Handoff State)
 
-- **Utolsó befejezett lépés:** `Lépés 17 (Utómunka: Stylus/Zoom Bugfix, Modern UI/UX & 144 Hz Keretidő-optimalizálás)`
+- **Utolsó befejezett lépés:** `Lépés 24 (II. Ütem Lezárása: Végleges Tesztek, 144 Hz Benchmark, Dokumentáció & APK Telepítés)`
 - **Befejezés dátuma:** `2026-11-14`
 - **Aktuális projektállapot:**
-  - Mind a 4 fő fázis (**1–4. Fázis, `Lépés 0–16`**) és a **Lépés 17** hibajavítási/modernizálási/144 Hz-es finomhangolási kör elkészült, és lefutottak a helyi és eszközös automatizált tesztek Xiaomi `25097RP43G` (Android 16 / SDK 36) táblagépen:
-    - Gradle fordítás (`:app:compileDebugKotlin`, `:app:compileDebugAndroidTestKotlin`, `:benchmark:compileBenchmarkKotlin`, R8 benchmark APK) ✅
-    - JVM JUnit 4 egységtesztek (`testDebugUnitTest`): **14 tesztosztály, 56 teszt, 0 hiba, 0 kihagyás** ✅ (benne a kétujjas pinch-zoom/pan esettel bővített `StylusInputRouterTest` 7/7)
-    - Műszerezett tesztek (`:app:connectedDebugAndroidTest`): **8/8 teszt sikeres (`0` hiba, `0` kihagyás)** ✅ (`25097RP43G - 16`: FTS4 keresés, `StrokeJournal` crash-recovery, 400%-os zoom + 5 `androidx.ink` `libink.so` JNI teszt)
-    - Macrobenchmark (`:benchmark:connectedBenchmarkAndroidTest`, 10 000 vonalas vászon kétujjas pan + pinch-zoom 144 Hz ütemezéssel, 5 iteráció, median `frameCount = 118,0`, `CV = 0,93%`): **`frameDurationCpuMs` P50 = `4,47 ms`, P90 = `5,63 ms`, P95 = `6,04 ms`, P99 = `8,24 ms`; `frameOverrunMs` P50 = `-7,31 ms`, P90 = `-6,05 ms`, P95 = `-5,45 ms`, P99 = `-3,11 ms`** ✅ (**P95 ≤ 6,94 ms teljesítve!**)
-  - Javítva és modernizálva (`Lépés 17`):
-    - **Stylus felengedéskori eltűnés/elcsúszás javítása:** `canvas.concat(matrix)` hozzáadása a `DryInkRasterCache` csemperaszterezéshez és a `StylusDrawingSurface` lasszó élő előnézetéhez.
-    - **Kétujjas pan & pinch-to-zoom + zoom gombok:** A `StylusInputRouter.handleTwoFingerNavigation` és `InProgressStrokesView` érintéstovábbításának javítása + `CanvasTopToolbar` (`- / % / +` zoom gombok).
-    - **Modernizált UI/UX:** Összecsukható pill-alakú `FloatingToolDock`, megújult `BrushSettingsPopover` (ESC + háttér-kattintás zárással) és letisztult `BookshelfScreen` / `CanvasTopToolbar` (`CompositingStrategy.Offscreen`).
-    - **144 Hz Render & UI Thread Optimalizálás:** `CompositePageSnapshot` (`Bitmap.Config.HARDWARE`, max. `2048 px`) a `DryInkRasterCache`-ben + `PaperBackgroundRenderer.drawFixedPageIntoBitmapCanvas`, elkülönített `DryCanvasView` (`FrameLayout`) Compose Snapshot-újrarajzolás nélkül, inaktív Compose overlay-ek kihagyása és ADPF `PerformanceHintManager` (`6,94 ms` target) + stylus-only JNI tengely-kiolvasás.
-  - Az `androidx.ink:ink-nativeloader:1.1.0-alpha10` csak Android `.so` (`libink.so`) könyvtárakat tartalmaz, így az 5 natív `StockBrushes`/`Stroke` JNI teszt a JVM-es `CanvasStateHolderTest.kt`-ből áthelyezésre került a `StylusNoteInstrumentedValidationTest.kt` (`app/src/androidTest/...`) csomagba (összesen 8 műszerezett teszt).
-  - Az `AiCopilotSheet.kt` implementálja az `AiCopilotParsers` tiszta Kotlin JSON feldolgozókat (`parseExamPackJson`, `parseMagicCircleJson`), az `AiCopilotController` Gemini Copilot munkafolyamatokat (Kézírás → Markdown SAF `.md`/PDF exporttal, Magic Circle „Magyarázd el”, Vizsgamód flashcardok + interaktív kvíz) és az ESC/backdrop-zárható `AiCopilotSheet` felületet.
-  - A `BookshelfScreen.kt` (`NotebookPagePane`) és `AppDatabase.kt` (`PageTextSearchDao.getRecognizedTextsForNotebook`) integrálja a teljes láncot: 5. rétegű `PageObjectsOverlayLayer`, `FunctionPlotterDialog`, `AiCopilotSheet`, `ConsentDialog`, vektoros PDF-export, valamint az oldal módosítása/bezárása után automatikusan ütemezett `BackgroundOcrWorker`.
-- **Következő végrehajtandó lépés:** `Frissített debug APK telepítése a tabletre (:app:installDebug) kézi próba és mindennapi használat céljából.`
+  - Mind a **I. Ütem (`Lépés 0–17`)**, mind a **II. Ütem (`Lépés 18–24` — StarNote UI/UX, Könyvespolc Drag & Drop, Szelektív PDF/NotebookLM, Globális Eszköztár, 2 lépcsős Ecsetfül, Szellemképmentes Lasszó `✨ AI` és 2 módú AI Formázó)** elkészült és ellenőrizve lett Xiaomi `25097RP43G` (Android 16 / SDK 36) táblagépen:
+    - JVM JUnit 4 egységtesztek (`testDebugUnitTest`): **16 tesztosztály, 64 teszt, 0 hiba, 0 kihagyás** ✅
+    - Műszerezett tesztek (`:app:connectedDebugAndroidTest`): **8/8 teszt sikeres (`0` hiba, `0` kihagyás)** ✅ (`25097RP43G - 16`)
+    - Macrobenchmark (`:benchmark:connectedBenchmarkAndroidTest`, `panAndZoom10kStrokesCanvasFrameTiming`, 5 iteráció, median `frameCount = 117,0`, `CV = 0,47%`): **`frameDurationCpuMs` P50 = `3,74 ms`, P90 = `5,04 ms`, P95 = `5,48 ms`, P99 = `6,88 ms`; `frameOverrunMs` P50 = `-7,95 ms`, P90 = `-6,79 ms`, P95 = `-6,23 ms`, P99 = `-4,35 ms`** ✅ (**P95 ≤ 6,94 ms teljesítve!**)
+- **Következő végrehajtandó lépés:** `Nincs — a II. Ütem (Lépés 18–24) minden lépése lezárva és verifikálva.`
 
 ---
+
+## II. Ütem: StarNote UI/UX, Eszköztár, PDF/NotebookLM és AI Megújítás (Lépés 18 – Lépés 24)
+
+| Lépés | Leírás | Státusz | Érintett főbb fájlok |
+|---|---|---|---|
+| **Lépés 18** | StarNote design rendszer, egyedi ikonok, valódi teljes képernyő + Lézer / Függvényrajzoló / Osztott nézet eltávolítása | `[x]` Kész | `Theme.kt`, `StylusIcons.kt`, `MainActivity.kt`, `BrushConfig.kt`, `FormatMigrator.kt`, `StylusDrawingSurface.kt`, `LatexOverlayNode.kt`, `PdfExportManager.kt`, `BookshelfScreen.kt` |
+| **Lépés 19** | Könyvespolc teljes StarNote átalakítás, bal oldalsáv, kategória Drag & Drop, új füzet & borítótervező UI | `[x]` Kész | `NotebookCover.kt`, `CoverDesignerDialog.kt`, `BookshelfScreen.kt`, `AppDatabase.kt` |
+| **Lépés 20** | Könyv `...` menü, szelektív PDF import (oldalszám/tartomány) és NotebookLM megosztás / export | `[x]` Kész | `AndroidManifest.xml`, `file_paths.xml`, `BookshelfScreen.kt`, `PdfAndNotebookLmDialogs.kt`, `PageSelectionParserTest.kt` |
+| **Lépés 21** | Nyitott füzet bal felső fejléc sáv, bal oldali kihúzható oldalszerkesztő (Fix oldalmód) és zoom-out korlát (`0.65f`) | `[x]` Kész | `CanvasTransformMatrix.kt`, `CanvasTransformMatrixTest.kt`, `BookshelfScreen.kt`, `LeftPageDrawer.kt` |
+| **Lépés 22** | Globális, szabadon mozgatható lebegő eszköztár, összecsukott 3 gomb + 2 lépcsős hosszan nyomható beállító fül | `[x]` Kész | `ToolDockPreferencesStore.kt`, `FloatingToolDock.kt`, `BrushSettingsPopover.kt`, `BookshelfScreen.kt` |
+| **Lépés 23** | Lasszó szellemkép megszüntetése, Lasszó `AI` gomb + AI mód egyszerűsítése (Beállítások + 2 formázó funkció) | `[x]` Kész | `DryInkRasterCache.kt`, `StylusDrawingSurface.kt`, `PageObject.kt`, `StrokeBinarySerializer.kt`, `LatexOverlayNode.kt`, `PdfExportManager.kt`, `AiCopilotSheet.kt` |
+| **Lépés 24** | Végleges tesztek, 144 Hz benchmark (`p95 ≤ 6,94 ms`), dokumentáció frissítés (`feature_registry/log/journeys`) és APK telepítés | `[x]` Kész | `docs/*`, unit / androidTest / benchmark, `25097RP43G` |
 
 ## 2. Részletes Megvalósítási Ellenőrzőlista (Lépés 0 – Lépés 16)
 
@@ -143,14 +146,14 @@ Ez a dokumentum a `stylusnote_rendszerterv_v2.txt` alapján készült **17 lép�
 
 ## 3. Elfogadási Kritériumok (11. Fejezet)
 
-- [x] **Frame time:** p95 ≤ 6,94 ms pan/zoom közben 10 000 vonalas oldalon Xiaomi Pad 8-on *(Mérve `25097RP43G` tableten a `panAndZoom10kStrokesCanvasFrameTiming` 5-iterációs 10 000 vonalas benchmarkkal: `frameDurationCpuMs` **P50 = `4,47 ms`**, **P90 = `5,63 ms`**, **P95 = `6,04 ms`**, **P99 = `8,24 ms`**; `frameOverrunMs` **P50 = `-7,31 ms`**, **P95 = `-5,45 ms`**, **P99 = `-3,11 ms`**, 0 eldobott képkocka ✅)*
+- [x] **Frame time:** p95 ≤ 6,94 ms pan/zoom közben 10 000 vonalas oldalon Xiaomi Pad 8-on *(Mérve `25097RP43G` tableten a `panAndZoom10kStrokesCanvasFrameTiming` 5-iterációs 10 000 vonalas benchmarkkal a II. ütem lezárásakor: `frameDurationCpuMs` **P50 = `3,74 ms`**, **P90 = `5,04 ms`**, **P95 = `5,48 ms`**, **P99 = `6,88 ms`**; `frameOverrunMs` **P50 = `-7,95 ms`**, **P95 = `-6,23 ms`**, **P99 = `-4,35 ms`**, 0 eldobott képkocka ✅)*
 - [ ] **Pontosság:** Tollhegy–tinta eltérés 400%-os nagyításnál ≤ 1 px *(Alap: `CanvasTransformMatrix` 400% teszt 8/8 `connectedDebugAndroidTest`-ben sikeres, `concat(matrix)` csempejavítás alkalmazva; kézi stylus / vizuális próba hátravan)*
 - [ ] **Memória:** 50 000 vonallal sincs OOM; raszter cache ≤ 192 MB *(Készüléken ellenőrzendő)*
 - [ ] **Betöltés:** 10 000 vonalas oldal megnyitása ≤ 1 s *(Készüléken ellenőrzendő)*
 - [ ] **Adatbiztonság:** Automatizált process-kill teszt rajzolás közben ≤ 1 s adatvesztéssel, hibátlan journal visszajátszás *(`StrokeJournal` truncated-tail recovery `connectedDebugAndroidTest`-ben sikeres; élő UI process-kill próba hátravan)*
 - [ ] **Round-trip:** Serializer, journal és backup/restore után azonos vonalak *(JVM `StrokeJournalRoundTripTest` 6/6 és `BackupAndExportTest` 3/3 sikeres; eszközön történő integrációs ellenőrzés hátravan)*
-- [x] **JVM Unit tesztek (`testDebugUnitTest` — 14 osztály, 56 teszt, 0 hiba, 0 kihagyás):**
-  - [x] `CanvasTransformMatrixTest` (5)
+- [x] **JVM Unit tesztek (`testDebugUnitTest` — 16 osztály, 64 teszt, 0 hiba, 0 kihagyás):**
+  - [x] `CanvasTransformMatrixTest` (6)
   - [x] `OneEuroFilterTest` (6)
   - [x] `SpatialIndexTest` (4, brute-force összevetés)
   - [x] `StylusInputRouterTest` (7)
@@ -164,6 +167,6 @@ Ez a dokumentum a `stylusnote_rendszerterv_v2.txt` alapján készült **17 lép�
   - [x] `OcrLineSegmenterTest` (2)
   - [x] `FunctionEvaluatorTest` (3)
   - [x] `AiCopilotExamParserTest` (2)
+  - [x] `ToolDockPlacementTest` (3)
+  - [x] `PageSelectionParserTest` (4)
 - [x] **Műszerezett (`androidTest`) tesztek (`:app:connectedDebugAndroidTest`):** 8/8 teszt sikeres (`25097RP43G - Android 16`, `0` hiba, `0` kihagyás, benne az 5 natív `libink.so` Ink JNI teszttel)
-
-//

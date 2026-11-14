@@ -41,16 +41,6 @@ class OcrLineSegmenterTest {
             layer = StrokeLayerType.HIGHLIGHTER,
             toolType = BrushToolType.HIGHLIGHTER
         )
-        val laserStroke = stroke(
-            id = "laser-1",
-            zOrder = 3L,
-            x1 = 90f,
-            y1 = 100f,
-            x2 = 130f,
-            y2 = 115f,
-            baseTimeMs = 300L,
-            toolType = BrushToolType.LASER
-        )
         val snappedTriangle = stroke(
             id = "shape-1",
             zOrder = 4L,
@@ -104,7 +94,6 @@ class OcrLineSegmenterTest {
             strokes = listOf(
                 textStroke,
                 highlighterStroke,
-                laserStroke,
                 snappedTriangle,
                 largeDiagram,
                 overlappedByLatex

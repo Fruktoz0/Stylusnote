@@ -2,11 +2,16 @@ package hu.bdev.stylusnote.ui.components
 
 import android.content.Context
 import android.graphics.Color as AndroidColor
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -14,9 +19,11 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -28,6 +35,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.ChevronLeft
+import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Gesture
 import androidx.compose.material.icons.filled.Palette
@@ -52,6 +61,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -77,6 +88,7 @@ import androidx.datastore.preferences.preferencesDataStore
 import hu.bdev.stylusnote.core.hardware.PressureCurve
 import hu.bdev.stylusnote.domain.model.BrushConfig
 import hu.bdev.stylusnote.domain.model.BrushToolType
+import hu.bdev.stylusnote.ui.theme.LocalStylusSurfacePalette
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlin.math.PI
@@ -208,14 +220,15 @@ private val QUICK_COLOR_PALETTE = listOf(
 )
 
 private val QUICK_SIZE_PRESETS_PT = listOf(1.5f, 2.5f, 5.0f, 12.0f)
+private val QUICK_ERASER_RADII_DP = listOf(12f, 20f, 32f, 44f)
 
 /**
- * Floating brush & color configuration studio popover (Section 5.4).
+ * Two-stage StarNote side-tab popover (IMG_2728).
  *
- * Includes a live variable-width stroke preview, 6 DataStore preset cards, quick color palette +
- * HSV wheel + HEX input, quick size dots + thickness slider (0.5–40 pt), opacity (10–100%),
- * 1€ stabilization (0–100%), graphical pressure curve cards, and Hold-to-Snap toggle.
- * Supports closing via both ESC key and backdrop click (UX Rule 11).
+ * Opens compact with only the most frequently adjusted essentials (quick sizes, swatches, opacity,
+ * or eraser radius) and expands smoothly to the full studio (presets, HSV wheel/HEX, 1-Euro
+ * stabilization, pressure curves, Hold-to-Snap) when dragged horizontally wider or toggled.
+ * Closes via both ESC key press and backdrop tap (UX Rule 11).
  */
 @Composable
 fun BrushSettingsPopover(
@@ -226,6 +239,18 @@ fun BrushSettingsPopover(
     onApplyPreset: (BrushConfig) -> Unit,
     onDismiss: () -> Unit
 ) {
+    val surfacePalette = LocalStylusSurfacePalette.current
+    var isExpandedFullStudio by remember { mutableStateOf(false) }
+    val panelWidth by animateDpAsState(
+        targetValue = if (isExpandedFullStudio) 472.dp else 312.dp,
+        label = "brushSidePanelWidth"
+    )
+
+    val focusRequester = remember { FocusRequester() }
+    LaunchedEffect(Unit) {
+        focusRequester.requestFocus()
+    }
+
     val hsv = remember(currentConfig.colorArgb) {
         FloatArray(3).also { AndroidColor.colorToHSV(currentConfig.colorArgb, it) }
     }
@@ -265,11 +290,12 @@ fun BrushSettingsPopover(
             usePlatformDefaultWidth = false
         )
     ) {
-        // Full-viewport backdrop ensures backdrop clicks & ESC dismiss cleanly outside the studio card.
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color.Black.copy(alpha = 0.28f))
+                .background(Color.Black.copy(alpha = 0.24f))
+                .focusRequester(focusRequester)
+                .focusable()
                 .onPreviewKeyEvent { keyEvent ->
                     if (keyEvent.key == Key.Escape && keyEvent.type == KeyEventType.KeyDown) {
                         onDismiss()
@@ -283,554 +309,674 @@ fun BrushSettingsPopover(
                     indication = null,
                     onClick = onDismiss
                 ),
-            contentAlignment = Alignment.Center
+            contentAlignment = Alignment.CenterEnd
         ) {
             Surface(
                 modifier = Modifier
-                    .widthIn(min = 340.dp, max = 460.dp)
-                    .padding(20.dp)
+                    .padding(end = 14.dp, top = 16.dp, bottom = 16.dp)
+                    .width(panelWidth)
+                    .heightIn(max = 760.dp)
+                    .animateContentSize()
                     .border(
                         width = 1.dp,
-                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f),
-                        shape = RoundedCornerShape(28.dp)
+                        color = MaterialTheme.colorScheme.outlineVariant,
+                        shape = RoundedCornerShape(24.dp)
                     )
-                    // Consume taps on the card so clicks inside do not bubble up to the backdrop.
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null,
                         onClick = {}
                     ),
-                shape = RoundedCornerShape(28.dp),
+                shape = RoundedCornerShape(24.dp),
                 tonalElevation = 8.dp,
                 shadowElevation = 16.dp,
                 color = MaterialTheme.colorScheme.surface
             ) {
-                Column(
-                    modifier = Modifier
-                        .verticalScroll(rememberScrollState())
-                        .padding(20.dp),
-                    verticalArrangement = Arrangement.spacedBy(14.dp)
-                ) {
-                    // Header
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    // Left edge drag/pull grip handle for smoothly expanding Stage 1 -> Stage 2.
+                    var cumulativeDragPx by remember { mutableFloatStateOf(0f) }
+                    Box(
+                        modifier = Modifier
+                            .width(26.dp)
+                            .fillMaxHeight()
+                            .background(surfacePalette.groupedCardBackground.copy(alpha = 0.65f))
+                            .pointerInput(isExpandedFullStudio) {
+                                detectHorizontalDragGestures(
+                                    onDragStart = { cumulativeDragPx = 0f },
+                                    onHorizontalDrag = { change, dragAmount ->
+                                        change.consume()
+                                        cumulativeDragPx += dragAmount
+                                        if (!isExpandedFullStudio && cumulativeDragPx < -32f) {
+                                            isExpandedFullStudio = true
+                                        } else if (isExpandedFullStudio && cumulativeDragPx > 32f) {
+                                            isExpandedFullStudio = false
+                                        }
+                                    }
+                                )
+                            }
+                            .clickable { isExpandedFullStudio = !isExpandedFullStudio },
+                        contentAlignment = Alignment.Center
                     ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Surface(
-                                shape = RoundedCornerShape(12.dp),
-                                color = MaterialTheme.colorScheme.primaryContainer,
-                                modifier = Modifier.size(38.dp)
-                            ) {
-                                Box(contentAlignment = Alignment.Center) {
-                                    Icon(
-                                        imageVector = Icons.Filled.Tune,
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                                        modifier = Modifier.size(20.dp)
-                                    )
-                                }
-                            }
-                            Column {
-                                Text(
-                                    text = currentConfig.toolType.displayName,
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                                Text(
-                                    text = if (currentConfig.toolType.isEraser) {
-                                        "Radír sugara és előnézet"
-                                    } else {
-                                        "Élő vonás-előnézet és színstúdió"
-                                    },
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
-                        Surface(
-                            onClick = onDismiss,
-                            shape = CircleShape,
-                            color = MaterialTheme.colorScheme.surfaceContainerHighest,
-                            modifier = Modifier.size(34.dp)
-                        ) {
-                            Box(contentAlignment = Alignment.Center) {
-                                Icon(
-                                    Icons.Filled.Close,
-                                    contentDescription = "Bezárás",
-                                    modifier = Modifier.size(18.dp)
-                                )
-                            }
+                            Box(
+                                modifier = Modifier
+                                    .width(4.dp)
+                                    .height(34.dp)
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.outline)
+                            )
+                            Icon(
+                                imageVector = if (isExpandedFullStudio) {
+                                    Icons.Filled.ChevronRight
+                                } else {
+                                    Icons.Filled.ChevronLeft
+                                },
+                                contentDescription = if (isExpandedFullStudio) "Kompakt nézet" else "Teljes funkciók",
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(18.dp)
+                            )
                         }
                     }
 
-                    // Live Stroke Preview Canvas
-                    LiveBrushPreviewCard(config = currentConfig)
-
-                    // 6 Saved Preset Cards
-                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text(
-                            text = "Mentett kedvenc ecsetek",
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .verticalScroll(rememberScrollState())
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        // Header
                         Row(
                             modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            presets.forEachIndexed { index, preset ->
-                                val swatchColor = Color(preset.effectiveColorArgb())
-                                val isMatching = preset.toolType == currentConfig.toolType &&
-                                    preset.colorArgb == currentConfig.colorArgb &&
-                                    kotlin.math.abs(preset.sizePt - currentConfig.sizePt) < 0.25f
-
-                                Surface(
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .border(
-                                            width = if (isMatching) 2.dp else 1.dp,
-                                            color = if (isMatching) {
-                                                MaterialTheme.colorScheme.primary
-                                            } else {
-                                                MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
-                                            },
-                                            shape = RoundedCornerShape(14.dp)
-                                        ),
-                                    shape = RoundedCornerShape(14.dp),
-                                    color = if (isMatching) {
-                                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f)
-                                    } else {
-                                        MaterialTheme.colorScheme.surfaceContainerLow
-                                    }
-                                ) {
-                                    Column(
-                                        modifier = Modifier
-                                            .clickable { onApplyPreset(preset) }
-                                            .padding(vertical = 7.dp, horizontal = 4.dp),
-                                        horizontalAlignment = Alignment.CenterHorizontally,
-                                        verticalArrangement = Arrangement.spacedBy(4.dp)
-                                    ) {
-                                        Box(
-                                            modifier = Modifier
-                                                .size(24.dp)
-                                                .clip(CircleShape)
-                                                .background(swatchColor)
-                                                .border(
-                                                    1.dp,
-                                                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.2f),
-                                                    CircleShape
-                                                ),
-                                            contentAlignment = Alignment.Center
-                                        ) {
-                                            Box(
-                                                modifier = Modifier
-                                                    .size((preset.clampedSizePt * 0.45f).coerceIn(3f, 12f).dp)
-                                                    .clip(CircleShape)
-                                                    .background(
-                                                        if (luminanceOf(swatchColor) > 0.55f) {
-                                                            Color.Black.copy(alpha = 0.7f)
-                                                        } else {
-                                                            Color.White.copy(alpha = 0.9f)
-                                                        }
-                                                    )
-                                            )
-                                        }
-                                        Text(
-                                            text = "${"%.1f".format(preset.clampedSizePt)}p",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            fontWeight = FontWeight.Medium,
-                                            color = MaterialTheme.colorScheme.onSurface
-                                        )
-                                        IconButton(
-                                            onClick = { onSavePresetSlot(index, currentConfig) },
-                                            modifier = Modifier.size(22.dp)
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Filled.Bookmark,
-                                                contentDescription = "Mentés ${index + 1}. helyre",
-                                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                modifier = Modifier.size(13.dp)
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if (currentConfig.toolType.isEraser) {
-                        StudioSectionCard {
-                            SettingSliderHeader(
-                                title = "Radír sugár",
-                                valueBadge = "${currentConfig.eraserRadiusDp.roundToInt()} dp"
-                            )
-                            Slider(
-                                value = currentConfig.eraserRadiusDp,
-                                onValueChange = { next ->
-                                    onConfigChange(currentConfig.copy(eraserRadiusDp = next))
-                                },
-                                valueRange = 8f..48f
-                            )
-                        }
-                    } else {
-                        // Thickness card with quick-size visual dots + slider
-                        StudioSectionCard {
-                            SettingSliderHeader(
-                                title = "Vastagság",
-                                valueBadge = "${"%.1f".format(currentConfig.clampedSizePt)} pt"
-                            )
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                QUICK_SIZE_PRESETS_PT.forEach { presetPt ->
-                                    val isSelected = kotlin.math.abs(currentConfig.clampedSizePt - presetPt) < 0.25f
-                                    Surface(
-                                        onClick = { onConfigChange(currentConfig.copy(sizePt = presetPt)) },
-                                        shape = RoundedCornerShape(12.dp),
-                                        color = if (isSelected) {
-                                            MaterialTheme.colorScheme.primaryContainer
-                                        } else {
-                                            MaterialTheme.colorScheme.surface
-                                        },
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .height(36.dp)
-                                    ) {
-                                        Row(
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.Center
-                                        ) {
-                                            Box(
-                                                modifier = Modifier
-                                                    .size((presetPt * 0.7f + 3f).coerceIn(4f, 13f).dp)
-                                                    .clip(CircleShape)
-                                                    .background(Color(currentConfig.effectiveColorArgb()))
-                                            )
-                                            Spacer(modifier = Modifier.width(5.dp))
-                                            Text(
-                                                text = if (presetPt % 1f == 0f) "${presetPt.toInt()}" else "$presetPt",
-                                                style = MaterialTheme.typography.labelMedium,
-                                                fontWeight = FontWeight.SemiBold
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                            Slider(
-                                value = currentConfig.clampedSizePt,
-                                onValueChange = { nextSize ->
-                                    onConfigChange(currentConfig.copy(sizePt = nextSize))
-                                },
-                                valueRange = BrushConfig.MIN_BRUSH_SIZE_PT..BrushConfig.MAX_BRUSH_SIZE_PT
-                            )
-                        }
-
-                        // Color Palette + HSV Wheel + HEX Card
-                        StudioSectionCard {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Filled.Palette,
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.primary,
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                    Text(
-                                        text = "Színpaletta",
-                                        style = MaterialTheme.typography.labelLarge,
-                                        fontWeight = FontWeight.SemiBold
-                                    )
-                                }
-                                Surface(
-                                    shape = RoundedCornerShape(10.dp),
-                                    color = MaterialTheme.colorScheme.surfaceContainerHighest
-                                ) {
-                                    Row(
-                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(5.dp)
-                                    ) {
-                                        Box(
-                                            modifier = Modifier
-                                                .size(10.dp)
-                                                .clip(CircleShape)
-                                                .background(Color(currentConfig.effectiveColorArgb()))
-                                        )
-                                        Text(
-                                            text = formatRgbHex(currentConfig.colorArgb),
-                                            style = MaterialTheme.typography.labelSmall,
-                                            fontWeight = FontWeight.Medium
-                                        )
-                                    }
-                                }
-                            }
-
-                            // 8 Curated Quick Color Swatches
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                QUICK_COLOR_PALETTE.forEach { argb ->
-                                    val selected = (currentConfig.colorArgb and 0x00FFFFFF) == (argb and 0x00FFFFFF)
-                                    val c = Color(argb)
-                                    Box(
-                                        modifier = Modifier
-                                            .size(30.dp)
-                                            .clip(CircleShape)
-                                            .background(c)
-                                            .border(
-                                                width = if (selected) 2.5.dp else 1.dp,
-                                                color = if (selected) {
-                                                    MaterialTheme.colorScheme.primary
-                                                } else {
-                                                    MaterialTheme.colorScheme.outlineVariant
-                                                },
-                                                shape = CircleShape
-                                            )
-                                            .clickable { onConfigChange(currentConfig.copy(colorArgb = argb)) },
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        if (selected) {
-                                            Icon(
-                                                imageVector = Icons.Filled.Check,
-                                                contentDescription = null,
-                                                tint = if (luminanceOf(c) > 0.55f) Color.Black else Color.White,
-                                                modifier = Modifier.size(15.dp)
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-
-                            HorizontalDivider(
-                                modifier = Modifier.padding(vertical = 2.dp),
-                                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
-                            )
-
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(14.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                HsvColorWheel(
-                                    hue = hue,
-                                    saturation = saturation,
-                                    value = value,
-                                    onHueSaturationChange = { nextH, nextS ->
-                                        hue = nextH
-                                        saturation = nextS
-                                        emitHsvColor(nextH, nextS, value)
-                                    },
-                                    modifier = Modifier.size(132.dp)
-                                )
-
-                                Column(
-                                    modifier = Modifier.weight(1f),
-                                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                                ) {
-                                    SettingSliderHeader(
-                                        title = "Fényerő",
-                                        valueBadge = "${(value * 100f).roundToInt()}%"
-                                    )
-                                    Slider(
-                                        value = value,
-                                        onValueChange = { nextV ->
-                                            value = nextV
-                                            emitHsvColor(hue, saturation, nextV)
-                                        },
-                                        valueRange = 0.05f..1.0f
-                                    )
-                                    OutlinedTextField(
-                                        value = hexText,
-                                        onValueChange = { candidate ->
-                                            hexText = candidate
-                                            parseHexColor(candidate)?.let { parsedArgb ->
-                                                onConfigChange(currentConfig.copy(colorArgb = parsedArgb))
-                                            }
-                                        },
-                                        label = { Text("HEX") },
-                                        singleLine = true,
-                                        shape = RoundedCornerShape(14.dp),
-                                        modifier = Modifier.fillMaxWidth()
-                                    )
-                                }
-                            }
-                        }
-
-                        // Opacity & 1-Euro Stabilization Card
-                        StudioSectionCard {
-                            if (currentConfig.toolType == BrushToolType.HIGHLIGHTER) {
-                                SettingSliderHeader(
-                                    title = "Átlátszóság",
-                                    valueBadge = "35% fix"
-                                )
-                                Text(
-                                    text = "Önátfedés-mentes kiemelő mód aktív.",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            } else {
-                                SettingSliderHeader(
-                                    title = "Átlátszóság",
-                                    valueBadge = "${(currentConfig.effectiveOpacity() * 100f).roundToInt()}%"
-                                )
-                                Slider(
-                                    value = currentConfig.opacity.coerceIn(BrushConfig.MIN_OPACITY, 1f),
-                                    onValueChange = { nextOpacity ->
-                                        onConfigChange(currentConfig.copy(opacity = nextOpacity))
-                                    },
-                                    valueRange = BrushConfig.MIN_OPACITY..1.0f
-                                )
-                            }
-
-                            SettingSliderHeader(
-                                title = "1€ Stabilizálás",
-                                valueBadge = "${currentConfig.clampedStabilizationPercent.roundToInt()}%"
-                            )
-                            Slider(
-                                value = currentConfig.clampedStabilizationPercent,
-                                onValueChange = { nextStab ->
-                                    onConfigChange(currentConfig.copy(stabilizationPercent = nextStab))
-                                },
-                                valueRange = 0f..100f
-                            )
-                        }
-
-                        // Pressure Curve Cards + Hold-to-Snap Card
-                        StudioSectionCard {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.weight(1f)
                             ) {
-                                Icon(
-                                    imageVector = Icons.Filled.Gesture,
-                                    contentDescription = null,
-                                    tint = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Text(
-                                    text = "Nyomásgörbe",
-                                    style = MaterialTheme.typography.labelLarge,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                            }
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                PressureCurve.entries.forEach { curve ->
-                                    val selected = currentConfig.pressureCurve == curve
-                                    Surface(
-                                        onClick = {
-                                            onConfigChange(currentConfig.copy(pressureCurve = curve))
-                                        },
-                                        shape = RoundedCornerShape(14.dp),
-                                        color = if (selected) {
-                                            MaterialTheme.colorScheme.primaryContainer
-                                        } else {
-                                            MaterialTheme.colorScheme.surface
-                                        },
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .border(
-                                                width = if (selected) 1.5.dp else 1.dp,
-                                                color = if (selected) {
-                                                    MaterialTheme.colorScheme.primary
-                                                } else {
-                                                    MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
-                                                },
-                                                shape = RoundedCornerShape(14.dp)
-                                            )
-                                    ) {
-                                        Column(
-                                            modifier = Modifier.padding(vertical = 8.dp, horizontal = 6.dp),
-                                            horizontalAlignment = Alignment.CenterHorizontally,
-                                            verticalArrangement = Arrangement.spacedBy(4.dp)
-                                        ) {
-                                            val curveColor = if (selected) {
-                                                MaterialTheme.colorScheme.onPrimaryContainer
-                                            } else {
-                                                MaterialTheme.colorScheme.onSurfaceVariant
-                                            }
-                                            Canvas(modifier = Modifier.size(width = 36.dp, height = 20.dp)) {
-                                                val p = Path()
-                                                val steps = 16
-                                                for (i in 0..steps) {
-                                                    val t = i / steps.toFloat()
-                                                    val yNorm = curve.apply(t)
-                                                    val x = t * size.width
-                                                    val y = (1f - yNorm) * size.height
-                                                    if (i == 0) p.moveTo(x, y) else p.lineTo(x, y)
-                                                }
-                                                drawPath(
-                                                    path = p,
-                                                    color = curveColor,
-                                                    style = Stroke(width = 2.5f, cap = StrokeCap.Round)
-                                                )
-                                            }
-                                            Text(
-                                                text = curve.displayName,
-                                                style = MaterialTheme.typography.labelSmall,
-                                                fontWeight = FontWeight.SemiBold,
-                                                color = curveColor
-                                            )
-                                        }
+                                Surface(
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = surfacePalette.activePillBackground,
+                                    modifier = Modifier.size(34.dp)
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Tune,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.size(18.dp)
+                                        )
                                     }
                                 }
-                            }
-
-                            HorizontalDivider(
-                                modifier = Modifier.padding(vertical = 2.dp),
-                                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
-                            )
-
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
+                                Column {
                                     Text(
-                                        text = "Hold-to-Snap alakzatok",
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        fontWeight = FontWeight.Medium
+                                        text = currentConfig.toolType.displayName,
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.Bold
                                     )
                                     Text(
-                                        text = "Vonás végén 300 ms tartással egyenes, kör vagy nyíl",
+                                        text = if (isExpandedFullStudio) "Teljes stúdió" else "Gyors beállítások",
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 }
-                                Switch(
-                                    checked = currentConfig.holdToSnapEnabled,
-                                    onCheckedChange = { enabled ->
-                                        onConfigChange(currentConfig.copy(holdToSnapEnabled = enabled))
+                            }
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Surface(
+                                    onClick = { isExpandedFullStudio = !isExpandedFullStudio },
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = surfacePalette.groupedCardBackground
+                                ) {
+                                    Text(
+                                        text = if (isExpandedFullStudio) "Kevesebb" else "Teljes",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp)
+                                    )
+                                }
+                                Surface(
+                                    onClick = onDismiss,
+                                    shape = CircleShape,
+                                    color = surfacePalette.groupedCardBackground,
+                                    modifier = Modifier.size(30.dp)
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Icon(
+                                            Icons.Filled.Close,
+                                            contentDescription = "Bezárás",
+                                            modifier = Modifier.size(16.dp)
+                                        )
                                     }
-                                )
+                                }
                             }
                         }
-                    }
 
-                    Button(
-                        onClick = onDismiss,
-                        shape = RoundedCornerShape(16.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("Kész", fontWeight = FontWeight.SemiBold)
+                        // Compact Live Stroke Preview
+                        LiveBrushPreviewCard(config = currentConfig)
+
+                        if (currentConfig.toolType.isEraser) {
+                            StudioSectionCard {
+                                SettingSliderHeader(
+                                    title = "Radír sugár",
+                                    valueBadge = "${currentConfig.eraserRadiusDp.roundToInt()} dp"
+                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    QUICK_ERASER_RADII_DP.forEach { radiusPreset ->
+                                        val selected = kotlin.math.abs(currentConfig.eraserRadiusDp - radiusPreset) < 2f
+                                        Surface(
+                                            onClick = { onConfigChange(currentConfig.copy(eraserRadiusDp = radiusPreset)) },
+                                            shape = RoundedCornerShape(10.dp),
+                                            color = if (selected) {
+                                                surfacePalette.activePillBackground
+                                            } else {
+                                                MaterialTheme.colorScheme.surface
+                                            },
+                                            border = if (selected) {
+                                                BorderStroke(1.25.dp, MaterialTheme.colorScheme.primary)
+                                            } else null,
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .height(32.dp)
+                                        ) {
+                                            Box(contentAlignment = Alignment.Center) {
+                                                Text(
+                                                    text = "${radiusPreset.toInt()}dp",
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                                Slider(
+                                    value = currentConfig.eraserRadiusDp,
+                                    onValueChange = { next ->
+                                        onConfigChange(currentConfig.copy(eraserRadiusDp = next))
+                                    },
+                                    valueRange = 8f..48f
+                                )
+                            }
+                        } else if (currentConfig.toolType == BrushToolType.LASSO) {
+                            StudioSectionCard {
+                                Text(
+                                    text = "Lasszó kijelölő",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = "Karikázd be a kézírást vagy ábrát a mozgatáshoz, másoláshoz vagy azonnali ✨ AI formázáshoz.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        } else {
+                            // Stage 1 Essential 1: Quick Thickness Pills + Slider
+                            StudioSectionCard {
+                                SettingSliderHeader(
+                                    title = "Vastagság",
+                                    valueBadge = "${"%.1f".format(currentConfig.clampedSizePt)} pt"
+                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    QUICK_SIZE_PRESETS_PT.forEach { presetPt ->
+                                        val isSelected = kotlin.math.abs(currentConfig.clampedSizePt - presetPt) < 0.25f
+                                        Surface(
+                                            onClick = { onConfigChange(currentConfig.copy(sizePt = presetPt)) },
+                                            shape = RoundedCornerShape(10.dp),
+                                            color = if (isSelected) {
+                                                surfacePalette.activePillBackground
+                                            } else {
+                                                MaterialTheme.colorScheme.surface
+                                            },
+                                            border = if (isSelected) {
+                                                BorderStroke(1.25.dp, MaterialTheme.colorScheme.primary)
+                                            } else null,
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .height(34.dp)
+                                        ) {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.Center
+                                            ) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .size((presetPt * 0.65f + 3f).coerceIn(4f, 12f).dp)
+                                                        .clip(CircleShape)
+                                                        .background(Color(currentConfig.effectiveColorArgb()))
+                                                )
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Text(
+                                                    text = if (presetPt % 1f == 0f) "${presetPt.toInt()}" else "$presetPt",
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    fontWeight = FontWeight.SemiBold
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                                Slider(
+                                    value = currentConfig.clampedSizePt,
+                                    onValueChange = { nextSize ->
+                                        onConfigChange(currentConfig.copy(sizePt = nextSize))
+                                    },
+                                    valueRange = BrushConfig.MIN_BRUSH_SIZE_PT..BrushConfig.MAX_BRUSH_SIZE_PT
+                                )
+                            }
+
+                            // Stage 1 Essential 2: Quick Colors (+ Stage 2 HSV Wheel & HEX when expanded)
+                            StudioSectionCard {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Palette,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Text(
+                                            text = "Színek",
+                                            style = MaterialTheme.typography.labelLarge,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                    }
+                                    Surface(
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = MaterialTheme.colorScheme.surface
+                                    ) {
+                                        Text(
+                                            text = formatRgbHex(currentConfig.colorArgb),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = FontWeight.Medium,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                        )
+                                    }
+                                }
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    QUICK_COLOR_PALETTE.forEach { argb ->
+                                        val selected = (currentConfig.colorArgb and 0x00FFFFFF) == (argb and 0x00FFFFFF)
+                                        val c = Color(argb)
+                                        Box(
+                                            modifier = Modifier
+                                                .size(28.dp)
+                                                .clip(CircleShape)
+                                                .background(c)
+                                                .border(
+                                                    width = if (selected) 2.5.dp else 1.dp,
+                                                    color = if (selected) {
+                                                        MaterialTheme.colorScheme.primary
+                                                    } else {
+                                                        MaterialTheme.colorScheme.outlineVariant
+                                                    },
+                                                    shape = CircleShape
+                                                )
+                                                .clickable { onConfigChange(currentConfig.copy(colorArgb = argb)) },
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            if (selected) {
+                                                Icon(
+                                                    imageVector = Icons.Filled.Check,
+                                                    contentDescription = null,
+                                                    tint = if (luminanceOf(c) > 0.55f) Color.Black else Color.White,
+                                                    modifier = Modifier.size(14.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if (isExpandedFullStudio) {
+                                    HorizontalDivider(
+                                        modifier = Modifier.padding(vertical = 2.dp),
+                                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+                                    )
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        HsvColorWheel(
+                                            hue = hue,
+                                            saturation = saturation,
+                                            value = value,
+                                            onHueSaturationChange = { nextH, nextS ->
+                                                hue = nextH
+                                                saturation = nextS
+                                                emitHsvColor(nextH, nextS, value)
+                                            },
+                                            modifier = Modifier.size(128.dp)
+                                        )
+
+                                        Column(
+                                            modifier = Modifier.weight(1f),
+                                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            SettingSliderHeader(
+                                                title = "Fényerő",
+                                                valueBadge = "${(value * 100f).roundToInt()}%"
+                                            )
+                                            Slider(
+                                                value = value,
+                                                onValueChange = { nextV ->
+                                                    value = nextV
+                                                    emitHsvColor(hue, saturation, nextV)
+                                                },
+                                                valueRange = 0.05f..1.0f
+                                            )
+                                            OutlinedTextField(
+                                                value = hexText,
+                                                onValueChange = { candidate ->
+                                                    hexText = candidate
+                                                    parseHexColor(candidate)?.let { parsedArgb ->
+                                                        onConfigChange(currentConfig.copy(colorArgb = parsedArgb))
+                                                    }
+                                                },
+                                                label = { Text("HEX") },
+                                                singleLine = true,
+                                                shape = RoundedCornerShape(12.dp),
+                                                modifier = Modifier.fillMaxWidth()
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Stage 1 Essential 3: Quick Opacity (+ Stage 2 Stabilization)
+                            StudioSectionCard {
+                                if (currentConfig.toolType == BrushToolType.HIGHLIGHTER) {
+                                    SettingSliderHeader(
+                                        title = "Átlátszóság",
+                                        valueBadge = "35% fix"
+                                    )
+                                    Text(
+                                        text = "Önátfedés-mentes kiemelő mód aktív.",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                } else {
+                                    SettingSliderHeader(
+                                        title = "Átlátszóság",
+                                        valueBadge = "${(currentConfig.effectiveOpacity() * 100f).roundToInt()}%"
+                                    )
+                                    Slider(
+                                        value = currentConfig.opacity.coerceIn(BrushConfig.MIN_OPACITY, 1f),
+                                        onValueChange = { nextOpacity ->
+                                            onConfigChange(currentConfig.copy(opacity = nextOpacity))
+                                        },
+                                        valueRange = BrushConfig.MIN_OPACITY..1.0f
+                                    )
+                                }
+
+                                if (isExpandedFullStudio) {
+                                    HorizontalDivider(
+                                        modifier = Modifier.padding(vertical = 2.dp),
+                                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+                                    )
+                                    SettingSliderHeader(
+                                        title = "1€ Stabilizálás",
+                                        valueBadge = "${currentConfig.clampedStabilizationPercent.roundToInt()}%"
+                                    )
+                                    Slider(
+                                        value = currentConfig.clampedStabilizationPercent,
+                                        onValueChange = { nextStab ->
+                                            onConfigChange(currentConfig.copy(stabilizationPercent = nextStab))
+                                        },
+                                        valueRange = 0f..100f
+                                    )
+                                }
+                            }
+
+                            // Stage 2 Only: 6 Presets + Pressure Curve Cards + Hold-to-Snap
+                            if (isExpandedFullStudio) {
+                                StudioSectionCard {
+                                    Text(
+                                        text = "Mentett kedvenc ecsetek",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        presets.forEachIndexed { index, preset ->
+                                            val swatchColor = Color(preset.effectiveColorArgb())
+                                            val isMatching = preset.toolType == currentConfig.toolType &&
+                                                preset.colorArgb == currentConfig.colorArgb &&
+                                                kotlin.math.abs(preset.sizePt - currentConfig.sizePt) < 0.25f
+
+                                            Surface(
+                                                modifier = Modifier
+                                                    .weight(1f)
+                                                    .border(
+                                                        width = if (isMatching) 2.dp else 1.dp,
+                                                        color = if (isMatching) {
+                                                            MaterialTheme.colorScheme.primary
+                                                        } else {
+                                                            MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+                                                        },
+                                                        shape = RoundedCornerShape(12.dp)
+                                                    ),
+                                                shape = RoundedCornerShape(12.dp),
+                                                color = if (isMatching) {
+                                                    surfacePalette.activePillBackground
+                                                } else {
+                                                    MaterialTheme.colorScheme.surface
+                                                }
+                                            ) {
+                                                Column(
+                                                    modifier = Modifier
+                                                        .clickable { onApplyPreset(preset) }
+                                                        .padding(vertical = 6.dp, horizontal = 3.dp),
+                                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                                ) {
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .size(22.dp)
+                                                            .clip(CircleShape)
+                                                            .background(swatchColor),
+                                                        contentAlignment = Alignment.Center
+                                                    ) {
+                                                        Box(
+                                                            modifier = Modifier
+                                                                .size((preset.clampedSizePt * 0.4f).coerceIn(3f, 10f).dp)
+                                                                .clip(CircleShape)
+                                                                .background(
+                                                                    if (luminanceOf(swatchColor) > 0.55f) {
+                                                                        Color.Black.copy(alpha = 0.7f)
+                                                                    } else {
+                                                                        Color.White.copy(alpha = 0.9f)
+                                                                    }
+                                                                )
+                                                        )
+                                                    }
+                                                    Text(
+                                                        text = "${"%.1f".format(preset.clampedSizePt)}p",
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        fontWeight = FontWeight.Medium
+                                                    )
+                                                    IconButton(
+                                                        onClick = { onSavePresetSlot(index, currentConfig) },
+                                                        modifier = Modifier.size(20.dp)
+                                                    ) {
+                                                        Icon(
+                                                            imageVector = Icons.Filled.Bookmark,
+                                                            contentDescription = "Mentés ${index + 1}. helyre",
+                                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                            modifier = Modifier.size(12.dp)
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                StudioSectionCard {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Gesture,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Text(
+                                            text = "Nyomásgörbe",
+                                            style = MaterialTheme.typography.labelLarge,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                    }
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        PressureCurve.entries.forEach { curve ->
+                                            val selected = currentConfig.pressureCurve == curve
+                                            Surface(
+                                                onClick = {
+                                                    onConfigChange(currentConfig.copy(pressureCurve = curve))
+                                                },
+                                                shape = RoundedCornerShape(12.dp),
+                                                color = if (selected) {
+                                                    surfacePalette.activePillBackground
+                                                } else {
+                                                    MaterialTheme.colorScheme.surface
+                                                },
+                                                modifier = Modifier
+                                                    .weight(1f)
+                                                    .border(
+                                                        width = if (selected) 1.5.dp else 1.dp,
+                                                        color = if (selected) {
+                                                            MaterialTheme.colorScheme.primary
+                                                        } else {
+                                                            MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+                                                        },
+                                                        shape = RoundedCornerShape(12.dp)
+                                                    )
+                                            ) {
+                                                Column(
+                                                    modifier = Modifier.padding(vertical = 8.dp, horizontal = 6.dp),
+                                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                                ) {
+                                                    val curveColor = if (selected) {
+                                                        MaterialTheme.colorScheme.primary
+                                                    } else {
+                                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                                    }
+                                                    Canvas(modifier = Modifier.size(width = 34.dp, height = 18.dp)) {
+                                                        val p = Path()
+                                                        val steps = 16
+                                                        for (i in 0..steps) {
+                                                            val t = i / steps.toFloat()
+                                                            val yNorm = curve.apply(t)
+                                                            val x = t * size.width
+                                                            val y = (1f - yNorm) * size.height
+                                                            if (i == 0) p.moveTo(x, y) else p.lineTo(x, y)
+                                                        }
+                                                        drawPath(
+                                                            path = p,
+                                                            color = curveColor,
+                                                            style = Stroke(width = 2.5f, cap = StrokeCap.Round)
+                                                        )
+                                                    }
+                                                    Text(
+                                                        text = curve.displayName,
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        fontWeight = FontWeight.SemiBold,
+                                                        color = curveColor
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    HorizontalDivider(
+                                        modifier = Modifier.padding(vertical = 2.dp),
+                                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+                                    )
+
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = "Hold-to-Snap alakzatok",
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                fontWeight = FontWeight.Medium
+                                            )
+                                            Text(
+                                                text = "Vonás végén 300 ms tartással egyenes, kör vagy nyíl",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                        Switch(
+                                            checked = currentConfig.holdToSnapEnabled,
+                                            onCheckedChange = { enabled ->
+                                                onConfigChange(currentConfig.copy(holdToSnapEnabled = enabled))
+                                            }
+                                        )
+                                    }
+                                }
+                            } else {
+                                Surface(
+                                    onClick = { isExpandedFullStudio = true },
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = surfacePalette.activePillBackground,
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text(
+                                        text = "◂ Húzd szét balra vagy bökj ide a teljes funkciókért",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp)
+                                    )
+                                }
+                            }
+                        }
+
+                        Button(
+                            onClick = onDismiss,
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Kész", fontWeight = FontWeight.SemiBold)
+                        }
                     }
                 }
             }

@@ -14,10 +14,14 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
@@ -27,6 +31,8 @@ import androidx.compose.material.icons.filled.FormatColorFill
 import androidx.compose.material.icons.filled.RotateRight
 import androidx.compose.material.icons.filled.ZoomIn
 import androidx.compose.material.icons.filled.ZoomOut
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -88,6 +94,7 @@ import hu.bdev.stylusnote.domain.model.CanvasMode
 import hu.bdev.stylusnote.domain.model.PagePaperConfig
 import hu.bdev.stylusnote.domain.repository.CanvasStateHolder
 import hu.bdev.stylusnote.ui.theme.LocalStylusSurfacePalette
+import hu.bdev.stylusnote.ui.theme.StylusIcons
 import hu.bdev.stylusnote.ui.theme.StylusSurfacePalette
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -120,6 +127,9 @@ interface DryStrokeStore {
  */
 interface JournalCommitSink {
     fun onStrokesCommitted(strokes: List<IndexedDryStroke>)
+    fun onStrokesTransformed(strokeIds: List<String>, affine: AffineTransform2D) = Unit
+    fun onStrokesRecolored(strokeIds: List<String>, canonicalColorArgb: Int) = Unit
+    fun onStrokesDeleted(strokeIds: List<String>) = Unit
 }
 
 object NoOpJournalCommitSink : JournalCommitSink {
@@ -152,7 +162,6 @@ class InMemoryDryStrokeStore : DryStrokeStore {
 private enum class ActiveGestureMode {
     DRAW_INK,
     ERASER,
-    LASER,
     LASSO
 }
 
@@ -230,7 +239,7 @@ private class DryCanvasView(context: Context) : View(context) {
  * 1. Vector paper template & page mode ([PaperBackgroundRenderer])
  * 2/3/4a. Dry ink tiled raster cache ([DryInkRasterCache] + [OledStrokeRenderCache])
  * 4b. Wet ink low-latency front-buffer ([InProgressStrokesView])
- * 6. Ephemeral laser presentation overlay ([LaserOverlay]) + Lasso / Hold-to-Snap selection overlay
+ * 6. Lasso / Hold-to-Snap selection overlay
  * 7. Hover cursor preview ([HoverCursorOverlay])
  */
 @SuppressLint("ClickableViewAccessibility")
@@ -244,12 +253,12 @@ fun StylusDrawingSurface(
     dryStrokeStore: DryStrokeStore = remember { CanvasStateHolder() },
     dryInkRasterCache: DryInkRasterCache = remember { DryInkRasterCache() },
     oledStrokeCache: OledStrokeRenderCache = remember { OledStrokeRenderCache() },
-    laserStateHolder: LaserTrailStateHolder = remember { LaserTrailStateHolder() },
     journalCommitSink: JournalCommitSink = NoOpJournalCommitSink,
     onTogglePenEraser: () -> Unit = {},
     onCanvasStateMutated: () -> Unit = {},
     onViewportSizeChanged: (IntSize) -> Unit = {},
     onViewportTransformChanged: () -> Unit = {},
+    onAiAutoFormatLassoSelection: (selectedIds: Set<String>, onFormatted: (clearSelection: Boolean) -> Unit) -> Unit = { _, _ -> },
     externalDrawVersionTick: Long = 0L,
     modifier: Modifier = Modifier
 ) {
@@ -262,7 +271,6 @@ fun StylusDrawingSurface(
     }
 
     val dryDrawTick = remember { mutableLongStateOf(0L) }
-    val laserDrawTick = remember { mutableLongStateOf(0L) }
     val hoverDrawTick = remember { mutableLongStateOf(0L) }
     val lassoDrawTick = remember { mutableLongStateOf(0L) }
     // Incremented only when selection membership or drag visibility changes, avoiding 144 Hz recomposition on pan/zoom.
@@ -433,25 +441,29 @@ fun StylusDrawingSurface(
             val dx = lassoRuntime.liveDeltaXPt
             val dy = lassoRuntime.liveDeltaYPt
             val selected = lassoRuntime.selectedIds
+            val oldBounds = lassoRuntime.selectionBounds
             lassoRuntime.isDraggingSelection = false
             lassoRuntime.dragOriginDoc = null
             lassoRuntime.liveDeltaXPt = 0f
             lassoRuntime.liveDeltaYPt = 0f
-            dryCanvasViewRef?.invalidate()
 
             // Rebuild immutable Stroke instances ONLY on ACTION_UP if actually moved.
             if (stateHolder != null && selected.isNotEmpty() && hypot(dx, dy) > 0.5f) {
-                val dirty = stateHolder.transformStrokes(selected, AffineTransform2D.translation(dx, dy))
+                val translation = AffineTransform2D.translation(dx, dy)
+                val dirty = stateHolder.transformStrokes(selected, translation)
                 if (dirty != null) {
                     for (id in selected) {
                         oledStrokeCache.invalidate(id)
                     }
+                    oldBounds?.let { dryInkRasterCache.invalidateDocRect(it) }
                     dryInkRasterCache.invalidateDocRect(dirty)
                     lassoRuntime.selectionBounds = stateHolder.computeSelectionBounds(selected)
+                    journalCommitSink.onStrokesTransformed(selected.toList(), translation)
                     dryDrawTick.longValue++
                     routerConfigHolder.onMutatedCallback()
                 }
             }
+            dryCanvasViewRef?.invalidate()
         } else {
             lassoRuntime.activePolygon.addAll(finalPoints)
             val poly = lassoRuntime.activePolygon
@@ -483,7 +495,7 @@ fun StylusDrawingSurface(
         lassoDrawTick.longValue++
     }
 
-    val wetStrokeSink = remember(transformMatrix, eraserCommandChannel, laserStateHolder) {
+    val wetStrokeSink = remember(transformMatrix, eraserCommandChannel) {
         object : WetStrokeSink<MotionEvent> {
             private var activeMode: ActiveGestureMode = ActiveGestureMode.DRAW_INK
             private var activeToolType: BrushToolType = BrushToolType.FOUNTAIN_PEN
@@ -504,7 +516,6 @@ fun StylusDrawingSurface(
 
             private fun modeForTool(tool: BrushToolType): ActiveGestureMode = when {
                 tool.isEraser -> ActiveGestureMode.ERASER
-                tool.isLaser -> ActiveGestureMode.LASER
                 tool == BrushToolType.LASSO -> ActiveGestureMode.LASSO
                 else -> ActiveGestureMode.DRAW_INK
             }
@@ -576,20 +587,6 @@ fun StylusDrawingSurface(
                             )
                         }
                     }
-                    ActiveGestureMode.LASER -> {
-                        val pts = extractRawDocPoints(event, pointerId)
-                        if (pts.isNotEmpty()) {
-                            laserStateHolder.startTrail(
-                                firstPoint = pts.first(),
-                                colorArgb = routerConfigHolder.config.colorArgb,
-                                widthPt = routerConfigHolder.config.clampedSizePt.coerceAtLeast(3f)
-                            )
-                            if (pts.size > 1) {
-                                laserStateHolder.appendPoints(pts.drop(1))
-                            }
-                            laserDrawTick.longValue++
-                        }
-                    }
                     ActiveGestureMode.LASSO -> {
                         val pts = extractRawDocPoints(event, pointerId)
                         if (pts.isNotEmpty()) {
@@ -630,13 +627,6 @@ fun StylusDrawingSurface(
                             )
                         }
                     }
-                    ActiveGestureMode.LASER -> {
-                        val pts = extractRawDocPoints(realEvent, pointerId)
-                        if (pts.isNotEmpty()) {
-                            laserStateHolder.appendPoints(pts)
-                            laserDrawTick.longValue++
-                        }
-                    }
                     ActiveGestureMode.LASSO -> {
                         moveLassoInteraction(extractRawDocPoints(realEvent, pointerId))
                     }
@@ -663,10 +653,6 @@ fun StylusDrawingSurface(
                             )
                         }
                         eraserCommandChannel.trySend(EraserWorkCommand.FinishSession)
-                    }
-                    ActiveGestureMode.LASER -> {
-                        laserStateHolder.finishTrail(extractRawDocPoints(event, pointerId))
-                        laserDrawTick.longValue++
                     }
                     ActiveGestureMode.LASSO -> {
                         finishLassoInteraction(extractRawDocPoints(event, pointerId))
@@ -709,14 +695,6 @@ fun StylusDrawingSurface(
                             )
                         )
                     }
-                    ActiveGestureMode.LASER -> {
-                        laserStateHolder.startTrail(
-                            firstPoint = DocPoint(firstSample.xPt, firstSample.yPt),
-                            colorArgb = routerConfigHolder.config.colorArgb,
-                            widthPt = routerConfigHolder.config.clampedSizePt.coerceAtLeast(3f)
-                        )
-                        laserDrawTick.longValue++
-                    }
                     ActiveGestureMode.LASSO -> {
                         startLassoInteraction(DocPoint(firstSample.xPt, firstSample.yPt))
                     }
@@ -758,12 +736,6 @@ fun StylusDrawingSurface(
                                     isVectorEraser = activeToolType == BrushToolType.VECTOR_ERASER
                                 )
                             )
-                        }
-                    }
-                    ActiveGestureMode.LASER -> {
-                        if (realSamples.isNotEmpty()) {
-                            laserStateHolder.appendPoints(realSamples.map { DocPoint(it.xPt, it.yPt) })
-                            laserDrawTick.longValue++
                         }
                     }
                     ActiveGestureMode.LASSO -> {
@@ -815,11 +787,6 @@ fun StylusDrawingSurface(
                         eraserCommandChannel.trySend(EraserWorkCommand.FinishSession)
                         lastBatchSample = null
                     }
-                    ActiveGestureMode.LASER -> {
-                        laserStateHolder.finishTrail(finalSamples.map { DocPoint(it.xPt, it.yPt) })
-                        laserDrawTick.longValue++
-                        lastBatchSample = null
-                    }
                     ActiveGestureMode.LASSO -> {
                         finishLassoInteraction(finalSamples.map { DocPoint(it.xPt, it.yPt) })
                         lastBatchSample = null
@@ -841,10 +808,6 @@ fun StylusDrawingSurface(
                     }
                     ActiveGestureMode.ERASER -> {
                         eraserCommandChannel.trySend(EraserWorkCommand.FinishSession)
-                    }
-                    ActiveGestureMode.LASER -> {
-                        laserStateHolder.cancelActiveTrail()
-                        laserDrawTick.longValue++
                     }
                     ActiveGestureMode.LASSO -> cancelLassoInteraction()
                 }
@@ -1190,7 +1153,17 @@ fun StylusDrawingSurface(
                                 transformMatrix = transformMatrix,
                                 spatialIndex = dryStrokeStore.spatialIndex,
                                 isOledMode = isOled,
-                                strokeAdapter = { entry -> oledStrokeCache.adaptStroke(entry, isOled) }
+                                strokeAdapter = { entry -> oledStrokeCache.adaptStroke(entry, isOled) },
+                                excludedStrokeIds = if (lassoRuntime.isDraggingSelection) {
+                                    lassoRuntime.selectedIds
+                                } else {
+                                    emptySet()
+                                },
+                                excludedBounds = if (lassoRuntime.isDraggingSelection) {
+                                    lassoRuntime.selectionBounds
+                                } else {
+                                    null
+                                }
                             )
                         }
 
@@ -1248,16 +1221,7 @@ fun StylusDrawingSurface(
             }
         )
 
-        // Layer 6a: Ephemeral laser overlay
-        if (brushConfig.toolType.isLaser || laserDrawTick.longValue > 0L) {
-            LaserOverlay(
-                stateHolder = laserStateHolder,
-                transformMatrix = transformMatrix,
-                activityTick = laserDrawTick
-            )
-        }
-
-        // Layer 6b: Lasso trace & selection marquee
+        // Layer 6: Lasso trace & selection marquee
         lassoSelectionVersion.longValue
         if (lassoRuntime.selectedIds.isNotEmpty() || lassoRuntime.activePolygon.isNotEmpty()) {
             LassoSelectionCanvasOverlay(
@@ -1287,12 +1251,30 @@ fun StylusDrawingSurface(
         if (selectedCount > 0 && stateHolder != null && !lassoRuntime.isDraggingSelection) {
             LassoSelectionActionBar(
                 selectedCount = selectedCount,
+                onAiAutoFormatSelection = {
+                    val activeSelectedIds = lassoRuntime.selectedIds.toSet()
+                    val previousBounds = lassoRuntime.selectionBounds
+                    onAiAutoFormatLassoSelection(activeSelectedIds) { clearSelection ->
+                        if (clearSelection) {
+                            for (id in activeSelectedIds) oledStrokeCache.invalidate(id)
+                            previousBounds?.let { dryInkRasterCache.invalidateDocRect(it) }
+                            lassoRuntime.selectedIds = emptySet()
+                            lassoRuntime.selectionBounds = null
+                            dryCanvasViewRef?.invalidate()
+                            dryDrawTick.longValue++
+                            lassoSelectionVersion.longValue++
+                            lassoDrawTick.longValue++
+                            onCanvasStateMutated()
+                        }
+                    }
+                },
                 onTransformSelection = { transform ->
                     val dirty = stateHolder.transformStrokes(lassoRuntime.selectedIds, transform)
                     if (dirty != null) {
                         for (id in lassoRuntime.selectedIds) oledStrokeCache.invalidate(id)
                         dryInkRasterCache.invalidateDocRect(dirty)
                         lassoRuntime.selectionBounds = stateHolder.computeSelectionBounds(lassoRuntime.selectedIds)
+                        journalCommitSink.onStrokesTransformed(lassoRuntime.selectedIds.toList(), transform)
                         dryDrawTick.longValue++
                         lassoSelectionVersion.longValue++
                         lassoDrawTick.longValue++
@@ -1300,13 +1282,15 @@ fun StylusDrawingSurface(
                     }
                 },
                 onRecolorSelection = {
+                    val targetColor = brushConfig.effectiveColorArgb()
                     val dirty = stateHolder.recolorStrokes(
                         strokeIds = lassoRuntime.selectedIds,
-                        newColorArgb = brushConfig.effectiveColorArgb()
+                        newColorArgb = targetColor
                     )
                     if (dirty != null) {
                         for (id in lassoRuntime.selectedIds) oledStrokeCache.invalidate(id)
                         dryInkRasterCache.invalidateDocRect(dirty)
+                        journalCommitSink.onStrokesRecolored(lassoRuntime.selectedIds.toList(), targetColor)
                         dryDrawTick.longValue++
                         onCanvasStateMutated()
                     }
@@ -1315,6 +1299,7 @@ fun StylusDrawingSurface(
                     val copies = stateHolder.duplicateStrokes(lassoRuntime.selectedIds)
                     if (copies.isNotEmpty()) {
                         for (copy in copies) dryInkRasterCache.invalidateDocRect(copy.bounds)
+                        journalCommitSink.onStrokesCommitted(copies)
                         lassoRuntime.selectedIds = copies.map { it.id }.toSet()
                         lassoRuntime.selectionBounds = stateHolder.computeSelectionBounds(lassoRuntime.selectedIds)
                         dryDrawTick.longValue++
@@ -1324,10 +1309,12 @@ fun StylusDrawingSurface(
                     }
                 },
                 onDeleteSelection = {
+                    val toDelete = lassoRuntime.selectedIds.toList()
                     val dirty = stateHolder.deleteStrokes(lassoRuntime.selectedIds)
                     if (dirty != null) {
                         for (id in lassoRuntime.selectedIds) oledStrokeCache.invalidate(id)
                         dryInkRasterCache.invalidateDocRect(dirty)
+                        journalCommitSink.onStrokesDeleted(toDelete)
                     }
                     lassoRuntime.selectedIds = emptySet()
                     lassoRuntime.selectionBounds = null
@@ -1410,6 +1397,7 @@ private fun LassoSelectionCanvasOverlay(
 private fun LassoSelectionActionBar(
     selectedCount: Int,
     selectionBoundsProvider: () -> DocRect?,
+    onAiAutoFormatSelection: () -> Unit,
     onTransformSelection: (AffineTransform2D) -> Unit,
     onRecolorSelection: () -> Unit,
     onDuplicateSelection: () -> Unit,
@@ -1432,8 +1420,25 @@ private fun LassoSelectionActionBar(
             Text(
                 text = "$selectedCount kijelölve",
                 style = MaterialTheme.typography.labelSmall,
-                modifier = Modifier.padding(end = 6.dp)
+                modifier = Modifier.padding(end = 4.dp)
             )
+            FilledTonalButton(
+                onClick = onAiAutoFormatSelection,
+                shape = RoundedCornerShape(14.dp),
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                colors = ButtonDefaults.filledTonalButtonColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer,
+                    contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+            ) {
+                Icon(
+                    imageVector = StylusIcons.StarFourPoint,
+                    contentDescription = "AI felismerés és formázás",
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("AI", style = MaterialTheme.typography.labelMedium)
+            }
             IconButton(
                 onClick = {
                     val b = selectionBoundsProvider() ?: return@IconButton

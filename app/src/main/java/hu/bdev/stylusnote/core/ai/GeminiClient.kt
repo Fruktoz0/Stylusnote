@@ -22,6 +22,7 @@ import kotlin.math.roundToInt
  */
 enum class UserInitiatedAiTrigger {
     LASSO_TO_LATEX,
+    LASSO_AUTO_FORMAT,
     STEP_BY_STEP_DERIVATION,
     HANDWRITING_TO_MARKDOWN,
     MAGIC_CIRCLE_EXPLAIN,
@@ -315,7 +316,7 @@ class GeminiClient(
         const val DEFAULT_MAX_BACKOFF_MS = 60_000L
 
         const val DEFAULT_INLINE_IMAGE_LONG_EDGE_PX = 1536
-        const val MIN_INLINE_IMAGE_LONG_EDGE_PX = 1024
+        const val MIN_INLINE_IMAGE_LONG_EDGE_PX = 512
         const val MAX_INLINE_IMAGE_LONG_EDGE_PX = 2048
 
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()

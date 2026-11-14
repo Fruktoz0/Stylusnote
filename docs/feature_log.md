@@ -8,21 +8,23 @@ Ez a dokumentum rögzíti a rendszer rétegezett architektúráját és a jóvá
 
 ```mermaid
 flowchart TD
-    subgraph UI["UI Réteg (Jetpack Compose Material 3 + AndroidView / FrameLayout)"]
-        MA["MainActivity (144 Hz Lock + ADPF Hint + Pen Button Hook)"]
-        CTB["CanvasTopToolbar (Offscreen Layer + Zoom -/%/+)"]
-        FTD["FloatingToolDock (Összecsukható Pill + Offscreen Layer)"]
-        SDS["StylusDrawingSurface"]
+    subgraph UI["UI Réteg (Jetpack Compose StarNote UI + AndroidView / FrameLayout)"]
+        MA["MainActivity (144 Hz Lock + Immerzív Teljes Képernyő + ADPF Hint)"]
+        BS["BookshelfScreen (2 Panel, Drag&Drop Kategória, FTS4, ... Menü, NotebookLM PDF)"]
+        CTB["CanvasTopToolbar (Bal Felső, Füzetnév + Zoom -/%/+ + AI Pill)"]
+        FTD["FloatingToolDock (Globális (x,y), 3 Gomb Összecsukva, 2 Lépcsős Ecsetfül)"]
+        LPD["LeftPageDrawer (Fix Oldal Kihúzható Bal Oldalsáv)"]
+        AIC["AiCopilotSheet (Beállítások + Hatókör + 2 Formázó Mód)"]
+        SDS["StylusDrawingSurface (Lasszó ✨ AI + Szellemkép-mentes Mozgatás)"]
         DCV["DryCanvasView (Hardware View Host)"]
         PBL["PaperBackgroundLayer (1. réteg)"]
-        DIRC["DryInkRasterCache (GPU Kompozit + 512x512 LRU 192MB)"]
+        DIRC["DryInkRasterCache (GPU Kompozit + 512x512 LRU + excludedStrokeIds)"]
         IPS["InProgressStrokesView (4. wet front-buffer)"]
         HCO["HoverCursorOverlay (7. réteg)"]
-        LO["LaserOverlay (6. réteg)"]
     end
 
     subgraph CORE["Core Réteg (Matematika, Hardver, AI)"]
-        CTM["CanvasTransformMatrix (PDF pt 1/72 in, 0.25x-5.0x)"]
+        CTM["CanvasTransformMatrix (PDF pt 1/72 in, 0.65x-5.0x)"]
         SIR["StylusInputRouter (Palm Rejection, Predictor vs. 1€)"]
         OEF["OneEuroFilter (0-100%)"]
         SI["SpatialIndex (R-fa / QuadTree)"]
@@ -30,19 +32,22 @@ flowchart TD
     end
 
     subgraph DOMAIN["Domain Réteg"]
-        CSH["CanvasStateHolder (Rétegek, Radírok, Lasszó, Delta Undo/Redo)"]
+        CSH["CanvasStateHolder (Rétegek, Radírok, Lasszó, FormattedTextObject, Delta Undo/Redo)"]
         BC["BrushConfig & CanvasAction"]
     end
 
     subgraph DATA["Data Réteg"]
         SJ["StrokeJournal + PageFileFormat (SNOT + CRC32 + ATOMIC_MOVE)"]
         DB["AppDatabase (Room + FTS4)"]
-        PDF["PdfTileRenderer & PdfExportManager & BackupManager"]
+        PDF["PdfTileRenderer (Szelektív) & PdfExportManager & NotebookLM FileProvider"]
     end
 
-    MA --> SDS
-    MA --> CTB
-    MA --> FTD
+    MA --> BS
+    BS --> SDS
+    BS --> CTB
+    BS --> FTD
+    BS --> LPD
+    BS --> AIC
     SDS --> DCV
     CTM -->|Draw-phase Matrix szinkron| PBL
     CTM -->|Draw-phase Matrix szinkron| DIRC
@@ -56,7 +61,6 @@ flowchart TD
     CSH --> SI
     CSH --> SJ
     CSH --> CLI
-    SDS --> LO
 ```
 
 ---
@@ -162,3 +166,18 @@ flowchart TD
   - `testDebugUnitTest`: **56/56** teszt sikeres (14 osztály, 0 hiba, 0 kihagyás).
   - `:app:connectedDebugAndroidTest`: **8/8** teszt sikeres (0 hiba, 0 kihagyás).
   - `:benchmark:connectedBenchmarkAndroidTest` (`panAndZoom10kStrokesCanvasFrameTiming`, 10 000 vonalas vászon, 5 iteráció, median `frameCount = 118,0`): **`frameDurationCpuMs` P50 = `4,47 ms`, P90 = `5,63 ms`, P95 = `6,04 ms` (≤ `6,94 ms` teljesítve ✅), P99 = `8,24 ms`**; **`frameOverrunMs` P50 = `-7,31 ms`, P95 = `-5,45 ms`, P99 = `-3,11 ms`** (0 eldobott képkocka).
+
+---
+
+### [2026-11-14] — II. Ütem (Lépés 18–24): StarNote UI/UX, Kategóriák Drag & Drop, Szelektív PDF/NotebookLM, Globális Eszköztár és Szellemkép-mentes `✨ AI` Formázás
+
+- **Lépés 18 (`StarNote alapok & tisztítás`):** `StylusIcons.kt` (egyedi toll, radír, lasszó és AI ikonok), `Theme.kt` (`HandwritingFontFamily` és StarNote színpaletta), valódi immerzív teljes képernyő (`WindowInsetsControllerCompat` a `MainActivity`-ben), valamint a Lézer (`LaserOverlay`), a Függvényrajzoló UI és az Osztott nézet kivezetése.
+- **Lépés 19 (`StarNote Könyvespolc & Borító Stúdió`):** Kétpaneles elrendezés bal oldali keresővel és `+` kategória-kezeléssel, hosszan nyomásos Drag & Drop kategória-áthelyezés (`NotebookEntity.folderId`, biztonságos `ForeignKey.CASCADE` leválasztással), `MIND | JEGYZET | PDF` szűrés (`PageDao.observePdfNotebookIds()`), szaggatott `+ Létrehozás` kártya, kedvenc csillag lecserélése `...` könyvmenüre, valamint megújult Moleskine `CoverDesignerDialog` (`ModalBackdropBox` ESC + backdrop zárással).
+- **Lépés 20 (`Szelektív PDF Import & NotebookLM Export`):** `parsePageSelectionSpec` + `SelectivePdfImportDialog` (egész PDF vagy adott oldalak/tartományok pl. `1-3, 5`), `NotebookLmExportDialog` + `FileProvider` (`file_paths.xml`, `Intent.ACTION_SEND`) teljes könyv vagy adott oldal megosztásához.
+- **Lépés 21 (`Vászon Bal Felső Fejléc, Zoom Floor & Bal Oldali Oldalfiók`):** `CanvasTransformMatrix.MIN_SCALE = 0.65f` (65% nagyítási alsó határ), bal felső sarokba igazított `CanvasTopToolbar` (`topToolbarBoundsPx` jelentéssel), valamint Fix oldalmódban elérhető `LeftPagePullTab` + `LeftPageDrawerOverlay` (oldalváltás és `+ Új oldal hozzáadása`, ESC + backdrop zárás).
+- **Lépés 22 (`Globális Lebegő Eszköztár & 2 Lépcsős Ecsetfül`):** `ToolDockPreferencesStore` DataStore az `(x, y)` pozíció, tájolás, összecsukott állapot és utolsó rajzeszköz megőrzéséhez (`clampDockOriginPx` ütközésvédelemmel a bal felső menüvel); összecsukva 3 gomb (`Toll`, `Radír`, `Vissza`); hosszú nyomásra (`combinedClickable`) nyíló 2 lépcsős `BrushSettingsPopover` (`312 dp` lényegi fül ↔ `472 dp` teljes stúdió).
+- **Lépés 23 (`Szellemképmentes Lasszó, ✨ AI & Egyszerűsített AI Mód`):** `DryInkRasterCache.drawVisibleTiles` (`excludedStrokeIds` + `excludedBounds`) az aktív lasszó mozgatás alatti szellemkép elkerülésére; `PageObject.FormattedTextObject` (`OBJECT_TAG_FORMATTED_TEXT = 5`, `HandwritingFontFamily`, kurzív PDF export); `LassoSelectionActionBar` `✨ AI` gomb (<10 ms `ShapeRecognizer` + 768 px Gemini Flash `LASSO_AUTO_FORMAT`); egyszerűsített `AiCopilotSheet` (Beállítások + Hatókör + 2 formázó mód).
+- **Lépés 24 mért eredményei Xiaomi `25097RP43G` (Android 16 / SDK 36) táblagépen:**
+  - `testDebugUnitTest`: **64/64** teszt sikeres (16 osztály, 0 hiba, 0 kihagyás).
+  - `:app:connectedDebugAndroidTest`: **8/8** teszt sikeres (0 hiba, 0 kihagyás).
+  - `:benchmark:connectedBenchmarkAndroidTest` (`panAndZoom10kStrokesCanvasFrameTiming`, 5 iteráció, median `frameCount = 117,0`, `CV = 0,47%`): **`frameDurationCpuMs` P50 = `3,74 ms`, P90 = `5,04 ms`, P95 = `5,48 ms` (≤ `6,94 ms` teljesítve ✅), P99 = `6,88 ms`**; **`frameOverrunMs` P50 = `-7,95 ms`, P90 = `-6,79 ms`, P95 = `-6,23 ms`, P99 = `-4,35 ms`** (0 eldobott képkocka).

@@ -6,9 +6,13 @@ import android.view.Choreographer
 import android.view.Display
 import android.view.KeyEvent
 import android.view.View
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -37,8 +41,8 @@ import hu.bdev.stylusnote.data.local.NotebookEntity
 import hu.bdev.stylusnote.data.local.PageEntity
 import hu.bdev.stylusnote.data.local.StrokeJournal
 import hu.bdev.stylusnote.ui.shelf.BookshelfScreen
+import hu.bdev.stylusnote.ui.shelf.NotebookWorkspaceScreen
 import hu.bdev.stylusnote.ui.shelf.OpenedPageTarget
-import hu.bdev.stylusnote.ui.shelf.SplitScreenCanvasWorkspace
 import hu.bdev.stylusnote.ui.theme.StylusNoteTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
@@ -64,6 +68,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        applyImmersiveFullscreen()
         configureHighRefreshRateDisplay()
         val benchmarkStrokeCount = intent?.getIntExtra(EXTRA_BENCHMARK_STROKE_COUNT, 0) ?: 0
 
@@ -93,7 +98,29 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        applyImmersiveFullscreen()
         configureHighRefreshRateDisplay()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            applyImmersiveFullscreen()
+        }
+    }
+
+    private fun applyImmersiveFullscreen() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            window.attributes = window.attributes.apply {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
+        val controller = WindowInsetsControllerCompat(window, window.decorView)
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller.hide(WindowInsetsCompat.Type.systemBars())
     }
 
     /**
@@ -179,9 +206,6 @@ private fun StylusNoteAppRoot(
             }
         )
     }
-    var secondaryTarget by remember { mutableStateOf<OpenedPageTarget?>(null) }
-    var selectingSecondaryForSplit by remember { mutableStateOf(false) }
-
     // Startup crash recovery & initial starter notebook provisioning.
     LaunchedEffect(database, benchmarkStrokeCount) {
         if (benchmarkStrokeCount > 0) return@LaunchedEffect
@@ -219,46 +243,28 @@ private fun StylusNoteAppRoot(
 
     Box(modifier = Modifier.fillMaxSize()) {
         val activePrimary = primaryTarget
-        if (activePrimary == null || selectingSecondaryForSplit) {
+        if (activePrimary == null) {
             BookshelfScreen(
                 database = database,
                 isDarkTheme = isDarkTheme,
                 onToggleTheme = onToggleTheme,
                 onOpenSinglePage = { target ->
-                    if (selectingSecondaryForSplit && primaryTarget != null) {
-                        secondaryTarget = target
-                        selectingSecondaryForSplit = false
-                    } else {
-                        primaryTarget = target
-                        secondaryTarget = null
-                    }
-                },
-                onOpenSplitScreen = { left, right ->
-                    primaryTarget = left
-                    secondaryTarget = right
-                    selectingSecondaryForSplit = false
+                    primaryTarget = target
                 },
                 modifier = Modifier.fillMaxSize()
             )
         } else {
-            SplitScreenCanvasWorkspace(
+            NotebookWorkspaceScreen(
                 database = database,
-                primaryTarget = activePrimary,
-                secondaryTarget = secondaryTarget,
+                target = activePrimary,
                 penButtonToggleTick = penButtonToggleTick,
                 isDarkTheme = isDarkTheme,
                 onToggleTheme = onToggleTheme,
+                onSelectPageTarget = { nextTarget ->
+                    primaryTarget = nextTarget
+                },
                 onExitToBookshelf = {
                     primaryTarget = null
-                    secondaryTarget = null
-                    selectingSecondaryForSplit = false
-                },
-                onCloseSecondaryPane = {
-                    secondaryTarget = null
-                    selectingSecondaryForSplit = false
-                },
-                onSelectSecondaryFromBookshelf = {
-                    selectingSecondaryForSplit = true
                 },
                 showDebugOverlay = showDebugOverlay,
                 onToggleDebugOverlay = onToggleDebugOverlay,

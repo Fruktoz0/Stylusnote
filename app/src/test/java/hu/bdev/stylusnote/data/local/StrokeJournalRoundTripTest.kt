@@ -142,6 +142,16 @@ class StrokeJournalRoundTripTest {
                 pdfAssetRelativePath = "assets/analizis_1.pdf",
                 pageIndexZeroBased = 3,
                 invertInOledMode = true
+            ),
+            PageObject.FormattedTextObject(
+                id = "fmt-text-1",
+                zOrder = 105L,
+                bounds = DocRect(90f, 640f, 410f, 700f),
+                text = "Árvíztűrő tükörfúrógép — tiszta kézírásos stílusban",
+                fontSizePt = 19f,
+                canonicalColorArgb = 0xFF1A1F29.toInt(),
+                rotationRadians = 0.02f,
+                sourceStrokeIds = listOf(stroke.id)
             )
         )
 
