@@ -1,0 +1,205 @@
+StylusNote – Teljes Rendszerterv és AI Agent Master Specifikáció (v2)
+
+Célhardver: Xiaomi Pad 8 (144 Hz) + Xiaomi Focus Pen Pro
+Paradigma: 100% natív Android (Kotlin + Jetpack Compose + Google Jetpack Ink API)
+Állapot: v2, 2026. november 13. A függőség- és API-állapot erre a dátumra vonatkozik, implementáláskor újra ellenőrizendő.
+
+## 0. Változások a v1-hez képest
+- Gemini modell: a gemini-2.5-flash a Google ütemezése szerint 2026. október 16-án leállt (fejlesztők 404-es hibákat jelentenek), az ajánlott utód a 3.x Flash család. A modell ID ezért konfigurálható, a ModelCatalog választ, a kliens kezeli a 404-et és a 429-et.
+- Ink verzió (döntés): az 1.0.0 stabil, a legfrissebb alfa az 1.1.0-alpha10 (2026. október 21.). A specifikáció az 1.1.0-alpha10-et rögzíti, mert az 1.1 alfa kísérleti „partial stroke” radírt tartalmaz (szerkeszti a geometriát és szétvágja a vonalakat), és az egyedi BrushFamily API teszi lehetővé a Ceruza és a Lézer ecsetet. Fallback: 1.0.0 stabil + saját radír.
+- Precíziós radír: elsődleges a beépített Stroke.subtract / split. A v1 „1 vagy 2 új Stroke” állítása hibás volt, N darab keletkezhet.
+- Undo: a törölt vonalak UUID-ja nem elég a visszavonáshoz, a törölt Stroke objektumokat is tárolni kell.
+- Tárolás: ink-storage kódoló + saját konténer, journal, atomikus snapshot, verziózott formátum (9. fejezet).
+- Room: csak FTS4 (a Room nem támogat FTS5-öt).
+- OCR: modelletöltés, sorokra bontás, magyar + angol modell.
+- LaTeX: natív renderelő (WebView tilos), a LaTeX-objektumok mentése definiálva.
+- Adatvédelem: az AI funkciók alapból kikapcsoltak, hozzájárulás-alapúak (9.5).
+- Törölve: a „16 384 nyomásszint” feltételezés (hardverfüggő, nem ellenőrzött).
+- Új: dokumentumtér (PDF pont), rétegmodell, wet→dry átadás, memóriakeret, elfogadási kritériumok, tesztek, alfázisok.
+
+## 1. AI Agent Végrehajtási Szabályok (Strict Engineering Constraints)
+- Zéró Cross-Platform / WebView. Tilos a React Native, a Flutter és a WebView (beleértve a MathJax/KaTeX-et is). Kizárólag natív Kotlin, Jetpack Compose (Material 3) és androidx.ink.* modulok használhatók a 4–10 ms-os késleltetés és a 6,94 ms-os (144 Hz) frame budget tartásához.
+- Függőségkezelés (Zero-Hallucination). Gradle Version Catalog (gradle/libs.versions.toml). Tárolók: Google Maven (https://dl.google.com/dl/android/maven2/) és Maven Central. A verziókat a maven-metadata.xml alapján old fel, pontos verziót rögzíts (nem +, nem tartomány), semmit ne írj be hallomásból.
+  - Ink: 1.1.0-alpha10 pin (vagy újabb 1.1.x; ha létezik stabil 1.1.x, azt használd). Modulok: ink-authoring, ink-authoring-compose, ink-brush, ink-brush-compose, ink-geometry, ink-geometry-compose, ink-rendering, ink-storage, ink-strokes. Az ink-nativeloader tranzitív is lehet.
+  - Egyéb: androidx.input:input-motionprediction, com.google.mlkit:digital-ink-recognition, Room, WorkManager, DataStore: a legfrissebb stabil, egymással kompatibilis verziók.
+- API-szimbólumok. A specben szereplő Ink / AndroidX / ML Kit nevek (pl. StockBrushes.*, Stroke.subtract, PartitionedMesh.intersects) iránymutatók, a feloldott verzió tényleges API-ja a mérvadó. Ha egy név nem létezik vagy átnevezték, ne találj ki helyette mást: állj meg és jelezd az eltérést. A kísérleti API-k opt-inje csak az őket becsomagoló adapter-osztályokban legyen.
+- 144 Hz zárolás. A MainActivity.kt-ben kérdezd le a Display.supportedModes listát, és a jelenlegi fizikai felbontáshoz tartozó legmagasabb frissítésű módot állítsd be a window.attributes.preferredDisplayModeId értékben. Ha elérhető (API 35+), használd a View.setRequestedFrameRate hintet is. A HyperOS energiatakarékos módja felülbírálhatja, ezért a tényleges frissítési frekvenciát a debug overlay mutassa.
+- Koordinátatér-szinkron (kritikus). A kétujjas zoom/pan Matrix minden képkockán 100%-ban szinkronban marad négy réteg között:
+  1. PaperBackgroundLayer (vektoros papírminta, csempézett PDF-háttér),
+  2. DryInkRasterCache és CanvasStrokeRenderer.draw(..., strokeToScreenTransform) (befejezett vonalak),
+  3. InProgressStrokesView.motionEventToViewTransform (aktív front-buffer vonal),
+  4. HoverCursorOverlay (lebegő tollhegy-előnézet).
+  400%-os nagyításnál is pixelpontos legyen a tollhegy és a tinta találkozása. A transzformációt a draw fázisban olvasd (Compose: graphicsLayer {} / drawWithContent lambda), soha ne váltson ki recompositiont minden képkockán.
+- Térbeli index és raszter cache. Tilos minden képkockán az összes Stroke-ot végigiterálni vagy újrarajzolni.
+  - Kötelező memóriabeli R-fa / QuadTree (SpatialIndex) a vonalak befoglaló dobozára (Box): viewport culling, radír, lasszó. Minden hozzáadásnál, törlésnél és transzformációnál karbantartandó.
+  - Pan/zoom közben a befejezett réteget csempézett offscreen cache-ből (DryInkRasterCache, 512×512 px csempék, Bitmap vagy HardwareBuffer) kell transzformálni. A gesztus megállása után (100 ms debounce) a látható csempék az új nagyításon vektorból, tűélesen renderelődnek újra.
+  - Memóriakeret: LRU csempe-cache, fix felső korláttal (kezdőérték 192 MB, mérés után finomítandó). Teljes oldalméretű Bitmap nem létezhet.
+- Wet→dry átadás. Az InProgressStrokesFinishedListener.onStrokesFinished adja vissza a kész Stroke-okat. Ezeket (1) add a CanvasStateHolder-hez és a SpatialIndex-hez, (2) érvényteleníts a dry cache érintett csempéit, (3) írd a journalba, és (4) csak a dry réteg kirajzolása után hívd a removeFinishedStrokes(ids)-t, különben villogás keletkezik.
+- Fázisolt építkezés. Mindig az aktuális alfázis teljes, fordítható és futtatható kódját add, hivatkozási hibák és // TODO nélkül. Minden alfázis végén a 11. fejezet elfogadási kritériumai teljesülnek, és az alfázis eszközön (Xiaomi Pad 8) ki van próbálva.
+
+## 2. Technológiai stack és adattárolás
+- Nyelv és UI: Kotlin, Jetpack Compose (Material 3), lebegő/dokkolható eszköztárak. A rajzfelület AndroidView-ban (vagy az ink-authoring-compose megfelelő elemén) fut; a toll hot path nem megy át a Compose recomposition-ön.
+- Rajzmotor: Jetpack Ink (ink-authoring, ink-brush, ink-rendering, ink-strokes, ink-geometry, ink-storage) + androidx.input:input-motionprediction.
+- Room: Folder (parentId, korlátlan mélység), Notebook, Chapter, Page (vászonmód, sablon, PDF-hivatkozás), Tag + kapcsolótábla, Bookmark, PageText (OCR-szöveg). Keresés: @Fts4 unicode61 tokenizerrel; az ékezet-érzéketlen keresést (remove_diacritics) a célkészüléken tesztelni kell. Explicit migrációk, exportSchema = true, fallbackToDestructiveMigration tilos.
+- Vonaltárolás: nem a Room-ban, hanem oldalanként fájlban (snapshot + journal), a 9. fejezet szerint. A StrokeInputBatch kódolásához az ink-storage kódolóját használd (a StrokeInputBatch szerializálása az Ink része); a saját konténer az UUID-t, ecsetet, réteget és objektumokat viszi. JSON tilos.
+- Gemini (BYOK): közvetlen kliensoldali REST/SDK a felhasználó saját AI Studio kulcsával.
+  - Modell: a ModelCatalog a GET /v1beta/models alapján választ a Flash-családból; alapértelmezett a legújabb stabil Flash (példa a november eleji állapotról: gemini-3.8-flash; a régebbi nevek aliasként az újabbakra irányíthatnak), de nem beégetve; a felhasználó felülírhatja.
+  - Be/kimenet: inline PNG (hosszabbik oldal 1024–2048 px); strukturált kimenet (responseMimeType: application/json + séma) LaTeX-hez, kártyákhoz, kvízhez.
+  - Hibakezelés: 429 → exponenciális backoff a Retry-After figyelembevételével; 404 (megszűnt modell) → ModelCatalog frissítés és értesítés; időtúllépés/újrapróbálás központi rate limiterrel.
+  - API-kulcs: Android Keystore-ban tárolt AES-GCM kulccsal titkosítva, a titkosított érték DataStore-ban; nem kerül naplóba és backupba.
+- Offline OCR: com.google.mlkit:digital-ink-recognition. Nyelvenként kb. 20 MB modellt kell előtte letölteni (RemoteModelManager), ezért a „100% offline” az első letöltés után igaz. Lásd 7.4.
+- LaTeX renderelés: natív, Canvas-alapú könyvtár (javasolt jelölt: ru.noties:jlatexmath-android, Maven Central; ha nem megfelelő, hasonló natív). A kimenet Canvas-műveletekkel rajzol, így a PDF-exportba is bekerülhet. A Gemini LaTeX-kimenetét validálni kell (parse-hiba → hibaüzenet, a kézírás marad).
+
+## 3. Dokumentumtér és rétegmodell
+- Dokumentumtér: egysége a PDF pont (1/72 in). A Stroke-ok koordinátái és az ecsetméret (0,5–40 pt) ebben élnek. Referencia: 5 mm ≈ 14,17 pt; 8 mm ≈ 22,68 pt; A4 = 595 × 842 pt; B5 (ISO) ≈ 499 × 709 pt; 16:10 = fekvő, 842 × 526 pt. A képernyő↔dokumentum leképezést a CanvasTransformMatrix végzi (0,25×–5,0×, eltolás, inverz).
+- Rétegsorrend (alulról): 1. papír → 2. PDF-háttér (csempézett) → 3. highlighter → 4. tinta (dry cache + wet InProgressStrokesView) → 5. objektumok (LaTeX, függvénygörbe, levezetés-kártya) → 6. lézer overlay → 7. hover kurzor → 8. UI.
+- Megjegyzés: highlighter húzása közben az aktív vonal a front buffer miatt a tinta fölött látszik, és befejezéskor kerül alá. Ez elfogadott; alternatíva egy külön InProgressStrokesView a highlighternek.
+
+## 4. Hardver-specifikus integráció és input pipeline (Xiaomi Pad 8 + Focus Pen Pro)
+- Eszköz-szűrés (szigorú palm rejection): vonalat kizárólag TOOL_TYPE_STYLUS (és TOOL_TYPE_ERASER) indíthat. Az egyujjas TOOL_TYPE_FINGER érintést a vászon figyelmen kívül hagyja. FLAG_CANCELED / ACTION_CANCEL esetén azonnal inProgressView.cancelStroke(). Opcionális beállítás: „Ujjal rajzolás” (alapból ki).
+- Két útvonal a tinta felé:
+  - Stabilizálás 0%: a MotionEvent közvetlenül az Inknek megy (startStroke / addToStroke(event, pointerId, prediction)), a history pontokat az Ink dolgozza fel.
+  - Stabilizálás > 0%: kézi bejárás minden ACTION_MOVE-nál a 0 until event.historySize tartományon (getHistoricalX, getHistoricalY, getHistoricalPressure, getHistoricalAxisValue(AXIS_TILT), getHistoricalEventTime), majd az aktuális pont → OneEuroFilter → StrokeInputBatch → a batch-alapú addToStroke túlterhelés. Így a 240+ Hz-es mintavétel megmarad.
+- Szűrési sorrend (Predictor vs. 1€):
+  - A MotionEventPredictor.record(event) kizárólag a nyers, szűretlen MotionEvent-et kapja (különben a két szűrő fáziskésése „overshoot” kampókat okoz a vonal végén).
+  - A OneEuroFilter a valós pontokat simítja; a prediktált pontok (predictor.predict()) szűretlenül mennek a front-buffer előrejelzéshez.
+  - A prediktált MotionEvent példányokat finally blokkban recycle()-elni kell.
+- Nyomás: az Android 0..1 float-ot ad; a kód nem tehet feltevést a hardver szintszámáról. Görbe: p' = p^γ (Lágy γ = 0,7; Lineáris 1,0; Kemény 1,5).
+- Kétujjas navigáció: TOOL_TYPE_FINGER gesztusok (ScaleGestureDetector + pan) a megosztott CanvasTransformMatrix-ot vezérlik. Aktív tollvonás alatt az ujjgesztusokat figyelmen kívül kell hagyni.
+- Hover kurzor (ACTION_HOVER_MOVE / ACTION_HOVER_EXIT): 1 px vékony körvonal követi a tollhegyet, az aktuális ecsetátmérővel (a zoomhoz skálázva) és az aktív színnel.
+- Focus Pen Pro gombhook: KeyEvent és MotionEvent figyelő (KEYCODE_STYLUS_BUTTON_PRIMARY, BUTTON_STYLUS_PRIMARY) a toll és a legutóbbi radír közti váltáshoz. A tolltest haptikája és a zárt HyperOS gesztusok SDK híján nem vezérelhetők.
+
+## 5. Modul A: rajzmotor, stabilizálás, ecsetek
+- 5.1 One-Euro (1€) stabilizáló. Sebességfüggő aluláteresztő szűrő az (x, y) koordinátákra: lassú írásnál simít, gyors húzásnál késleltetés nélkül követ. Ecsetenként 0–100% csúszka, a minCutoff és beta paraméterekre leképezve (a leképezést dokumentáld a kódban). 0% = nyers adat, a szűrő kimarad.
+- 5.2 Hold-to-Snap.
+  - Egyenes, kör, ellipszis, háromszög, téglalap, nyíl: ha a vonal végén 300 ms-ig megtartod a tollat (elmozdulás < 4 pt), tökéletes vektoros alakzattá simul.
+  - Hamis pozitívok ellen: csak 40 pt feletti vonalhossznál és elég nagy felismerési bizonyosságnál aktiválódik, ecsetenként kikapcsolható, a snap utáni Undo az eredeti vonalat adja vissza.
+  - Az alakzat normál Stroke, mellette ShapeMeta (típus + kontrollpontok) rekord, így utólag nyújtható és forgatható (a szerkesztés újragenerálja a Stroke-ot).
+- 5.3 Öt ecset.
+  - Töltőtoll: nyomásérzékeny stock brush (pressure pen), a hardver teljes jelentett nyomásfelbontásával, választható görbével.
+  - Golyóstoll: stock marker brush; állandó, tűéles vastagság.
+  - Ceruza: dőlésszög-érzékeny (AXIS_TILT, AXIS_ORIENTATION), megdöntve szélesebb. Egyedi BrushFamily-vel valósítandó meg (programozható ecset-API, tilt → méret BrushBehavior); a mentéshez a BrushFamily szerializálás használandó.
+  - Highlighter: stock highlighter SelfOverlap paraméterrel (az átfedés ne sötétedjen), alpha = 0,35, külön réteg a tinta alatt; egyenesre húzható.
+  - Lézer: prezentációs overlay világító csíkja. Nem kerül az Undo stackbe és a fájlba; ACTION_UP után 1500 ms alatt elhalványul és törlődik.
+- 5.4 Lebegő eszköztár (FloatingToolDock, BrushSettingsPopover). Áthelyezhető, dokkolható (fent/balra/jobbra). Csúszkák: vastagság (0,5–40 pt), átlátszóság (10–100%), stabilizálás (0–100%). HSV színkerék + HEX + 6 mentett kedvenc preset (DataStore).
+- 5.5 Radírok, lasszó, Undo/Redo.
+  - Vektoros radír: képernyő-állandó méret (dp), dokumentumtérbe átszámolva. A SpatialIndex szűr, majd PartitionedMesh.intersects alapján egy érintés törli a teljes metszett vonalat.
+  - Precíziós radír: elsődleges a kísérleti Stroke.subtract(...), majd Stroke.split(); ezek az Ink 1.1 alfában háttérszálon hívandó (@WorkerThread) függvények, és az alpha10 anti-aliasingot ad a vágott élekhez. Az eredmény N önálló Stroke, mindegyik új UUID-val. A teljes radírozási húzás egyetlen CompositeAction.
+  - Fallback (ha a beépített radír hibás vagy artefaktos): a metszett vonal pontjai közül a radír hatókörébe esőket (sugár = radír sugara + ecsetméret/2) kiszedi; a szegmens–kör metszéspontokat interpolálja a szomszédos pontok között, hogy gyors vonalaknál ne legyen nagy lyuk; a maradék pontszakaszokból N új Stroke-ot épít (az egypontos maradékot eldobja).
+  - Lasszó: a SpatialIndex + poligon-metszés alapján (egy vonal kijelölt, ha pontjainak legalább 60%-a bent van, beállítható). Mozgatás, forgatás, átméretezés, átszínezés, másolás, átadás a Matek/AI modulnak. Az Ink Stroke-jai immutábilisek: húzás közben a kijelölést csak a renderelési transzformációval (strokeToScreenTransform) mozgasd, a Stroke-okat ACTION_UP-nál építsd újra.
+  - Undo/Redo (Command pattern, delta-alapú): minimum 50 lépés, teljes oldalmásolat tilos. A stackben: AddedStrokes, RemovedStrokes (a törölt immutábilis Stroke objektumok referenciáival, enélkül nincs visszavonás), TransformedStrokes (UUID-k + mátrix), RecoloredStrokes, CompositeAction. Új művelet törli a Redo stacket. A mélységet a lépésszám mellett pontkeret is korlátozza. Az Undo stack nem perzisztens.
+
+## 6. Modul B: matek és STEM eszközök
+- Lasszó → LaTeX: a kijelölt kézírásból nagy felbontású, fehér hátterű, fekete tintás bitmap készül (mindig az eredeti, világos módú színekkel renderelve, az OLED módtól függetlenül). Beküldés a Geminibe (a ModelCatalog aktuális Flash modellje), JSON kimenettel, amelynek egyetlen latex mezője van. Feldolgozás: kódkerítések eltávolítása, trim, validálás a natív renderelővel. Hibás LaTeX → hibaüzenet, a kézírás érintetlen.
+- Vektoros képlet-behelyettesítés: egy gombnyomással LatexOverlayNode objektumra cseréli a kézírást (tűéles, átméretezhető, átszínezhető). Az objektum ObjectRecord-ként mentődik (LaTeX forrás, pozíció/méret/forgatás, szín). Egyetlen CompositeAction (RemovedStrokes + AddedObject), tehát Undo-kompatibilis.
+- Lépésről lépésre levezetés: a képlet alatti menüből kérhető, strukturált kártyaként (Markdown + LaTeX) objektumként szúrható a képlet mellé.
+- Függvényrajzoló: felismert vagy begépelt f(x) → helyi kifejezés-kiértékelő (saját rekurzív-leszálló parser vagy bevált könyvtár, verzió Maven-ből feloldva), adaptív mintavételezés, szakadási pontok kezelése; méretezhető vektoros koordináta-rendszer és görbe Path-ként, objektumként mentve.
+
+## 7. Modul C: hibrid AI Copilot
+- Kézírás → strukturált jegyzet: kijelölt oldalak képként (több oldal kötegelve) → címsoros, listás Markdown; export Markdown/PDF.
+- Magic Circle – „Magyarázd el”: bekarikázott ábra/fogalom kontextuális magyarázata példákkal lebegő buborékban.
+- Vizsgamód: a kiválasztott könyv tartalmából (OCR-szöveg + kijelölt oldalak képe) flashcardok és feleletválasztós teszt, JSON sémával.
+- Offline háttér-OCR (ML Kit Digital Ink):
+  - BackgroundOcrWorker (WorkManager, alacsony prioritás), csak módosult oldalakon, bezárás/mentés után, debounce-szal.
+  - Modellek: hu és en-US (DigitalInkRecognitionModelIdentifier.fromLanguageTag), letöltés RemoteModelManager-rel; első indításkor a felület mutatja a letöltést, modell nélkül a worker halogat.
+  - A felismerő egyetlen szövegsort feltételez, ezért kell az OcrLineSegmenter: a vonalakat függőleges középpont/átfedés szerint sorokba csoportosítja (SpatialIndex), soronként külön Ink objektumot épít (írási sorrendben, (x, y, t) pontokkal), WritingArea-t ad a sor becsült magasságával, RecognitionContext pre-contextként az előző sort. Kihagyandó: highlighter, lézer, nagy befoglalójú rajzok és objektumok.
+  - Nyelv: notebook-szintű beállítás (alap: magyar). Az eredmény a PageText FTS4 táblába kerül. Matek és ábrák nem ismerhetők fel, azok Gemini-feladatok.
+- Gemini-hívások szabályai: központi GeminiClient rate limiterrel, sorbaállítással, backoffal és használatszámlálóval; hívást csak felhasználói művelet indíthat; AI funkciók alapból kikapcsoltak (9.5).
+
+## 8. Modul D: rendszerezés, borítók, OLED mód, PDF
+- Hierarchia: korlátlan mélységű Mappák → Jegyzetfüzetek → Fejezetek/Oldalak, színes címkék, könyvjelzők.
+- Könyvborító Stúdió: textúrák (bőr, vászon, matt minimalista, műszaki tervrajz), galériakép-import, gerincszín, címke-elrendezés, betűtípus.
+- Kettős vászonmód: Fix oldal (A4, 16:10, B5) vagy Végtelenített vászon, könyvenként/oldalanként.
+- Papírsablonok: Üres, Pontozott (5 mm), Négyzethálós (5 mm), Vonalas (8 mm), Cornell, Kottapapír; vektorosan, zoom-követően rajzolva.
+- OLED mélyfekete mód (Smart Luminance Inversion): HSL-ben L_new = 1,0 − L_old, a Hue és Saturation marad (a sötétkék tinta világoskék lesz). A fájlba mindig az eredeti, világos módú szín kerül. Megvalósítás: renderidőben Stroke-másolat invertált színű ecsettel (az API-t ellenőrizni kell), cache-elve, témaváltáskor érvénytelenítve. A PDF-háttér (bitmap) ColorMatrix-szal invertálható (kapcsolható). Az export mindig az eredeti színekkel készül.
+- PDF import: PdfRenderer-alapú csempézett nézet (nagyításkor az adott kivágás nagy felbontású újrarenderelése, Page.render clip + transzformmal). A PdfRenderer egyszerre egy megnyitott oldalt enged, ezért mutex/egyszálú executor kell. Jelszóvédett PDF nem támogatott (hibaüzenet). Az importált PDF az app tárolójába másolódik, az oldalak (pdfId, pageIndex) hivatkozással élnek; saját jegyzetoldal beszúrható a diák közé.
+- Vektoros PDF export: a PdfDocument Canvas nem rajzolja a GPU-s CanvasStrokeRenderer meshet, ezért a Stroke.shape (PartitionedMesh) kontúr-poligonjai (outline) szoftveres android.graphics.Path-tá alakulnak. A highlighter vonalak vonalankénti saveLayerAlpha-val rajzolandók (az önátfedés ne sötétedjen). A LaTeX-objektumok és függvénygörbék Canvas-műveletekkel kerülnek be. Mindig az eredeti (világos) színek; az oldalméret a dokumentumtér pontjaiban.
+- Backup: .zip (manifest: formatVersion, appVersion, entitáslista; oldalfájlok, PDF-ek, borítók). Célok: helyi tárhely; Google Drive és más felhő a Storage Access Frameworkön át (ACTION_CREATE_DOCUMENT / ACTION_OPEN_DOCUMENT_TREE, Drive OAuth nélkül); WebDAV (OkHttp); SMB opcionálisan, későbbi fázisban. Az API-kulcs nem része a mentésnek.
+- Alkalmazáson belüli Split-Screen: két dokumentum egymás mellett, állítható elválasztóval, független CanvasStateHolder példányokkal.
+
+## 9. Adatbiztonság, fájlformátum, adatvédelem
+- 9.1 Fájlkiosztás: pages/<pageId>/page.snote (snapshot) és pages/<pageId>/page.journal (append-only).
+- 9.2 Formátum: fejléc: magic SNOT, formatVersion (u16), használt Ink verzió, flagek. Rekordok, mind hosszal prefixelve és CRC32-vel:
+  - StrokeRecord: UUID (16 B), réteg, z-index, ecset-hivatkozás (stock azonosító + paraméterek vagy szerializált BrushFamily), méret, eredeti ARGB szín, StrokeInputBatch az ink-storage kódolójával, opcionális ShapeMeta.
+  - ObjectRecord: LaTeX, függvénygörbe, levezetés-kártya, PDF-hivatkozás.
+- 9.3 Journal és helyreállítás: minden befejezett vonal (ACTION_UP) azonnal journal-rekord (ADD, REMOVE uuid, TRANSFORM uuid+mátrix, ADD_OBJECT), egyetlen szálú íróval; fsync kötegelve (≤ 1 s) és onPause/onStop-nál. Kompaktálás N rekordonként (kezdőérték 500) vagy oldalbezáráskor: snapshot temp fájlba → fsync → atomikus átnevezés (Files.move(..., ATOMIC_MOVE)) → journal csonkolása. Megnyitáskor: snapshot betöltése + journal visszajátszása, a csonka/CRC-hibás utolsó rekord eldobva. Indításkor: a snapshotnál újabb journalok felderítése (crash recovery).
+- 9.4 Verziózás: ismeretlen, magasabb formatVersion → csak olvasható mód, soha nem írható felül; alacsonyabb → FormatMigrator lánc. Ha egy BrushFamily nem tölthető be, a legközelebbi stock ecset a tartalék, jelölve. Room: explicit migrációk.
+- 9.5 Adatvédelem (Gemini): az AI funkciók alapból kikapcsoltak; az első használatnál egyszeri hozzájárulás-képernyő (AiConsentStore): a kijelölt tartalom képként a Google Gemini API-hoz kerül a felhasználó saját kulcsával. Az ingyenes szinten emberi felülvizsgálók is olvashatják a beküldött tartalmat a Google termékfejlesztése érdekében; az EEA-ban, Svájcban és az Egyesült Királyságban viszont a fizetős adatkezelési feltételek érvényesek minden szolgáltatásra. Az UI ezt mutassa meg, és az aktuális feltételekre hivatkozzon. Háttérben soha nem megy tartalom a Geminihez (az OCR offline).
+- 9.6 Memória: JSON nincs, streaming dekódolás, az oldalak lustán töltődnek.
+
+## 10. Projekt csomagstruktúra (hu.bdev.stylusnote)
+app/src/main/java/hu/bdev/stylusnote/
+├── MainActivity.kt # 144 Hz lock, edge-to-edge, stylus KeyEvent hook, frame rate overlay
+├── core/
+│ ├── math/
+│ │ ├── OneEuroFilter.kt # sebességfüggő stabilizáló (0–100%)
+│ │ ├── ShapeRecognizer.kt # Hold-to-Snap (300 ms), ShapeMeta
+│ │ ├── CanvasTransformMatrix.kt # zoom/pan, inverz, dokumentumtér (pt)
+│ │ ├── SpatialIndex.kt # R-fa / QuadTree (culling, radír, lasszó)
+│ │ └── ColorLuminanceInverter.kt# HSL-alapú OLED inverzió
+│ ├── hardware/
+│ │ └── StylusInputRouter.kt # palm rejection, két útvonal, predictor, hover, pen button
+│ └── ai/
+│ ├── GeminiClient.kt # REST/SDK, rate limiter, backoff, Keystore kulcs
+│ ├── ModelCatalog.kt # ListModels alapú modellválasztás, 404 kezelés
+│ ├── AiConsentStore.kt # hozzájárulás, AI ki/be
+│ ├── BackgroundOcrWorker.kt # ML Kit Digital Ink, offline, WorkManager
+│ ├── OcrLineSegmenter.kt # vonalak sorokba csoportosítása
+│ └── FunctionEvaluator.kt # f(x) kiértékelő a függvényrajzolóhoz
+├── data/
+│ ├── local/
+│ │ ├── AppDatabase.kt # Room (Folder, Notebook, Chapter, Page, Tag, Bookmark, PageText FTS4)
+│ │ ├── PageFileFormat.kt # SNOT fejléc, rekordok, CRC, verzió
+│ │ ├── StrokeBinarySerializer.kt# ink-storage alapú kódolás
+│ │ ├── StrokeJournal.kt # append-only journal, kompaktálás, recovery
+│ │ └── FormatMigrator.kt
+│ └── export/
+│ ├── PdfTileRenderer.kt # csempézett PDF-oldal
+│ ├── PdfExportManager.kt # outline -> Path, highlighter saveLayerAlpha
+│ └── BackupManager.kt # ZIP, SAF, WebDAV
+├── domain/
+│ ├── model/
+│ │ ├── BrushConfig.kt
+│ │ ├── NotebookCover.kt
+│ │ ├── PaperTemplate.kt
+│ │ ├── PageObject.kt # LaTeX, függvénygörbe, kártya
+│ │ └── CanvasAction.kt # delta-alapú Undo/Redo (CompositeAction)
+│ └── repository/
+│ └── CanvasStateHolder.kt # rétegek, radírok, lasszó, undo stack
+└── ui/
+ ├── shelf/ BookshelfScreen.kt, CoverDesignerDialog.kt
+ ├── canvas/ StylusDrawingSurface.kt, DryInkRasterCache.kt, PaperBackgroundLayer.kt,
+ │ HoverCursorOverlay.kt, LaserOverlay.kt, LatexOverlayNode.kt
+ ├── components/ FloatingToolDock.kt, BrushSettingsPopover.kt, AiCopilotSheet.kt, ConsentDialog.kt
+ └── theme/ Theme.kt
+app/src/test/ # unit tesztek
+app/src/androidTest/ # műszerezett tesztek
+benchmark/ # Macrobenchmark modul
+
+## 11. Megvalósítási fázisok és elfogadási kritériumok
+- 1. fázis – alapok és rajzmotor
+  - 1a: version catalog, build.gradle.kts, MainActivity (144 Hz lock + overlay), üres vászon, CanvasTransformMatrix.
+  - 1b: StylusInputRouter, Ink wet stroke, predictor, OneEuroFilter, wet→dry átadás, SpatialIndex.
+  - 1c: DryInkRasterCache, pan/zoom, hover kurzor, StylusDrawingSurface.
+- 2. fázis – ecsetek, radírok, lasszó, UI
+  - 2a: BrushConfig, CanvasAction, CanvasStateHolder (undo/redo, vektoros és precíziós radír).
+  - 2b: FloatingToolDock, BrushSettingsPopover, ecsetek (Ceruza, Lézer, highlighter réteg).
+  - 2c: lasszó, ShapeRecognizer, PaperBackgroundLayer, ColorLuminanceInverter.
+- 3. fázis – adatbázis, formátum, könyvespolc, PDF
+  - 3a: PageFileFormat, StrokeBinarySerializer, StrokeJournal, AppDatabase.
+  - 3b: BookshelfScreen, CoverDesignerDialog.
+  - 3c: PdfTileRenderer, PdfExportManager, BackupManager.
+- 4. fázis – AI, OCR, matek
+  - 4a: GeminiClient, ModelCatalog, AiConsentStore, Keystore.
+  - 4b: BackgroundOcrWorker, OcrLineSegmenter, FTS keresés.
+  - 4c: LaTeX (LatexOverlayNode), függvényrajzoló.
+  - 4d: AiCopilotSheet (összefoglaló, Magic Circle, vizsgamód).
+- Elfogadási kritériumok (célértékek, az első mérés után finomítandók):
+  - Frame time: p95 ≤ 6,94 ms pan/zoom közben 10 000 vonalas oldalon, Xiaomi Pad 8-on (Macrobenchmark FrameTimingMetric / JankStats).
+  - Pontosság: tollhegy–tinta eltérés 400%-os nagyításnál ≤ 1 px (screenshot-teszt).
+  - Memória: 50 000 vonallal sincs OOM; a raszter cache a 192 MB-os kereten belül marad.
+  - Betöltés: 10 000 vonalas oldal megnyitása ≤ 1 s.
+  - Adatbiztonság: process kill rajzolás közben → legfeljebb a be nem fejezett vonal és kb. 1 s adat vész el; a journal-visszajátszás hibátlan; a kill-teszt automatizált.
+  - Round-trip: serializer, journal és backup/restore után a vonalak azonosak (UUID, pontok, ecset).
+  - Unit tesztek: OneEuroFilter, SpatialIndex (brute-force összevetés), ShapeRecognizer, Undo/Redo (CompositeAction is), precíziós radír (N szakasz), OcrLineSegmenter, FTS ékezet-érzéketlen keresés.
+- Nem cél (jelen verzióban): iOS/desktop, valós idejű együttműködés.
