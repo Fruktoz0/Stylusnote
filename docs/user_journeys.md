@@ -137,3 +137,21 @@ flowchart LR
     SCH --> ENG["CloudSyncEngine<br/>Room v3 tombstone + SHA-256 delta szinkron<br/>Csak módosult oldalak és fájlok feltöltése/letöltése"]
 ```
 
+---
+
+## 9. Élő Jegyzetbeli Kézírás- és Objektumkereső + Tartós AI Visszavonás
+
+```mermaid
+flowchart LR
+    K1["CanvasTopToolbar: AI gomb mellett Keresés pirula"] --> K2["InNotebookSearchCoordinator (RAM élő vonások + zárt oldalak + Room FTS4)"]
+    K2 --> K3{"ML Kit Digital Ink modell"}
+    K3 -- Hiányzik és van kézírás --> K4["Automatikus on-demand modell letöltés"]
+    K3 -- Kész / letöltve --> K5["Sorok OCR + FormattedText / Latex / Cím egyeztetés"]
+    K4 --> K5
+    K5 --> K6["Szószintű DocRect kiemelés (SearchHighlightCanvasOverlay) + 1/N léptetés + Oldalváltás és Auto-Pan"]
+    K5 --> K7["Opcionális kézi BYOK AI mélyindexelés gomb (vonások módosítása nélkül)"]
+    K6 --> K8["ESC / Vissza / X bezárás → kiemelés törlése"]
+    AIU["AI formázás → Undo → Jegyzet bezárása"] --> SJ["StrokeJournal enqueueCanvasActionInverse + compactBeforeClose szinkron"]
+    SJ --> RE["Újranyitás → eredeti színes tintavonások megmaradnak"]
+```
+

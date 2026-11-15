@@ -124,6 +124,7 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -143,7 +144,12 @@ import hu.bdev.stylusnote.core.ai.AiConsentStore
 import hu.bdev.stylusnote.core.ai.BackgroundOcrWorker
 import hu.bdev.stylusnote.core.ai.GeminiClient
 import hu.bdev.stylusnote.core.ai.GeminiModelInfo
+import hu.bdev.stylusnote.core.ai.InNotebookSearchCoordinator
 import hu.bdev.stylusnote.core.ai.ModelCatalog
+import hu.bdev.stylusnote.core.ai.NotebookSearchMatch
+import hu.bdev.stylusnote.core.ai.SearchExecutionResult
+import hu.bdev.stylusnote.core.ai.SearchIndexState
+import hu.bdev.stylusnote.core.ai.SearchTextIndexer
 import hu.bdev.stylusnote.core.math.CanvasTransformMatrix
 import hu.bdev.stylusnote.core.math.DocPoint
 import hu.bdev.stylusnote.core.math.DocRect
@@ -195,7 +201,9 @@ import hu.bdev.stylusnote.ui.components.BrushPresetStore
 import hu.bdev.stylusnote.ui.components.BrushSettingsPopover
 import hu.bdev.stylusnote.ui.components.ConsentDialog
 import hu.bdev.stylusnote.ui.components.FloatingToolDock
+import hu.bdev.stylusnote.ui.components.InNotebookSearchToolbarSection
 import hu.bdev.stylusnote.ui.components.PaperSettingsDialog
+import hu.bdev.stylusnote.ui.components.SearchHighlightCanvasOverlay
 import hu.bdev.stylusnote.ui.components.ShapePickerPopover
 import hu.bdev.stylusnote.ui.components.ToolDockPreferencesStore
 import hu.bdev.stylusnote.ui.components.ToolDockPrefs
@@ -1883,6 +1891,31 @@ private fun NotebookDetailsDialog(
     }
 }
 
+private class ActivePageSearchBridge(
+    val pageId: String,
+    val liveStrokesProvider: () -> List<PersistedStrokeRecord>,
+    val liveObjectsProvider: () -> List<PageObject>,
+    val livePageTitleProvider: () -> String?,
+    val switchPageAction: (String) -> Unit
+)
+
+internal data class NotebookSearchUiState(
+    val isOpen: Boolean = false,
+    val query: String = "",
+    val activeMatchIndex: Int = 0,
+    val matchesCount: Int = 0,
+    val indexState: SearchIndexState = SearchIndexState.IDLE,
+    val canRunAiDeepIndex: Boolean = false,
+    val activeMatchForCurrentPage: NotebookSearchMatch? = null,
+    val navigateTriggerTick: Long = 0L,
+    val onOpen: () -> Unit = {},
+    val onQueryChange: (String) -> Unit = {},
+    val onPreviousMatch: () -> Unit = {},
+    val onNextMatch: () -> Unit = {},
+    val onTriggerAiDeepIndex: () -> Unit = {},
+    val onClose: () -> Unit = {}
+)
+
 /**
  * Single-pane 144 Hz notebook workspace hosting [CanvasStateHolder], [DryInkRasterCache],
  * [StrokeJournal], AI Copilot, and tool overlays.
@@ -1932,6 +1965,193 @@ fun NotebookWorkspaceScreen(
     var isFullScreenCanvas by remember(target.notebookId) { mutableStateOf(false) }
     var showLeftPageDrawer by remember(target.notebookId) { mutableStateOf(false) }
 
+    val aiConsentStore = remember(context) { AiConsentStore(context.applicationContext) }
+    val modelCatalog = remember { ModelCatalog() }
+    val geminiClient = remember(aiConsentStore, modelCatalog) {
+        GeminiClient(consentStore = aiConsentStore, modelCatalog = modelCatalog)
+    }
+    val consentState by aiConsentStore.stateFlow.collectAsState(initial = AiConsentState())
+    var showConsentDialog by remember(target.notebookId) { mutableStateOf(false) }
+    var discoveredFlashModels by remember { mutableStateOf<List<GeminiModelInfo>>(emptyList()) }
+    val notebookPages by database.pageDao()
+        .observePagesForNotebook(target.notebookId)
+        .collectAsState(initial = emptyList())
+    var notebookOcrLanguage by remember(target.notebookId) { mutableStateOf(OcrLanguageTag.HUNGARIAN) }
+    LaunchedEffect(target.notebookId) {
+        val nb = withContext(Dispatchers.IO) { database.notebookDao().getNotebookById(target.notebookId) }
+        if (nb != null) {
+            notebookOcrLanguage = nb.ocrLanguage
+        }
+    }
+
+    var isSearchOpen by remember(target.notebookId) { mutableStateOf(false) }
+    var searchQuery by remember(target.notebookId) { mutableStateOf("") }
+    var lastExecutedQuery by remember(target.notebookId) { mutableStateOf("") }
+    var searchMatches by remember(target.notebookId) { mutableStateOf<List<NotebookSearchMatch>>(emptyList()) }
+    var activeMatchIndex by remember(target.notebookId) { mutableIntStateOf(0) }
+    var searchIndexState by remember(target.notebookId) { mutableStateOf(SearchIndexState.IDLE) }
+    var searchNavigateTick by remember(target.notebookId) { mutableLongStateOf(0L) }
+    var activePageRevisionTick by remember(target.notebookId) { mutableLongStateOf(0L) }
+    var activePageBridge by remember(target.notebookId) { mutableStateOf<ActivePageSearchBridge?>(null) }
+
+    val searchCoordinator = remember(database, context, geminiClient) {
+        InNotebookSearchCoordinator(
+            database = database,
+            filesDir = context.applicationContext.filesDir,
+            aiTextBoxExtractor = { strokes, lang ->
+                HandwritingToLatexConverter.recognizeHandwritingBoxesForSearch(
+                    strokes = strokes,
+                    ocrLanguage = lang,
+                    geminiClient = geminiClient
+                )
+            }
+        )
+    }
+
+    var workspaceBannerHu by remember(target.notebookId) { mutableStateOf<String?>(null) }
+    LaunchedEffect(workspaceBannerHu) {
+        if (workspaceBannerHu != null) {
+            kotlinx.coroutines.delay(2200L)
+            workspaceBannerHu = null
+        }
+    }
+
+    var shownSearchWarningHu by remember(target.notebookId) { mutableStateOf<String?>(null) }
+
+    fun applySearchExecutionResult(result: SearchExecutionResult, queryChanged: Boolean) {
+        searchMatches = result.matches
+        searchIndexState = result.state
+        if (result.matches.isEmpty()) {
+            activeMatchIndex = 0
+        } else if (queryChanged) {
+            val samePageIdx = result.matches.indexOfFirst { it.pageId == target.pageId }
+            activeMatchIndex = if (samePageIdx >= 0) samePageIdx else 0
+            if (samePageIdx >= 0) {
+                searchNavigateTick++
+            }
+        } else {
+            activeMatchIndex = activeMatchIndex.coerceIn(0, result.matches.lastIndex)
+        }
+        val notice = result.statusNoticeHu
+        if (!notice.isNullOrBlank() && notice != shownSearchWarningHu) {
+            shownSearchWarningHu = notice
+            workspaceBannerHu = notice
+        } else if (notice == null) {
+            shownSearchWarningHu = null
+        }
+    }
+
+    fun stepSearchMatch(delta: Int) {
+        if (searchMatches.isEmpty()) return
+        val nextIdx = (activeMatchIndex + delta).mod(searchMatches.size)
+        activeMatchIndex = nextIdx
+        searchNavigateTick++
+        val nextMatch = searchMatches[nextIdx]
+        if (nextMatch.pageId != target.pageId) {
+            activePageBridge?.switchPageAction?.invoke(nextMatch.pageId)
+        }
+    }
+
+    fun closeInNotebookSearch() {
+        isSearchOpen = false
+        searchQuery = ""
+        lastExecutedQuery = ""
+        searchMatches = emptyList()
+        activeMatchIndex = 0
+        searchIndexState = SearchIndexState.IDLE
+    }
+
+    LaunchedEffect(
+        isSearchOpen,
+        searchQuery,
+        target.pageId,
+        activePageRevisionTick,
+        notebookPages,
+        notebookOcrLanguage,
+        benchmarkStrokeCount
+    ) {
+        if (!isSearchOpen || benchmarkStrokeCount > 0) return@LaunchedEffect
+        val trimmed = searchQuery.trim()
+        if (trimmed.isEmpty()) {
+            searchMatches = emptyList()
+            activeMatchIndex = 0
+            lastExecutedQuery = ""
+            searchIndexState = SearchIndexState.IDLE
+            return@LaunchedEffect
+        }
+        kotlinx.coroutines.delay(140L)
+        val bridge = activePageBridge?.takeIf { it.pageId == target.pageId }
+        val result = searchCoordinator.prepareAndSearch(
+            notebookId = target.notebookId,
+            ocrLanguage = notebookOcrLanguage,
+            pages = notebookPages,
+            currentPageId = target.pageId,
+            liveStrokes = bridge?.liveStrokesProvider?.invoke().orEmpty(),
+            liveObjects = bridge?.liveObjectsProvider?.invoke().orEmpty(),
+            livePageTitle = bridge?.livePageTitleProvider?.invoke()
+                ?: notebookPages.firstOrNull { it.id == target.pageId }?.title,
+            query = trimmed,
+            onStateChanged = { nextState, notice ->
+                searchIndexState = nextState
+                if (nextState == SearchIndexState.DOWNLOADING_MODEL && notice != null) {
+                    workspaceBannerHu = notice
+                }
+            }
+        )
+        val queryChanged = trimmed != lastExecutedQuery
+        lastExecutedQuery = trimmed
+        applySearchExecutionResult(result, queryChanged = queryChanged)
+    }
+
+    fun triggerAiDeepSearch() {
+        if (!consentState.isReadyForUserInitiatedCall) {
+            showConsentDialog = true
+            return
+        }
+        val trimmed = searchQuery.trim()
+        if (trimmed.isEmpty()) return
+        workspaceScope.launch {
+            val bridge = activePageBridge?.takeIf { it.pageId == target.pageId }
+            val result = searchCoordinator.runManualAiDeepIndex(
+                notebookId = target.notebookId,
+                ocrLanguage = notebookOcrLanguage,
+                pages = notebookPages,
+                currentPageId = target.pageId,
+                liveStrokes = bridge?.liveStrokesProvider?.invoke().orEmpty(),
+                liveObjects = bridge?.liveObjectsProvider?.invoke().orEmpty(),
+                livePageTitle = bridge?.livePageTitleProvider?.invoke()
+                    ?: notebookPages.firstOrNull { it.id == target.pageId }?.title,
+                query = trimmed,
+                onStateChanged = { nextState, _ -> searchIndexState = nextState }
+            )
+            lastExecutedQuery = trimmed
+            applySearchExecutionResult(result, queryChanged = true)
+            workspaceBannerHu = result.statusNoticeHu ?: if (result.matches.isEmpty()) {
+                "AI mélyindexelés kész, nincs találat."
+            } else {
+                "AI mélyindexelés: ${result.matches.size} találat."
+            }
+        }
+    }
+
+    val activeSearchMatch = searchMatches.getOrNull(activeMatchIndex)
+    val searchUiState = NotebookSearchUiState(
+        isOpen = isSearchOpen,
+        query = searchQuery,
+        activeMatchIndex = activeMatchIndex,
+        matchesCount = searchMatches.size,
+        indexState = searchIndexState,
+        canRunAiDeepIndex = consentState.isReadyForUserInitiatedCall,
+        activeMatchForCurrentPage = activeSearchMatch?.takeIf { it.pageId == target.pageId },
+        navigateTriggerTick = searchNavigateTick,
+        onOpen = { isSearchOpen = true },
+        onQueryChange = { searchQuery = it },
+        onPreviousMatch = { stepSearchMatch(-1) },
+        onNextMatch = { stepSearchMatch(+1) },
+        onTriggerAiDeepIndex = ::triggerAiDeepSearch,
+        onClose = ::closeInNotebookSearch
+    )
+
     fun updateActiveBrushConfig(next: BrushConfig) {
         brushConfig = next
         val updatedMap = perToolConfigs.toMutableMap()
@@ -1968,14 +2188,6 @@ fun NotebookWorkspaceScreen(
         }
     }
 
-    var workspaceBannerHu by remember(target.notebookId) { mutableStateOf<String?>(null) }
-    LaunchedEffect(workspaceBannerHu) {
-        if (workspaceBannerHu != null) {
-            kotlinx.coroutines.delay(2200L)
-            workspaceBannerHu = null
-        }
-    }
-
     Box(modifier = modifier.fillMaxSize()) {
         key(target.notebookId, target.pageId) {
             NotebookPagePane(
@@ -1995,6 +2207,20 @@ fun NotebookWorkspaceScreen(
                 shapeHasFill = shapeHasFill,
                 isFullScreenCanvas = isFullScreenCanvas,
                 showLeftPageDrawer = showLeftPageDrawer,
+                notebookPages = notebookPages,
+                notebookOcrLanguage = notebookOcrLanguage,
+                geminiClient = geminiClient,
+                consentState = consentState,
+                searchUiState = searchUiState,
+                onOpenConsentDialog = { showConsentDialog = true },
+                onNotebookOcrLanguageLoaded = { loadedLang -> notebookOcrLanguage = loadedLang },
+                onPublishSearchBridge = { bridge -> activePageBridge = bridge },
+                onPageContentRevisionChanged = { activePageRevisionTick++ },
+                onClearSearchBridge = { disposedPageId ->
+                    if (activePageBridge?.pageId == disposedPageId) {
+                        activePageBridge = null
+                    }
+                },
                 onUpdateBrushConfig = ::updateActiveBrushConfig,
                 onSelectTool = ::selectTool,
                 onTogglePenEraser = {
@@ -2036,6 +2262,36 @@ fun NotebookWorkspaceScreen(
                 )
             }
         }
+
+        if (showConsentDialog) {
+            ConsentDialog(
+                currentState = consentState,
+                availableFlashModels = discoveredFlashModels,
+                onDismiss = { showConsentDialog = false },
+                onSaveSettings = { accepted, aiEnabled, newKey, modelOverride ->
+                    if (newKey != null) {
+                        aiConsentStore.saveApiKey(newKey)
+                    }
+                    if (accepted) {
+                        aiConsentStore.recordConsentAccepted(enableAi = aiEnabled)
+                    } else {
+                        aiConsentStore.revokeConsentAndDisableAi(clearApiKey = false)
+                    }
+                    aiConsentStore.setModelOverride(modelOverride)
+                },
+                onClearApiKey = { aiConsentStore.clearApiKey() },
+                onRevokeConsent = { aiConsentStore.revokeConsentAndDisableAi(clearApiKey = false) },
+                onRefreshModels = { typedKey ->
+                    runCatching {
+                        val key = typedKey ?: aiConsentStore.readDecryptedApiKey()
+                            ?: throw IllegalStateException("Előbb adj meg egy API-kulcsot.")
+                        val refreshed = modelCatalog.refreshCatalog(key)
+                        discoveredFlashModels = refreshed.availableFlashModels
+                        refreshed.availableFlashModels
+                    }
+                }
+            )
+        }
     }
 }
 
@@ -2057,6 +2313,16 @@ private fun NotebookPagePane(
     shapeHasFill: Boolean,
     isFullScreenCanvas: Boolean,
     showLeftPageDrawer: Boolean,
+    notebookPages: List<PageEntity>,
+    notebookOcrLanguage: OcrLanguageTag,
+    geminiClient: GeminiClient,
+    consentState: AiConsentState,
+    searchUiState: NotebookSearchUiState,
+    onOpenConsentDialog: () -> Unit,
+    onNotebookOcrLanguageLoaded: (OcrLanguageTag) -> Unit,
+    onPublishSearchBridge: (ActivePageSearchBridge) -> Unit,
+    onPageContentRevisionChanged: () -> Unit,
+    onClearSearchBridge: (String) -> Unit,
     onUpdateBrushConfig: (BrushConfig) -> Unit,
     onSelectTool: (BrushToolType) -> Unit,
     onTogglePenEraser: () -> Unit,
@@ -2087,32 +2353,21 @@ private fun NotebookPagePane(
     var dockBoundsPx by remember { mutableStateOf(Rect.Zero) }
     var showBrushSettings by remember(target) { mutableStateOf(false) }
     var showShapePicker by remember(target) { mutableStateOf(false) }
-    var notebookOcrLanguage by remember(target.notebookId) { mutableStateOf(OcrLanguageTag.HUNGARIAN) }
     var showPaperSettings by remember(target) { mutableStateOf(false) }
     var showAiCopilot by remember(target) { mutableStateOf(false) }
-    var showConsentDialog by remember(target) { mutableStateOf(false) }
     var showCloudBackupDialog by remember(target) { mutableStateOf(false) }
     var selectedObjectId by remember(target) { mutableStateOf<String?>(null) }
-    var discoveredFlashModels by remember { mutableStateOf<List<GeminiModelInfo>>(emptyList()) }
     var copilotNoticeBannerHu by remember(target) { mutableStateOf<String?>(null) }
 
     var notebookTitle by remember(target) { mutableStateOf("Jegyzetfüzet") }
     var pageNumber by remember(target) { mutableIntStateOf(1) }
     var currentPageEntity by remember(target) { mutableStateOf<PageEntity?>(null) }
-    val notebookPages by database.pageDao()
-        .observePagesForNotebook(target.notebookId)
-        .collectAsState(initial = emptyList())
     var isCreatingPage by remember { mutableStateOf(false) }
     var topToolbarBoundsPx by remember { mutableStateOf(Rect.Zero) }
     var observedFullScreen by remember { mutableStateOf(isFullScreenCanvas) }
     var isReadOnlyPage by remember(target) { mutableStateOf(false) }
+    var hasHydratedPageContent by remember(target) { mutableStateOf(false) }
 
-    val aiConsentStore = remember(context) { AiConsentStore(context.applicationContext) }
-    val modelCatalog = remember { ModelCatalog() }
-    val geminiClient = remember(aiConsentStore, modelCatalog) {
-        GeminiClient(consentStore = aiConsentStore, modelCatalog = modelCatalog)
-    }
-    val consentState by aiConsentStore.stateFlow.collectAsState(initial = AiConsentState())
     val pdfTileRenderer = remember(context) { PdfTileRenderer(context.filesDir) }
     val pdfExportManager = remember(context, pdfTileRenderer) {
         PdfExportManager(context.applicationContext, pdfTileRenderer)
@@ -2124,6 +2379,14 @@ private fun NotebookPagePane(
     var externalDrawTick by remember { mutableLongStateOf(0L) }
     var historyRevisionTick by remember { mutableLongStateOf(0L) }
     var viewportTransformTick by remember { mutableLongStateOf(0L) }
+
+    val activePageMatch = searchUiState.activeMatchForCurrentPage?.takeIf { it.pageId == target.pageId }
+    val latestActivePageMatch by rememberUpdatedState(activePageMatch)
+    fun bumpOverlayTransformTickIfVisible() {
+        if (canvasStateHolder.hasPageObjects || latestActivePageMatch != null) {
+            viewportTransformTick++
+        }
+    }
 
     val latestBrushConfig by rememberUpdatedState(brushConfig)
     val strokeJournal = remember(target) {
@@ -2153,7 +2416,7 @@ private fun NotebookPagePane(
         )
         dryInkRasterCache.onGestureSettled(transformMatrix.scale)
         syncZoomPercentFromMatrix()
-        if (canvasStateHolder.hasPageObjects) viewportTransformTick++
+        bumpOverlayTransformTickIfVisible()
         externalDrawTick++
     }
 
@@ -2169,7 +2432,7 @@ private fun NotebookPagePane(
         )
         dryInkRasterCache.onGestureSettled(transformMatrix.scale)
         syncZoomPercentFromMatrix()
-        if (canvasStateHolder.hasPageObjects) viewportTransformTick++
+        bumpOverlayTransformTickIfVisible()
         externalDrawTick++
     }
 
@@ -2427,7 +2690,7 @@ private fun NotebookPagePane(
         }
         if (nb != null) {
             notebookTitle = nb.title
-            notebookOcrLanguage = nb.ocrLanguage
+            onNotebookOcrLanguageLoaded(nb.ocrLanguage)
         }
         currentPageEntity = loadedOrCreatedPage
         pageNumber = loadedOrCreatedPage.pageIndexInNotebook + 1
@@ -2450,6 +2713,39 @@ private fun NotebookPagePane(
         dryInkRasterCache.clearAll()
         externalDrawTick++
         historyRevisionTick++
+        hasHydratedPageContent = true
+    }
+
+    LaunchedEffect(target.pageId, historyRevisionTick) {
+        if (hasHydratedPageContent && historyRevisionTick > 0L) {
+            onPageContentRevisionChanged()
+        }
+    }
+
+    LaunchedEffect(
+        target.pageId,
+        activePageMatch?.highlightDocRect,
+        activePageMatch?.matchedSnippet,
+        searchUiState.navigateTriggerTick,
+        hasHydratedPageContent,
+        viewportSize
+    ) {
+        val targetRect = activePageMatch?.highlightDocRect ?: return@LaunchedEffect
+        if (!hasHydratedPageContent || viewportSize.width <= 0 || viewportSize.height <= 0) {
+            return@LaunchedEffect
+        }
+        val panned = transformMatrix.centerOnDocRectIfNeeded(
+            targetRect = targetRect,
+            viewportWidthPx = viewportSize.width.toFloat(),
+            viewportHeightPx = viewportSize.height.toFloat(),
+            forceCenter = false
+        )
+        if (panned) {
+            dryInkRasterCache.onGestureSettled(transformMatrix.scale)
+            syncZoomPercentFromMatrix()
+            viewportTransformTick++
+            externalDrawTick++
+        }
     }
 
     var switchedWithinWorkspace by remember(target.pageId) { mutableStateOf(false) }
@@ -2509,6 +2805,28 @@ private fun NotebookPagePane(
             }
             CloudSyncScheduler.onPageTransition(context)
             onSelectPageTarget(OpenedPageTarget(target.notebookId, nextPageId))
+        }
+    }
+
+    DisposableEffect(target.pageId, hasHydratedPageContent) {
+        if (hasHydratedPageContent) {
+            onPublishSearchBridge(
+                ActivePageSearchBridge(
+                    pageId = target.pageId,
+                    liveStrokesProvider = {
+                        SearchTextIndexer.buildSearchablePersistedRecords(canvasStateHolder.allStrokesSorted())
+                    },
+                    liveObjectsProvider = { canvasStateHolder.allPageObjects() },
+                    livePageTitleProvider = {
+                        notebookPages.firstOrNull { it.id == target.pageId }?.title
+                            ?: currentPageEntity?.title
+                    },
+                    switchPageAction = ::switchToPage
+                )
+            )
+        }
+        onDispose {
+            onClearSearchBridge(target.pageId)
         }
     }
 
@@ -2614,10 +2932,10 @@ private fun NotebookPagePane(
             onViewportSizeChanged = { viewportSize = it },
             onViewportTransformChanged = {
                 syncZoomPercentFromMatrix()
-                if (canvasStateHolder.hasPageObjects) viewportTransformTick++
+                bumpOverlayTransformTickIfVisible()
             },
             onLiveViewportTransformChanged = {
-                if (canvasStateHolder.hasPageObjects) viewportTransformTick++
+                bumpOverlayTransformTickIfVisible()
             },
             onCanvasTouchStart = {
                 if (selectedObjectId != null) {
@@ -2689,7 +3007,7 @@ private fun NotebookPagePane(
                                 minConfidence = 0.74f
                             ) != null
                         if (!isLocalSingleShape && !consentState.isReadyForUserInitiatedCall) {
-                            showConsentDialog = true
+                            onOpenConsentDialog()
                             onFormatted(false)
                             return@launch
                         }
@@ -2788,7 +3106,7 @@ private fun NotebookPagePane(
                 },
                 onRequestStepByStep = { latexObj ->
                     if (!consentState.isReadyForUserInitiatedCall) {
-                        showConsentDialog = true
+                        onOpenConsentDialog()
                     } else {
                         coroutineScope.launch {
                             HandwritingToLatexConverter.generateStepByStepDerivationCard(
@@ -2814,10 +3132,24 @@ private fun NotebookPagePane(
             )
         }
 
+        val highlightRect = activePageMatch?.highlightDocRect
+        if (highlightRect != null) {
+            viewportTransformTick
+            SearchHighlightCanvasOverlay(
+                highlightDocRect = highlightRect,
+                transformSnapshot = transformMatrix.snapshot(),
+                isOledMode = palette.isOledDeepBlack,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .testTag("in_notebook_search_highlight")
+            )
+        }
+
         if (!isFullScreenCanvas) {
             CanvasTopToolbar(
                 notebookTitle = notebookTitle,
                 zoomPercentProvider = { currentZoomPercent },
+                searchUiState = searchUiState,
                 onBackToShelf = onBackToShelf,
                 onOpenCloudBackupDialog = { showCloudBackupDialog = true },
                 onCloudQuickSyncTriggered = { msg -> onShowWorkspaceBanner(msg) },
@@ -2972,6 +3304,36 @@ private fun NotebookPagePane(
             }
         }
 
+        fun applyHistoryTransition(isUndo: Boolean) {
+            val outcome = if (isUndo) {
+                canvasStateHolder.undoWithAction()
+            } else {
+                canvasStateHolder.redoWithAction()
+            }
+            val action = outcome.action ?: return
+            outcome.affectedBounds?.let { dryInkRasterCache.invalidateDocRect(it) }
+            if (selectedObjectId != null && canvasStateHolder.getPageObject(selectedObjectId!!) == null) {
+                selectedObjectId = null
+            }
+            if (!isReadOnlyPage) {
+                if (isUndo) {
+                    strokeJournal.enqueueCanvasActionInverse(action)
+                } else {
+                    strokeJournal.enqueueCanvasActionForward(action)
+                }
+                coroutineScope.launch(Dispatchers.IO) {
+                    database.pageDao().markOcrSyncState(
+                        pageId = target.pageId,
+                        needsSync = true,
+                        updatedAtMs = System.currentTimeMillis()
+                    )
+                    CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
+                }
+            }
+            externalDrawTick++
+            historyRevisionTick++
+        }
+
         FloatingToolDock(
             brushConfig = brushConfig,
             lastDrawingTool = lastDrawingTool,
@@ -2992,22 +3354,8 @@ private fun NotebookPagePane(
             onOpenPaperSettings = { showPaperSettings = true },
             onOpenShapes = { showShapePicker = true },
             onInsertImage = { insertImageLauncher.launch("image/*") },
-            onUndo = {
-                canvasStateHolder.undo()?.let { dryInkRasterCache.invalidateDocRect(it) }
-                if (selectedObjectId != null && canvasStateHolder.getPageObject(selectedObjectId!!) == null) {
-                    selectedObjectId = null
-                }
-                externalDrawTick++
-                historyRevisionTick++
-            },
-            onRedo = {
-                canvasStateHolder.redo()?.let { dryInkRasterCache.invalidateDocRect(it) }
-                if (selectedObjectId != null && canvasStateHolder.getPageObject(selectedObjectId!!) == null) {
-                    selectedObjectId = null
-                }
-                externalDrawTick++
-                historyRevisionTick++
-            },
+            onUndo = { applyHistoryTransition(isUndo = true) },
+            onRedo = { applyHistoryTransition(isUndo = false) },
             onFitPage = { fitPageToViewportNow() },
             onToggleTheme = onToggleTheme,
             onToggleDebugOverlay = onToggleDebugOverlay,
@@ -3140,7 +3488,7 @@ private fun NotebookPagePane(
                 pageNumber = pageNumber,
                 totalPageCount = notebookPages.size.coerceAtLeast(1),
                 consentState = consentState,
-                onOpenConsentSettings = { showConsentDialog = true },
+                onOpenConsentSettings = onOpenConsentDialog,
                 onFormatWithAi = { aiScope, mode ->
                     runCatching {
                         val formatText = (mode == AiFormattingMode.FULL_HANDWRITING_AND_FIGURES)
@@ -3170,36 +3518,6 @@ private fun NotebookPagePane(
             )
         }
 
-        if (showConsentDialog) {
-            ConsentDialog(
-                currentState = consentState,
-                availableFlashModels = discoveredFlashModels,
-                onDismiss = { showConsentDialog = false },
-                onSaveSettings = { accepted, aiEnabled, newKey, modelOverride ->
-                    if (newKey != null) {
-                        aiConsentStore.saveApiKey(newKey)
-                    }
-                    if (accepted) {
-                        aiConsentStore.recordConsentAccepted(enableAi = aiEnabled)
-                    } else {
-                        aiConsentStore.revokeConsentAndDisableAi(clearApiKey = false)
-                    }
-                    aiConsentStore.setModelOverride(modelOverride)
-                },
-                onClearApiKey = { aiConsentStore.clearApiKey() },
-                onRevokeConsent = { aiConsentStore.revokeConsentAndDisableAi(clearApiKey = false) },
-                onRefreshModels = { typedKey ->
-                    runCatching {
-                        val key = typedKey ?: aiConsentStore.readDecryptedApiKey()
-                            ?: throw IllegalStateException("Előbb adj meg egy API-kulcsot.")
-                        val refreshed = modelCatalog.refreshCatalog(key)
-                        discoveredFlashModels = refreshed.availableFlashModels
-                        refreshed.availableFlashModels
-                    }
-                }
-            )
-        }
-
         if (showCloudBackupDialog) {
             CloudBackupDialog(
                 database = database,
@@ -3211,9 +3529,10 @@ private fun NotebookPagePane(
 }
 
 @Composable
-private fun CanvasTopToolbar(
+internal fun CanvasTopToolbar(
     notebookTitle: String,
     zoomPercentProvider: () -> Int,
+    searchUiState: NotebookSearchUiState = NotebookSearchUiState(),
     onBackToShelf: () -> Unit,
     onOpenCloudBackupDialog: () -> Unit,
     onCloudQuickSyncTriggered: (String) -> Unit,
@@ -3342,6 +3661,21 @@ private fun CanvasTopToolbar(
                     )
                 }
             }
+
+            InNotebookSearchToolbarSection(
+                isOpen = searchUiState.isOpen,
+                query = searchUiState.query,
+                activeMatchIndex = searchUiState.activeMatchIndex,
+                matchesCount = searchUiState.matchesCount,
+                indexState = searchUiState.indexState,
+                canRunAiDeepIndex = searchUiState.canRunAiDeepIndex,
+                onOpen = searchUiState.onOpen,
+                onQueryChange = searchUiState.onQueryChange,
+                onPreviousMatch = searchUiState.onPreviousMatch,
+                onNextMatch = searchUiState.onNextMatch,
+                onTriggerAiDeepIndex = searchUiState.onTriggerAiDeepIndex,
+                onClose = searchUiState.onClose
+            )
         }
     }
 }

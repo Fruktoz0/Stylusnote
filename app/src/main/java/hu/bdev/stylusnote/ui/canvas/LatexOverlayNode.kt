@@ -102,6 +102,7 @@ import androidx.ink.strokes.Stroke as InkStroke
 import hu.bdev.stylusnote.core.ai.FunctionEvaluator
 import hu.bdev.stylusnote.core.ai.FunctionParseException
 import hu.bdev.stylusnote.core.ai.GeminiClient
+import hu.bdev.stylusnote.core.ai.HandwritingFormatGeometry
 import hu.bdev.stylusnote.core.ai.UserInitiatedAiTrigger
 import hu.bdev.stylusnote.core.hardware.StylusPointSample
 import hu.bdev.stylusnote.core.hardware.toStrokeInputBatch
@@ -509,9 +510,9 @@ object HandwritingToLatexConverter {
     private const val DERIVATION_RESPONSE_SCHEMA =
         """{"type":"object","properties":{"title":{"type":"string"},"steps":{"type":"string"}},"required":["title","steps"]}"""
     private const val LASSO_AUTO_FORMAT_SCHEMA =
-        """{"type":"object","properties":{"kind":{"type":"string","enum":["formula","text","shape"]},"latex":{"type":"string"},"text":{"type":"string"},"shapeType":{"type":"string","enum":["line","rectangle","circle","ellipse","triangle","arrow"]}},"required":["kind"]}"""
+        """{"type":"object","properties":{"kind":{"type":"string","enum":["formula","text","shape","scribble"]},"latex":{"type":"string"},"text":{"type":"string"},"shapeType":{"type":"string","enum":["line","rectangle","circle","ellipse","triangle","arrow"]},"startPoint":{"type":"array","items":{"type":"number"}},"endPoint":{"type":"array","items":{"type":"number"}}},"required":["kind"]}"""
     private const val PAGE_FORMAT_SCHEMA =
-        """{"type":"object","properties":{"elements":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string","enum":["text","formula","shape"]},"box":{"type":"array","items":{"type":"number"}},"text":{"type":"string"},"latex":{"type":"string"},"shapeType":{"type":"string","enum":["line","rectangle","circle","ellipse","triangle","arrow"]}},"required":["kind","box"]}}},"required":["elements"]}"""
+        """{"type":"object","properties":{"elements":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string","enum":["text","formula","shape","scribble"]},"box":{"type":"array","items":{"type":"number"}},"text":{"type":"string"},"latex":{"type":"string"},"shapeType":{"type":"string","enum":["line","rectangle","circle","ellipse","triangle","arrow"]},"startPoint":{"type":"array","items":{"type":"number"}},"endPoint":{"type":"array","items":{"type":"number"}}},"required":["kind","box"]}}},"required":["elements"]}"""
 
     private const val LASSO_FAST_EDGE_PX = 768
 
@@ -561,6 +562,7 @@ object HandwritingToLatexConverter {
             }
         }
 
+        val frame = computeStrokeCanvasFrame(selectedStrokes)
         val bitmap = renderStrokesToCanonicalLightBitmap(
             strokes = selectedStrokes,
             targetLongEdgePx = LASSO_FAST_EDGE_PX
@@ -574,15 +576,19 @@ object HandwritingToLatexConverter {
         val response = runCatching {
             geminiClient.generateContent(
                 trigger = UserInitiatedAiTrigger.LASSO_AUTO_FORMAT,
-                promptText = "Osztályozd a képen látható kijelölést (`formula`, `text`, vagy `shape`), " +
+                promptText = "Osztályozd a képen látható kijelölést (`formula`, `text`, `shape` vagy `scribble`), " +
                     "majd add vissza a tisztázott eredményt JSON-ban. " +
+                    "Firkákat, krikszkrakszokat vagy áthúzott vonalakat ne alakíts át — ezeknél adj vissza `kind: \"scribble\"` értéket! " +
+                    "Ha egy szó láthatóan félbehagyott vagy levágott végű, a szövegkörnyezet alapján értelmesen egészítsd ki. " +
                     "Ha `formula`: töltsd ki a `latex` mezőt pontos LaTeX-szel (határolók nélkül). " +
                     "Ha `text`: töltsd ki a `text` mezőt pontos magyar/angol szöveggel sortöréseket megőrizve. " +
-                    "Ha `shape`: válassz `shapeType`-ot (`line`, `rectangle`, `circle`, `ellipse`, `triangle`, `arrow`).",
+                    "Ha `shape`: válassz `shapeType`-ot (`line`, `rectangle`, `circle`, `ellipse`, `triangle`, `arrow`), " +
+                    "és `line`/`arrow` esetén feltétlenül add meg a `startPoint` ([y, x] kezdőpont / nyíl farka) és `endPoint` ([y, x] végpont / nyíl hegye) tömböket 0..1000 skálán!",
                 inlinePngImages = listOf(pngBytes),
                 responseMimeType = "application/json",
                 responseSchemaJson = LASSO_AUTO_FORMAT_SCHEMA,
-                systemInstruction = "Villámgyors jegyzet-digitalizáló asszisztens vagy. Mindig rövid, pontos JSON objektummal válaszolj."
+                systemInstruction = "Villámgyors jegyzet-digitalizáló asszisztens vagy. Mindig rövid, pontos JSON objektummal válaszolj.",
+                temperature = 0.1f
             )
         }.getOrElse { err ->
             return LassoAutoFormatResult.Failure(err.message ?: "Sikertelen AI felismerés.")
@@ -601,9 +607,22 @@ object HandwritingToLatexConverter {
         val shapeRaw = json.optString("shapeType").trim()
 
         return when (kind) {
+            "scribble", "ignore" -> {
+                LassoAutoFormatResult.Failure("Csak firka vagy áthúzás látható — érintetlenül hagyva.")
+            }
+
             "shape" -> {
-                val shapeType = parseRecognizedShapeType(shapeRaw) ?: RecognizedShapeType.RECTANGLE
-                val meta = buildShapeMetaForBounds(shapeType, bounds)
+                val shapeType = HandwritingFormatGeometry.parseRecognizedShapeType(shapeRaw)
+                    ?: RecognizedShapeType.RECTANGLE
+                val aiStartPt = extractNormalizedDocPoint(json, "startPoint", frame)
+                val aiEndPt = extractNormalizedDocPoint(json, "endPoint", frame)
+                val meta = HandwritingFormatGeometry.buildShapeMetaForElement(
+                    shapeType = shapeType,
+                    strokes = selectedStrokes,
+                    bounds = bounds,
+                    aiStartPt = aiStartPt,
+                    aiEndPt = aiEndPt
+                )
                 val tpl = selectedStrokes.first().samples.firstOrNull() ?: defaultTemplateSample(bounds)
                 val snappedSamples = meta.generateSamples(tpl)
                 val snappedRecord = buildSnappedStrokeRecord(selectedStrokes.first(), meta, snappedSamples)
@@ -766,6 +785,64 @@ object HandwritingToLatexConverter {
         )
     }
 
+    /**
+     * Read-only BYOK OCR pass used exclusively when the user taps manual AI deep-indexing in the
+     * in-notebook search bar: returns `(recognizedText, docBounds)` pairs without altering strokes.
+     */
+    suspend fun recognizeHandwritingBoxesForSearch(
+        strokes: List<PersistedStrokeRecord>,
+        ocrLanguage: OcrLanguageTag,
+        geminiClient: GeminiClient
+    ): List<Pair<String, DocRect>> {
+        if (strokes.isEmpty()) return emptyList()
+        val frame = computeStrokeCanvasFrame(strokes)
+        val bitmap = renderStrokesToCanonicalLightBitmap(
+            strokes = strokes,
+            targetLongEdgePx = GeminiClient.PAGE_FORMAT_IMAGE_EDGE_PX
+        )
+        val pngBytes = try {
+            GeminiClient.prepareInlinePngBytes(bitmap, targetLongEdgePx = GeminiClient.PAGE_FORMAT_IMAGE_EDGE_PX)
+        } finally {
+            if (!bitmap.isRecycled) bitmap.recycle()
+        }
+        val response = geminiClient.generateContent(
+            trigger = UserInitiatedAiTrigger.HANDWRITING_TO_MARKDOWN,
+            promptText = "Keresőindexeléshez olvasd ki az oldalon látható ÖSSZES kézzel írott szövegsort " +
+                "${ocrLanguage.displayName} (${ocrLanguage.bcp47Tag}) nyelven (`kind: \"text\"`). " +
+                "Adj vissza minden sorhoz `box` [yMin, xMin, yMax, xMax] 0..1000 koordinátát és `text` szöveget. " +
+                "Firkákat hagyj ki (`scribble`), a félbehagyott szavakat értelmesen egészítsd ki.",
+            inlinePngImages = listOf(pngBytes),
+            responseMimeType = "application/json",
+            responseSchemaJson = PAGE_FORMAT_SCHEMA,
+            systemInstruction = "Gyors, precíz OCR keresőindexelő vagy. Tömör JSON-t adj vissza.",
+            temperature = 0.1f
+        )
+        val root = JSONObject(GeminiClient.stripMarkdownCodeFences(response.text))
+        val array = root.optJSONArray("elements") ?: return emptyList()
+        val results = ArrayList<Pair<String, DocRect>>(array.length())
+        for (i in 0 until array.length()) {
+            val item = array.optJSONObject(i) ?: continue
+            val kind = item.optString("kind").trim().lowercase()
+            if (kind == "scribble" || kind == "ignore") continue
+            val text = (item.optString("text").ifBlank { item.optString("latex") }).trim()
+            if (text.isEmpty()) continue
+            val boxArr = item.optJSONArray("box") ?: continue
+            if (boxArr.length() < 4) continue
+            val yMin = boxArr.optDouble(0, 0.0).toFloat().coerceIn(0f, 1000f) / 1000f
+            val xMin = boxArr.optDouble(1, 0.0).toFloat().coerceIn(0f, 1000f) / 1000f
+            val yMax = boxArr.optDouble(2, 1000.0).toFloat().coerceIn(0f, 1000f) / 1000f
+            val xMax = boxArr.optDouble(3, 1000.0).toFloat().coerceIn(0f, 1000f) / 1000f
+            val rect = DocRect(
+                leftPt = frame.leftPt + min(xMin, xMax) * frame.widthPt,
+                topPt = frame.topPt + min(yMin, yMax) * frame.heightPt,
+                rightPt = max(frame.leftPt + min(xMin, xMax) * frame.widthPt + 8f, frame.leftPt + max(xMin, xMax) * frame.widthPt),
+                bottomPt = max(frame.topPt + min(yMin, yMax) * frame.heightPt + 8f, frame.topPt + max(yMin, yMax) * frame.heightPt)
+            )
+            results.add(text to rect)
+        }
+        return results
+    }
+
     private suspend fun executeStructuredFormattingPass(
         targetStrokes: List<PersistedStrokeRecord>,
         formatText: Boolean,
@@ -780,10 +857,10 @@ object HandwritingToLatexConverter {
         val frame = computeStrokeCanvasFrame(targetStrokes)
         val bitmap = renderStrokesToCanonicalLightBitmap(
             strokes = targetStrokes,
-            targetLongEdgePx = GeminiClient.DEFAULT_INLINE_IMAGE_LONG_EDGE_PX
+            targetLongEdgePx = GeminiClient.PAGE_FORMAT_IMAGE_EDGE_PX
         )
         val pngBytes = try {
-            GeminiClient.prepareInlinePngBytes(bitmap, targetLongEdgePx = GeminiClient.DEFAULT_INLINE_IMAGE_LONG_EDGE_PX)
+            GeminiClient.prepareInlinePngBytes(bitmap, targetLongEdgePx = GeminiClient.PAGE_FORMAT_IMAGE_EDGE_PX)
         } finally {
             if (!bitmap.isRecycled) bitmap.recycle()
         }
@@ -793,22 +870,27 @@ object HandwritingToLatexConverter {
                 "Az oldalon látható kézzel írott szövegeket írd át pontosan ${ocrLanguage.displayName} (${ocrLanguage.bcp47Tag}) nyelven, " +
                     "kizárólag `text` elemekként! A rajzolt ábrákat, alakzatokat és kereteket hagyd figyelmen kívül! "
             formatText ->
-                "Az oldalon látható ÖSSZES elemet azonosítsd (${ocrLanguage.displayName} / ${ocrLanguage.bcp47Tag} kontextusban): " +
+                "Az oldalon látható értelmes elemeket azonosítsd (${ocrLanguage.displayName} / ${ocrLanguage.bcp47Tag} kontextusban): " +
                     "`text` (kézzel írt bekezdések/listák), `formula` (matematikai képletek LaTeX-ben), és `shape` (vonalak, nyilak, téglalapok, körök, háromszögek). "
             else ->
                 "Az oldalon kizárólag a `formula` (matematikai képletek LaTeX-ben) és `shape` (ábrák, nyilak, téglalapok, körök, háromszögek, vonalak) elemeket add vissza; " +
                     "a sima kézírott folyószöveget hagyd figyelmen kívül! "
         }
 
+        val commonPrecisionRules =
+            "Firkákat, átfirkált/kihúzott vonásokat, véletlen krikszkrakszokat hagyd ki (ne adj vissza belőlük semmit, vagy jelöld `scribble`-ként — NE találj ki helyettük hamis szöveget vagy alakzatot). " +
+                "A láthatóan félbehagyott vagy levágott végű kézzel írt szavakat a mondatkörnyezet és a nyelv alapján értelmesen egészítsd ki. " +
+                "Minden elemhez add meg a `box` [yMin, xMin, yMax, xMax] határoló dobozát 0..1000 skálán a képhez képest, továbbá a `text`, `latex` vagy `shapeType` mezőt. " +
+                "Minden `shape` típusú `line` vagy `arrow` esetén KÖTELEZŐEN add meg a `startPoint` [y, x] (vonal eleje / nyíl tolla vége) és `endPoint` [y, x] (vonal vége / nyíl hegyének csúcsa) pontos végpontokat 0..1000 skálán, megőrizve a pontos pozíciót, dőlésszöget és irányt!"
+
         val response = geminiClient.generateContent(
             trigger = UserInitiatedAiTrigger.HANDWRITING_TO_MARKDOWN,
-            promptText = modeInstruction +
-                "Minden elemhez add meg a `box` [yMin, xMin, yMax, xMax] határoló dobozát 0..1000 skálán a képhez képest, " +
-                "továbbá a megfelelő `text`, `latex` vagy `shapeType` mezőt.",
+            promptText = modeInstruction + commonPrecisionRules,
             inlinePngImages = listOf(pngBytes),
             responseMimeType = "application/json",
             responseSchemaJson = PAGE_FORMAT_SCHEMA,
-            systemInstruction = "Precíz jegyzet-, kézírás- és ábrafelismerő vagy. Pontos 0..1000-es koordinátájú JSON-t adj vissza."
+            systemInstruction = "Gyors, precíz jegyzet-, kézírás- és ábrafelismerő vagy. Tömör, pontos 0..1000-es koordinátájú JSON-t adj vissza.",
+            temperature = 0.1f
         )
 
         val root = JSONObject(GeminiClient.stripMarkdownCodeFences(response.text))
@@ -824,6 +906,7 @@ object HandwritingToLatexConverter {
         for (i in 0 until array.length()) {
             val item = array.optJSONObject(i) ?: continue
             val kind = item.optString("kind").trim().lowercase()
+            if (kind == "scribble" || kind == "ignore") continue
             if (textOnlyOcr && kind != "text") continue
             if (!formatText && kind == "text") continue
 
@@ -833,17 +916,44 @@ object HandwritingToLatexConverter {
             val xMin = boxArr.optDouble(1, 0.0).toFloat().coerceIn(0f, 1000f) / 1000f
             val yMax = boxArr.optDouble(2, 1000.0).toFloat().coerceIn(0f, 1000f) / 1000f
             val xMax = boxArr.optDouble(3, 1000.0).toFloat().coerceIn(0f, 1000f) / 1000f
+            val rawLeft = frame.leftPt + min(xMin, xMax) * frame.widthPt
+            val rawTop = frame.topPt + min(yMin, yMax) * frame.heightPt
+            val rawRight = frame.leftPt + max(xMin, xMax) * frame.widthPt
+            val rawBottom = frame.topPt + max(yMin, yMax) * frame.heightPt
             val rawBox = DocRect(
-                leftPt = frame.leftPt + min(xMin, xMax) * frame.widthPt,
-                topPt = frame.topPt + min(yMin, yMax) * frame.heightPt,
-                rightPt = max(frame.leftPt + min(xMin, xMax) * frame.widthPt + 28f, frame.leftPt + max(xMin, xMax) * frame.widthPt),
-                bottomPt = max(frame.topPt + min(yMin, yMax) * frame.heightPt + 24f, frame.topPt + max(yMin, yMax) * frame.heightPt)
+                leftPt = rawLeft,
+                topPt = rawTop,
+                rightPt = max(rawLeft + 6f, rawRight),
+                bottomPt = max(rawTop + 6f, rawBottom)
             )
 
+            val aiShapeType = if (kind == "shape") {
+                HandwritingFormatGeometry.parseRecognizedShapeType(item.optString("shapeType"))
+                    ?: RecognizedShapeType.RECTANGLE
+            } else {
+                null
+            }
+            val aiStartPt = if (kind == "shape") extractNormalizedDocPoint(item, "startPoint", frame) else null
+            val aiEndPt = if (kind == "shape") extractNormalizedDocPoint(item, "endPoint", frame) else null
+
             val matchBox = rawBox.inflate(14f)
-            val matchedStrokes = targetStrokes.filter { s ->
-                !consumedStrokeIds.contains(s.id) &&
-                    matchBox.contains((s.bounds.leftPt + s.bounds.rightPt) * 0.5f, (s.bounds.topPt + s.bounds.bottomPt) * 0.5f)
+            val linearMatches = if (
+                (aiShapeType == RecognizedShapeType.LINE || aiShapeType == RecognizedShapeType.ARROW) &&
+                aiStartPt != null &&
+                aiEndPt != null
+            ) {
+                targetStrokes.filter { s ->
+                    !consumedStrokeIds.contains(s.id) &&
+                        HandwritingFormatGeometry.doesStrokeMatchLinearSegment(s, aiStartPt, aiEndPt)
+                }
+            } else {
+                emptyList()
+            }
+            val matchedStrokes = linearMatches.ifEmpty {
+                targetStrokes.filter { s ->
+                    !consumedStrokeIds.contains(s.id) &&
+                        matchBox.contains(s.bounds.centerXPt, s.bounds.centerYPt)
+                }
             }
             if (matchedStrokes.isEmpty() && array.length() > 1) continue
 
@@ -858,9 +968,14 @@ object HandwritingToLatexConverter {
 
             when (kind) {
                 "shape" -> {
-                    val shapeType = parseRecognizedShapeType(item.optString("shapeType"))
-                        ?: RecognizedShapeType.RECTANGLE
-                    val meta = buildShapeMetaForBounds(shapeType, tightBounds)
+                    val shapeType = aiShapeType ?: RecognizedShapeType.RECTANGLE
+                    val meta = HandwritingFormatGeometry.buildShapeMetaForElement(
+                        shapeType = shapeType,
+                        strokes = activeGroupStrokes,
+                        bounds = tightBounds,
+                        aiStartPt = aiStartPt,
+                        aiEndPt = aiEndPt
+                    )
                     val tpl = activeGroupStrokes.first().samples.firstOrNull() ?: defaultTemplateSample(tightBounds)
                     val snappedSamples = meta.generateSamples(tpl)
                     val snappedRecord = buildSnappedStrokeRecord(activeGroupStrokes.first(), meta, snappedSamples)
@@ -967,50 +1082,28 @@ object HandwritingToLatexConverter {
         )
     }
 
-    private fun parseRecognizedShapeType(raw: String): RecognizedShapeType? = when (raw.trim().lowercase()) {
-        "line" -> RecognizedShapeType.LINE
-        "arrow" -> RecognizedShapeType.ARROW
-        "circle" -> RecognizedShapeType.CIRCLE
-        "ellipse", "oval" -> RecognizedShapeType.ELLIPSE
-        "triangle" -> RecognizedShapeType.TRIANGLE
-        "rectangle", "rect", "square", "box" -> RecognizedShapeType.RECTANGLE
-        else -> null
+    private fun extractNormalizedDocPoint(
+        item: JSONObject,
+        fieldName: String,
+        frame: DocRect
+    ): DocPoint? {
+        val arr = item.optJSONArray(fieldName) ?: return null
+        if (arr.length() < 2) return null
+        val yNorm = arr.optDouble(0, Double.NaN).toFloat()
+        val xNorm = arr.optDouble(1, Double.NaN).toFloat()
+        if (!yNorm.isFinite() || !xNorm.isFinite()) return null
+        return HandwritingFormatGeometry.normalizedYxPointToDoc(
+            yNormalized0To1000 = yNorm,
+            xNormalized0To1000 = xNorm,
+            frame = frame
+        )
     }
 
-    private fun buildShapeMetaForBounds(shapeType: RecognizedShapeType, bounds: DocRect): ShapeMeta {
-        val cx = (bounds.leftPt + bounds.rightPt) * 0.5f
-        val cy = (bounds.topPt + bounds.bottomPt) * 0.5f
-        val pts: List<DocPoint> = when (shapeType) {
-            RecognizedShapeType.LINE, RecognizedShapeType.ARROW -> {
-                if (bounds.widthPt >= bounds.heightPt * 0.6f) {
-                    listOf(DocPoint(bounds.leftPt, cy), DocPoint(bounds.rightPt, cy))
-                } else {
-                    listOf(DocPoint(cx, bounds.topPt), DocPoint(cx, bounds.bottomPt))
-                }
-            }
-            RecognizedShapeType.CIRCLE -> {
-                val r = (min(bounds.widthPt, bounds.heightPt) * 0.5f).coerceAtLeast(10f)
-                listOf(DocPoint(cx, cy), DocPoint(cx + r, cy))
-            }
-            RecognizedShapeType.ELLIPSE -> listOf(
-                DocPoint(cx, cy),
-                DocPoint(bounds.rightPt, cy),
-                DocPoint(cx, bounds.bottomPt)
-            )
-            RecognizedShapeType.TRIANGLE -> listOf(
-                DocPoint(cx, bounds.topPt),
-                DocPoint(bounds.rightPt, bounds.bottomPt),
-                DocPoint(bounds.leftPt, bounds.bottomPt)
-            )
-            RecognizedShapeType.RECTANGLE -> listOf(
-                DocPoint(bounds.leftPt, bounds.topPt),
-                DocPoint(bounds.rightPt, bounds.topPt),
-                DocPoint(bounds.rightPt, bounds.bottomPt),
-                DocPoint(bounds.leftPt, bounds.bottomPt)
-            )
-        }
-        return ShapeMeta(shapeType = shapeType, controlPoints = pts, rotationRadians = 0f)
-    }
+    private fun parseRecognizedShapeType(raw: String): RecognizedShapeType? =
+        HandwritingFormatGeometry.parseRecognizedShapeType(raw)
+
+    private fun buildShapeMetaForBounds(shapeType: RecognizedShapeType, bounds: DocRect): ShapeMeta =
+        HandwritingFormatGeometry.buildShapeMetaForBounds(shapeType, bounds)
 
     private fun defaultTemplateSample(bounds: DocRect) = StylusPointSample(
         xPt = bounds.leftPt,

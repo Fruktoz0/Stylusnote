@@ -11,11 +11,12 @@ flowchart TD
     subgraph UI["UI Réteg (Jetpack Compose StarNote UI + AndroidView / FrameLayout)"]
         MA["MainActivity (144 Hz Lock + Immerzív Teljes Képernyő)"]
         BS["BookshelfScreen (2 Panel, Drag&Drop Kategória, FTS4, ... Menü, NotebookLM PDF)"]
-        CTB["CanvasTopToolbar (Bal Felső Sarokhoz Csatolva, Zoom -/%/+ + AI Pill)"]
+        CTB["CanvasTopToolbar (Bal Felső Sarok, Felhő + Zoom + AI + Keresés Sáv)"]
         FTD["FloatingToolDock (Globális (x,y), Eszközmemória, StarNote Színes Ikonok, Alakzatok, Képbeszúrás, Teljes Képernyő)"]
         SPP["ShapePickerPopover (HorizontalPager 2D→3D) & GeometricShapeObject (tag=6) & ImageObject (tag=7)"]
         LPD["LeftPageDrawer (Függőlegesen Húzható Fül + Drag&Drop Oldalátrendezés)"]
         AIC["AiCopilotSheet (Beállítások + Hatókör + 2 Formázó Mód)"]
+        INSE["InNotebookSearchCoordinator + SearchHighlightCanvasOverlay"]
         SDS["StylusDrawingSurface (Lasszó Sarok-Forgatás & ✨ AI + Papírhoz Rögzített PageObjectek)"]
         DCV["DryCanvasView (Hardware View Host)"]
         PBL["PaperBackgroundLayer (1. réteg, többoldalas lapelőnézet + GRID_SIMPLE_5MM)"]
@@ -51,6 +52,9 @@ flowchart TD
     BS --> SPP
     BS --> LPD
     BS --> AIC
+    BS --> INSE
+    INSE --> DB
+    INSE --> SJ
     SDS --> DCV
     CTM -->|Draw-phase Matrix szinkron| PBL
     CTM -->|Draw-phase Matrix szinkron| DIRC
@@ -276,3 +280,17 @@ flowchart TD
     - `.\gradlew :app:connectedDebugAndroidTest --console=plain`: **13/13** műszerezett teszt sikeres `25097RP43G`-n (`TEST-25097RP43G - 16-_app-.xml`, `0` hiba, `0` kihagyás; köztük a `CloudSyncUiAndDatabaseInstrumentedTest` Room v2→v3, tombstone, `mergeRemoteManifestIntoDatabase` és UI tesztekkel).
     - `.\gradlew :benchmark:connectedBenchmarkAndroidTest --console=plain` (`panAndZoom10kStrokesCanvasFrameTiming`, 5 iteráció, median `frameCount = 119,0`, `CV = 0,0096`): **`frameDurationCpuMs` P50 = `4,55 ms`, P90 = `5,88 ms`, P95 = `6,48 ms` (≤ `6,94 ms` teljesítve ✅), P99 = `9,03 ms`**; **`frameOverrunMs` P50 = `-7,05 ms`, P90 = `-5,73 ms`, P95 = `-5,34 ms`, P99 = `-2,22 ms`**.
     - `.\gradlew :app:installDebug` + tabletes vizuális ellenőrzés (`25097RP43G`): Könyvespolc (`shelf_cloud_verified.png`), füzetnév melletti felhő ikon (`canvas_cloud_verified.png`), hosszú nyomásra nyíló `CloudBackupDialog` (`dialog_cloud_verified.png` — vágásmentes elrendezés a `.zip` gombokig) és ESC-re záródás (`dialog_cloud_escaped.png`) igazolva.
+
+---
+
+### [2026-11-15] — VII. Ütem (`Lépés 53–58`): Vonalas Sablon Tisztítása, Tartós Undo/Redo Journal, Gyors/Pontos AI, Élő Kézírás-/Objektumkereső
+
+- **Piros margóvonal eltávolítása (`Lépés 53` — `PaperBackgroundLayer.kt`, `PaperSettingsDialog.kt`):** A `RULED_8MM` (`Vonalas (8 mm)`) papírsablonból és a választó előnézetből is kikerült a bal oldali piros függőleges margóvonal (`StylusNoteInstrumentedValidationTest.ruledPaperDrawsNoRedVerticalMarginLineInFixedOrInfiniteMode`).
+- **Tartós Undo/Redo `StrokeJournal` szinkron (`Lépés 54` — `CanvasStateHolder.kt`, `StrokeJournal.kt`, `BookshelfScreen.kt`):** Bevezettük az `UndoRedoOutcome`-ot (`undoWithAction` / `redoWithAction`), az aszinkron `enqueueCanvasActionInverse` / `enqueueCanvasActionForward` lemezszinkront LRU `removedStrokeCache`-sel (eredeti tintaszínek, rétegek és `ShapeMeta` értékek megőrzésével), valamint a `flushAndSyncBlocking()` / `closeBlocking()` előtti `pendingMutationJobs.joinAll()` szinkronizálást, így a visszavont AI-átalakítás füzetbezárás és újranyitás után is visszavont marad.
+- **Gyorsabb AI & geometriai pontosság (`Lépés 55` — `GeminiClient.kt`, `HandwritingFormatGeometry.kt`, `LatexOverlayNode.kt`):** `thinkingBudget = 0` a `gemini-2.5*` modelleken (automatikus HTTP 400 fallbackkal), `400 ms`-ra csökkentett min. kérésköz, `1024 px` oldalkép, `"startPoint"` / `"endPoint"` + tinta-projekció és vonalszakasz-illesztés a nyilak/vonalak pontos hely- és iránytartásához, `"scribble"` kategória a firkák érintetlenül hagyásához, valamint kontextuális szó-kiegészítés félbehagyott szavaknál.
+- **Élő Jegyzetbeli Kereső (`Lépés 56–57` — `InNotebookSearchEngine.kt`, `InNotebookSearchBar.kt`, `CanvasTransformMatrix.kt`, `BackgroundOcrWorker.kt`, `AppDatabase.kt`, `BookshelfScreen.kt`):** Hibrid élő RAM + lemezes oldal OCR (`ML Kit Digital Ink`, szükség esetén automatikus modell-letöltéssel) + `FormattedTextObject`/`LatexObject`/`DerivationCardObject`/`FunctionPlotObject`/`PageEntity.title` indexelés `InNotebookSearchCoordinator`-ral; `CanvasTopToolbar` `AI` gomb melletti `Keresés` sáv (`1/N` léptetés, lapváltás `switchToPage`, `centerOnDocRectIfNeeded` pan, `SearchHighlightCanvasOverlay`, opcionális BYOK `AI mélyindexelés`, ESC/`×` bezárás).
+- **VII. Ütem Végső Verifikáció (`Lépés 58` — `25097RP43G` Xiaomi Pad 8, Android 16 / SDK 36):**
+  - `.\gradlew testDebugUnitTest --console=plain`: **104/104** JVM unit teszt sikeres **21** tesztosztályban (`0` hiba, `0` kihagyás).
+  - `.\gradlew :app:connectedDebugAndroidTest --console=plain`: **17/17** műszerezett teszt sikeres (`TEST-25097RP43G - 16-_app-.xml`, `0` hiba, `0` kihagyás; köztük `UndoPersistenceAndSearchInstrumentedTest` mindhárom tesztje).
+  - `.\gradlew :benchmark:connectedBenchmarkAndroidTest --console=plain` (`panAndZoom10kStrokesCanvasFrameTiming`, 5 iteráció, median `frameCount = 118,0`, `CV = 0,0096`): **`frameDurationCpuMs` P50 = `4,75 ms`, P90 = `6,05 ms`, P95 = `6,50 ms` (≤ `6,94 ms` teljesítve ✅), P99 = `8,74 ms`**; **`frameOverrunMs` P50 = `-6,84 ms`, P90 = `-5,62 ms`, P95 = `-5,17 ms`, P99 = `-3,57 ms`** (0 eldobott képkocka).
+  - `.\gradlew :app:installDebug` + tabletes vizuális ellenőrzés (`25097RP43G`): Vonalas (`RULED_8MM`) lap piros bal oldali vonal nélkül, valamint az `AI` gomb melletti összecsukott és lenyitott `Keresés` sáv élő tabletes képernyőképeken (`sn_canvas_ruled.png`, `sn_search_expanded.png`) igazolva.

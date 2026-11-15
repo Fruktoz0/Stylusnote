@@ -508,9 +508,8 @@ private fun TemplateMiniPreview(
                 }
             }
             PaperTemplateType.RULED_8MM -> {
-                val marginX = w * 0.22f
-                drawLine(accentRed, Offset(marginX, 0f), Offset(marginX, h), strokeWidth = 1.2f)
                 val dy = h / 7f
+                drawLine(strongLineColor, Offset(0f, dy), Offset(w, dy), strokeWidth = 1.1f)
                 for (i in 2..6) {
                     drawLine(lineColor, Offset(0f, i * dy), Offset(w, i * dy), strokeWidth = 1f)
                 }

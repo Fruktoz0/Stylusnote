@@ -3,6 +3,8 @@ package hu.bdev.stylusnote.data.local
 import hu.bdev.stylusnote.core.math.ShapeMeta
 import hu.bdev.stylusnote.domain.model.AffineTransform2D
 import hu.bdev.stylusnote.domain.model.BrushConfig
+import hu.bdev.stylusnote.domain.model.BrushToolType
+import hu.bdev.stylusnote.domain.model.CanvasAction
 import hu.bdev.stylusnote.domain.model.PageObject
 import hu.bdev.stylusnote.domain.model.PersistedStrokeRecord
 import hu.bdev.stylusnote.ui.canvas.IndexedDryStroke
@@ -20,6 +22,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlin.math.abs
 import java.io.BufferedInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -78,10 +81,17 @@ class StrokeJournal(
 
     private val ioMutex = Mutex()
     private val scope = CoroutineScope(SupervisorJob() + writerDispatcher)
+    private val pendingJobsLock = Any()
+    private val pendingMutationJobs = LinkedHashSet<Job>()
     private var pendingFsyncJob: Job? = null
 
     private val liveStrokes = LinkedHashMap<String, PersistedStrokeRecord>()
     private val liveObjects = LinkedHashMap<String, PageObject>()
+    private val removedCacheLock = Any()
+    private val removedStrokeCache = object : LinkedHashMap<String, PersistedStrokeRecord>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, PersistedStrokeRecord>?): Boolean =
+            size > MAX_REMOVED_STROKE_CACHE
+    }
 
     private var journalChannel: FileChannel? = null
     private var journalRecordCount: Int = 0
@@ -204,6 +214,70 @@ class StrokeJournal(
         }
     }
 
+    private fun launchTrackedMutation(block: suspend () -> Unit) {
+        lateinit var job: Job
+        synchronized(pendingJobsLock) {
+            job = scope.launch { block() }
+            pendingMutationJobs.add(job)
+        }
+        job.invokeOnCompletion {
+            synchronized(pendingJobsLock) {
+                pendingMutationJobs.remove(job)
+            }
+        }
+    }
+
+    private fun rememberRemovedStroke(record: PersistedStrokeRecord) {
+        synchronized(removedCacheLock) {
+            removedStrokeCache[record.id] = record
+        }
+    }
+
+    private fun lookupRememberedStroke(entry: IndexedDryStroke): PersistedStrokeRecord? {
+        val cached = synchronized(removedCacheLock) { removedStrokeCache[entry.id] } ?: return null
+        val sameColorRgb = (cached.canonicalColorArgb and 0x00FFFFFF) ==
+            (entry.stroke.brush.colorIntArgb and 0x00FFFFFF)
+        val sameBounds = abs(cached.bounds.leftPt - entry.bounds.leftPt) <= 0.5f &&
+            abs(cached.bounds.topPt - entry.bounds.topPt) <= 0.5f &&
+            abs(cached.bounds.rightPt - entry.bounds.rightPt) <= 0.5f &&
+            abs(cached.bounds.bottomPt - entry.bounds.bottomPt) <= 0.5f
+        return if (sameColorRgb && sameBounds) cached else null
+    }
+
+    private fun buildPersistedRecordsForAction(
+        entries: List<IndexedDryStroke>,
+        preferCachedSnapshot: Boolean = true
+    ): List<PersistedStrokeRecord> {
+        if (entries.isEmpty()) return emptyList()
+        val activeBrush = activeBrushConfigProvider()
+        return entries.map { entry ->
+            if (preferCachedSnapshot) {
+                lookupRememberedStroke(entry)?.let { cached -> return@map cached }
+            }
+            val strokeColorArgb = entry.stroke.brush.colorIntArgb
+            val canonicalRgb = if (strokeColorArgb != 0) {
+                (0xFF shl 24) or (strokeColorArgb and 0x00FFFFFF)
+            } else {
+                activeBrush.colorArgb
+            }
+            val toolType = when {
+                entry.isHighlighter -> BrushToolType.HIGHLIGHTER
+                activeBrush.toolType == BrushToolType.HIGHLIGHTER -> BrushToolType.FOUNTAIN_PEN
+                else -> activeBrush.toolType
+            }
+            val inferredBrush = activeBrush.copy(
+                toolType = toolType,
+                sizePt = entry.stroke.brush.size,
+                colorArgb = canonicalRgb
+            )
+            StrokeBinarySerializer.fromIndexedDryStroke(
+                entry = entry,
+                brushConfig = inferredBrush,
+                shapeMeta = shapeMetaProvider(entry.id)
+            )
+        }
+    }
+
     /**
      * [JournalCommitSink] entrypoint invoked directly by `StylusDrawingSurface` when wet ink strokes
      * complete `wet -> dry` handoff on `ACTION_UP`.
@@ -218,50 +292,147 @@ class StrokeJournal(
                 shapeMeta = shapeMetaProvider(entry.id)
             )
         }
-        scope.launch {
+        launchTrackedMutation {
             appendAddStrokes(persisted)
         }
     }
 
     override fun onStrokesTransformed(strokeIds: List<String>, affine: AffineTransform2D) {
         if (strokeIds.isEmpty()) return
-        scope.launch {
+        launchTrackedMutation {
             appendTransformStrokes(strokeIds, affine)
         }
     }
 
     override fun onStrokesRecolored(strokeIds: List<String>, canonicalColorArgb: Int) {
         if (strokeIds.isEmpty()) return
-        scope.launch {
+        launchTrackedMutation {
             appendRecolorStrokes(strokeIds, canonicalColorArgb)
         }
     }
 
     override fun onStrokesDeleted(strokeIds: List<String>) {
         if (strokeIds.isEmpty()) return
-        scope.launch {
+        launchTrackedMutation {
             appendRemoveStrokes(strokeIds)
         }
     }
 
     override fun onObjectsAdded(objects: List<PageObject>) {
         if (objects.isEmpty()) return
-        scope.launch {
+        launchTrackedMutation {
             objects.forEach { appendAddObject(it) }
         }
     }
 
     override fun onObjectsUpdated(objects: List<PageObject>) {
         if (objects.isEmpty()) return
-        scope.launch {
+        launchTrackedMutation {
             objects.forEach { appendUpdateObject(it) }
         }
     }
 
     override fun onObjectsDeleted(objectIds: List<String>) {
         if (objectIds.isEmpty()) return
-        scope.launch {
+        launchTrackedMutation {
             objectIds.forEach { appendRemoveObject(it) }
+        }
+    }
+
+    /**
+     * Asynchronously mirrors an Undo (`applyInverse`) delta from [CanvasStateHolder] onto disk
+     * sequentially on [writerDispatcher], guaranteed to complete before [closeBlocking] compacts.
+     */
+    fun enqueueCanvasActionInverse(action: CanvasAction) {
+        launchTrackedMutation {
+            applyCanvasActionInverse(action)
+        }
+    }
+
+    /**
+     * Asynchronously mirrors a Redo (`applyForward`) delta from [CanvasStateHolder] onto disk
+     * sequentially on [writerDispatcher], guaranteed to complete before [closeBlocking] compacts.
+     */
+    fun enqueueCanvasActionForward(action: CanvasAction) {
+        launchTrackedMutation {
+            applyCanvasActionForward(action)
+        }
+    }
+
+    suspend fun applyCanvasActionForward(action: CanvasAction) {
+        when (action) {
+            is CanvasAction.AddedStrokes -> {
+                appendAddStrokes(buildPersistedRecordsForAction(action.strokes))
+            }
+            is CanvasAction.RemovedStrokes -> {
+                appendRemoveStrokes(action.strokes.map { it.id })
+            }
+            is CanvasAction.TransformedStrokes -> {
+                appendTransformStrokes(action.strokeIds, action.transform)
+            }
+            is CanvasAction.RecoloredStrokes -> {
+                appendRecolorEntries(action.afterStrokes)
+            }
+            is CanvasAction.CompositeAction -> {
+                for (i in 0 until action.actions.size) {
+                    applyCanvasActionForward(action.actions[i])
+                }
+            }
+            is CanvasAction.AddedObject -> appendAddObject(action.pageObject)
+            is CanvasAction.RemovedObject -> appendRemoveObject(action.pageObject.id)
+            is CanvasAction.UpdatedObject -> appendUpdateObject(action.afterObject)
+        }
+    }
+
+    suspend fun applyCanvasActionInverse(action: CanvasAction) {
+        when (action) {
+            is CanvasAction.AddedStrokes -> {
+                appendRemoveStrokes(action.strokes.map { it.id })
+            }
+            is CanvasAction.RemovedStrokes -> {
+                appendAddStrokes(buildPersistedRecordsForAction(action.strokes))
+            }
+            is CanvasAction.TransformedStrokes -> {
+                val invTransform = action.transform.invert()
+                val allPresentInJournal = ioMutex.withLock {
+                    action.strokeIds.all { liveStrokes.containsKey(it) }
+                }
+                if (invTransform != null && allPresentInJournal) {
+                    appendTransformStrokes(action.strokeIds, invTransform)
+                } else {
+                    appendRemoveStrokes(action.strokeIds)
+                    appendAddStrokes(
+                        buildPersistedRecordsForAction(
+                            entries = action.beforeStrokes,
+                            preferCachedSnapshot = false
+                        )
+                    )
+                }
+            }
+            is CanvasAction.RecoloredStrokes -> {
+                appendRecolorEntries(action.beforeStrokes)
+            }
+            is CanvasAction.CompositeAction -> {
+                for (i in action.actions.size - 1 downTo 0) {
+                    applyCanvasActionInverse(action.actions[i])
+                }
+            }
+            is CanvasAction.AddedObject -> appendRemoveObject(action.pageObject.id)
+            is CanvasAction.RemovedObject -> appendAddObject(action.pageObject)
+            is CanvasAction.UpdatedObject -> appendUpdateObject(action.beforeObject)
+        }
+    }
+
+    private suspend fun appendRecolorEntries(entries: List<IndexedDryStroke>) {
+        if (entries.isEmpty()) return
+        val groupedIdsByColor = LinkedHashMap<Int, MutableList<String>>()
+        for (entry in entries) {
+            val rgb = entry.stroke.brush.colorIntArgb and 0x00FFFFFF
+            val canonical = (0xFF shl 24) or rgb
+            groupedIdsByColor.getOrPut(canonical) { ArrayList() }.add(entry.id)
+        }
+        for ((color, ids) in groupedIdsByColor) {
+            appendRecolorStrokes(ids, color)
         }
     }
 
@@ -290,7 +461,7 @@ class StrokeJournal(
         }
         appendEncodedBatch(frames) {
             for (id in strokeIds) {
-                liveStrokes.remove(id)
+                liveStrokes.remove(id)?.let(::rememberRemovedStroke)
             }
         }
     }
@@ -386,29 +557,42 @@ class StrokeJournal(
         }
     }
 
+    private fun snapshotPendingMutationJobs(): List<Job> = synchronized(pendingJobsLock) {
+        pendingMutationJobs.toList()
+    }
+
     /**
      * Synchronous lifecycle helper suitable for Activity `onPause` / `onStop` and cleanup hooks.
+     * Drains all in-flight mutation jobs before forcing an immediate fsync.
      */
     fun flushAndSyncBlocking() {
-        runBlocking(writerDispatcher) {
+        runBlocking {
+            for (job in snapshotPendingMutationJobs()) {
+                job.join()
+            }
             flushAndSync()
         }
     }
 
     fun closeBlocking(compactBeforeClose: Boolean = false) {
-        runBlocking(writerDispatcher) {
-            ioMutex.withLock {
-                pendingFsyncJob?.cancel()
-                pendingFsyncJob = null
-                if (!isReadOnly) {
-                    if (compactBeforeClose && journalRecordCount > 0) {
-                        compactLocked()
-                    } else if (journalUnsynced) {
-                        journalChannel?.force(false)
-                        journalUnsynced = false
+        runBlocking {
+            for (job in snapshotPendingMutationJobs()) {
+                job.join()
+            }
+            withContext(writerDispatcher) {
+                ioMutex.withLock {
+                    pendingFsyncJob?.cancel()
+                    pendingFsyncJob = null
+                    if (!isReadOnly) {
+                        if (compactBeforeClose && journalRecordCount > 0) {
+                            compactLocked()
+                        } else if (journalUnsynced) {
+                            journalChannel?.force(false)
+                            journalUnsynced = false
+                        }
                     }
+                    closeChannelLocked()
                 }
-                closeChannelLocked()
             }
         }
         scope.cancel()
@@ -619,7 +803,7 @@ class StrokeJournal(
             }
             SnotRecordType.REMOVE_STROKE -> {
                 val id = StrokeBinarySerializer.decodeIdPayload(frame.payload)
-                liveStrokes.remove(id)
+                liveStrokes.remove(id)?.let(::rememberRemovedStroke)
                 false
             }
             SnotRecordType.TRANSFORM_STROKE -> {
@@ -663,6 +847,7 @@ class StrokeJournal(
         const val DEFAULT_COMPACTION_THRESHOLD_BYTES: Long = 2L * 1024L * 1024L
         const val DEFAULT_FSYNC_INTERVAL_MS: Long = 900L
         const val MAX_FSYNC_INTERVAL_MS: Long = 1_000L
+        private const val MAX_REMOVED_STROKE_CACHE: Int = 1_024
 
         /**
          * Scans all `pages/<pageId>/` subdirectories on application startup (Section 9.3),

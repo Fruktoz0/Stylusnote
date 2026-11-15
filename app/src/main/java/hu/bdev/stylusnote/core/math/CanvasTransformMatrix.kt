@@ -224,6 +224,40 @@ class CanvasTransformMatrix(
     }
 
     /**
+     * Pans and (when zoomed out far below base page readability) zooms the viewport so
+     * [targetRect] sits cleanly in the center safe zone away from top toolbars.
+     * Returns `true` if the viewport transform changed.
+     */
+    @Synchronized
+    fun centerOnDocRectIfNeeded(
+        targetRect: DocRect,
+        viewportWidthPx: Float,
+        viewportHeightPx: Float,
+        forceCenter: Boolean = false
+    ): Boolean {
+        if (viewportWidthPx <= 0f || viewportHeightPx <= 0f) return false
+        val sLeft = targetRect.leftPt * _scale + _panXPx
+        val sTop = targetRect.topPt * _scale + _panYPx
+        val sRight = targetRect.rightPt * _scale + _panXPx
+        val sBottom = targetRect.bottomPt * _scale + _panYPx
+        val alreadyReadableInSafeZone = !forceCenter &&
+            _scale >= _baseFitScale * 0.85f &&
+            sLeft >= 32f &&
+            sRight <= viewportWidthPx - 32f &&
+            sTop >= 120f &&
+            sBottom <= viewportHeightPx - 96f
+        if (alreadyReadableInSafeZone) return false
+
+        val minReadableScale = (_baseFitScale * 1.15f).coerceIn(MIN_SCALE, MAX_SCALE)
+        val targetScale = max(_scale, minReadableScale).coerceIn(MIN_SCALE, MAX_SCALE)
+        _scale = targetScale
+        _panXPx = viewportWidthPx * 0.5f - targetRect.centerXPt * targetScale
+        _panYPx = viewportHeightPx * 0.45f - targetRect.centerYPt * targetScale
+        _version++
+        return true
+    }
+
+    /**
      * Populates [outMatrix] with the document-to-screen transform without allocating.
      */
     @Synchronized

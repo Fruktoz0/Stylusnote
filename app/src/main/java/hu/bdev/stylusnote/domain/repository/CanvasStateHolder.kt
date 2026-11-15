@@ -1256,30 +1256,49 @@ class CanvasStateHolder(
         action.affectedBounds
     }
 
+    data class UndoRedoOutcome(
+        val affectedBounds: DocRect?,
+        val action: CanvasAction?
+    )
+
+    /**
+     * Reverts the latest action from the Undo stack and moves it to the Redo stack.
+     * Returns both the affected document bounds and the reverted [CanvasAction] delta
+     * so callers can mirror the mutation durably into [StrokeJournal].
+     */
+    fun undoWithAction(): UndoRedoOutcome = synchronized(stateLock) {
+        val action = undoStack.removeLastOrNull() ?: return UndoRedoOutcome(null, null)
+        totalUndoPointCost = max(0, totalUndoPointCost - action.estimatedPointCost)
+        applyInverseLocked(action)
+        redoStack.addLast(action)
+        UndoRedoOutcome(action.affectedBounds, action)
+    }
+
+    /**
+     * Re-applies the latest undone action from the Redo stack and moves it back onto Undo.
+     * Returns both the affected document bounds and the re-applied [CanvasAction] delta
+     * so callers can mirror the mutation durably into [StrokeJournal].
+     */
+    fun redoWithAction(): UndoRedoOutcome = synchronized(stateLock) {
+        val action = redoStack.removeLastOrNull() ?: return UndoRedoOutcome(null, null)
+        applyForwardLocked(action)
+        undoStack.addLast(action)
+        totalUndoPointCost += action.estimatedPointCost
+        enforceUndoBudgetLocked()
+        UndoRedoOutcome(action.affectedBounds, action)
+    }
+
     /**
      * Reverts the latest action from the Undo stack and moves it to the Redo stack.
      * Returns the affected document bounds for targeted tile cache invalidation.
      */
-    fun undo(): DocRect? = synchronized(stateLock) {
-        val action = undoStack.removeLastOrNull() ?: return null
-        totalUndoPointCost = max(0, totalUndoPointCost - action.estimatedPointCost)
-        applyInverseLocked(action)
-        redoStack.addLast(action)
-        action.affectedBounds
-    }
+    fun undo(): DocRect? = undoWithAction().affectedBounds
 
     /**
      * Re-applies the latest undone action from the Redo stack and moves it back onto Undo.
      * Returns the affected document bounds for targeted tile cache invalidation.
      */
-    fun redo(): DocRect? = synchronized(stateLock) {
-        val action = redoStack.removeLastOrNull() ?: return null
-        applyForwardLocked(action)
-        undoStack.addLast(action)
-        totalUndoPointCost += action.estimatedPointCost
-        enforceUndoBudgetLocked()
-        action.affectedBounds
-    }
+    fun redo(): DocRect? = redoWithAction().affectedBounds
 
     private fun ensureProperLayerZIndex(entry: IndexedDryStroke): IndexedDryStroke {
         val inHighlighterBand = entry.zIndex < INK_Z_ORDER_BASE
@@ -1322,6 +1341,11 @@ class CanvasStateHolder(
             is CanvasAction.TransformedStrokes -> {
                 removeStrokesByIdLocked(action.beforeStrokes.map { it.id })
                 insertStrokesLocked(action.afterStrokes)
+                for (id in action.strokeIds) {
+                    shapeMetaById[id]?.let { existingMeta ->
+                        shapeMetaById[id] = existingMeta.transform(action.transform)
+                    }
+                }
             }
             is CanvasAction.RecoloredStrokes -> {
                 removeStrokesByIdLocked(action.beforeStrokes.map { it.id })
@@ -1352,6 +1376,13 @@ class CanvasStateHolder(
             is CanvasAction.TransformedStrokes -> {
                 removeStrokesByIdLocked(action.afterStrokes.map { it.id })
                 insertStrokesLocked(action.beforeStrokes)
+                action.transform.invert()?.let { invTransform ->
+                    for (id in action.strokeIds) {
+                        shapeMetaById[id]?.let { existingMeta ->
+                            shapeMetaById[id] = existingMeta.transform(invTransform)
+                        }
+                    }
+                }
             }
             is CanvasAction.RecoloredStrokes -> {
                 removeStrokesByIdLocked(action.afterStrokes.map { it.id })

@@ -1,6 +1,10 @@
 package hu.bdev.stylusnote
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color as AndroidColor
+import androidx.compose.ui.graphics.Color
 import androidx.ink.brush.InputToolType
 import androidx.ink.brush.SelfOverlap
 import androidx.ink.brush.StockBrushes
@@ -21,12 +25,17 @@ import hu.bdev.stylusnote.domain.model.AffineTransform2D
 import hu.bdev.stylusnote.domain.model.BrushConfig
 import hu.bdev.stylusnote.domain.model.BrushToolType
 import hu.bdev.stylusnote.domain.model.CanvasAction
+import hu.bdev.stylusnote.domain.model.CanvasMode
 import hu.bdev.stylusnote.domain.model.PageObject
+import hu.bdev.stylusnote.domain.model.PagePaperConfig
+import hu.bdev.stylusnote.domain.model.PaperTemplateType
 import hu.bdev.stylusnote.domain.model.PersistedStrokeRecord
 import hu.bdev.stylusnote.domain.model.StrokeLayerType
 import hu.bdev.stylusnote.domain.repository.CanvasStateHolder
 import hu.bdev.stylusnote.ui.canvas.IndexedDryStroke
+import hu.bdev.stylusnote.ui.canvas.PaperBackgroundRenderer
 import hu.bdev.stylusnote.ui.canvas.computeStrokeDocBounds
+import hu.bdev.stylusnote.ui.theme.StylusSurfacePalette
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -477,6 +486,48 @@ class StylusNoteInstrumentedValidationTest {
         assertNotNull(redoDirty)
         assertEquals(3, holder.strokeCount)
         assertNull(holder.getStroke("orig-1"))
+    }
+
+    @Test
+    fun ruledPaperDrawsNoRedVerticalMarginLineInFixedOrInfiniteMode() {
+        val palette = StylusSurfacePalette(
+            isOledDeepBlack = false,
+            deskBackground = Color(0xFFF7F8FA),
+            pagePaperBackground = Color(0xFFFFFFFF),
+            pageBorder = Color(0xFFDFE3E9),
+            defaultInkColor = Color(0xFF1E232A)
+        )
+        val matrix = CanvasTransformMatrix(initialScale = 1f, initialPanXPx = 0f, initialPanYPx = 0f)
+
+        fun countRedPixelsNearMargin(mode: CanvasMode, template: PaperTemplateType, checkXRange: IntRange): Int {
+            val bmp = Bitmap.createBitmap(620, 420, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bmp)
+            PaperBackgroundRenderer.drawPaperLayer(
+                canvas = canvas,
+                viewportWidthPx = bmp.width,
+                viewportHeightPx = bmp.height,
+                transformMatrix = matrix,
+                paperConfig = PagePaperConfig(canvasMode = mode, templateType = template),
+                palette = palette
+            )
+            var redCount = 0
+            for (y in 80 until 380 step 2) {
+                for (x in checkXRange) {
+                    val px = bmp.getPixel(x, y)
+                    val r = AndroidColor.red(px)
+                    val g = AndroidColor.green(px)
+                    val b = AndroidColor.blue(px)
+                    if (r - g > 60 && r - b > 60) redCount++
+                }
+            }
+            bmp.recycle()
+            return redCount
+        }
+
+        assertEquals(0, countRedPixelsNearMargin(CanvasMode.FIXED_PAGE, PaperTemplateType.RULED_8MM, 60..90))
+        assertEquals(0, countRedPixelsNearMargin(CanvasMode.INFINITE_CANVAS, PaperTemplateType.RULED_8MM, 60..90))
+        // Sanity check: Cornell template intentionally keeps its red cue-column divider.
+        assertTrue(countRedPixelsNearMargin(CanvasMode.FIXED_PAGE, PaperTemplateType.CORNELL, 165..195) > 20)
     }
 
     private fun inkSample(

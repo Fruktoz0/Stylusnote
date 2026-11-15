@@ -3,9 +3,12 @@ package hu.bdev.stylusnote.domain
 import hu.bdev.stylusnote.core.hardware.StylusPointSample
 import hu.bdev.stylusnote.core.math.DocPoint
 import hu.bdev.stylusnote.core.math.DocRect
+import hu.bdev.stylusnote.core.math.RecognizedShapeType
+import hu.bdev.stylusnote.core.math.ShapeMeta
 import hu.bdev.stylusnote.domain.model.AffineTransform2D
 import hu.bdev.stylusnote.domain.model.BrushConfig
 import hu.bdev.stylusnote.domain.model.BrushToolType
+import hu.bdev.stylusnote.domain.model.CanvasAction
 import hu.bdev.stylusnote.domain.model.GeometricShapeType
 import hu.bdev.stylusnote.domain.model.PageObject
 import hu.bdev.stylusnote.domain.repository.CanvasStateHolder
@@ -249,6 +252,31 @@ class CanvasStateHolderTest {
         assertEquals(2, holder.allPageObjects().size)
         assertNotNull(holder.redo())
         assertFalse(holder.allPageObjects().isNotEmpty())
+    }
+
+    @Test
+    fun undoWithActionAndRedoWithActionReturnExactActionDeltas() {
+        val holder = CanvasStateHolder()
+        val initialObj = PageObject.FormattedTextObject(
+            id = "fmt-delta-1",
+            zOrder = holder.allocateObjectZOrder(),
+            bounds = DocRect(40f, 50f, 200f, 90f),
+            text = "Kezdeti",
+            sourceStrokeIds = listOf("stroke-1")
+        )
+        holder.addPageObject(initialObj)
+        val updatedObj = initialObj.copy(text = "Módosított")
+        holder.updatePageObject(updatedObj)
+
+        val undoOutcome = holder.undoWithAction()
+        assertNotNull(undoOutcome.affectedBounds)
+        assertTrue(undoOutcome.action is CanvasAction.UpdatedObject)
+        assertEquals("Kezdeti", (holder.getPageObject("fmt-delta-1") as PageObject.FormattedTextObject).text)
+
+        val redoOutcome = holder.redoWithAction()
+        assertNotNull(redoOutcome.affectedBounds)
+        assertTrue(redoOutcome.action is CanvasAction.UpdatedObject)
+        assertEquals("Módosított", (holder.getPageObject("fmt-delta-1") as PageObject.FormattedTextObject).text)
     }
 
     private fun sample(

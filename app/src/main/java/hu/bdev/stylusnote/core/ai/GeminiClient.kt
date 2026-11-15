@@ -94,7 +94,8 @@ class GeminiClient(
         responseMimeType: String? = null,
         responseSchemaJson: String? = null,
         systemInstruction: String? = null,
-        temperature: Float? = null
+        temperature: Float? = null,
+        thinkingBudget: Int? = null
     ): GeminiResponse {
         require(promptText.isNotBlank() || inlinePngImages.isNotEmpty()) {
             "A Gemini kéréshez szöveges utasítás vagy kép szükséges."
@@ -127,21 +128,27 @@ class GeminiClient(
         var firstFailedModelId: String? = null
         var lastFailure: Throwable? = null
 
-        val payloadJson = buildGenerateContentRequestJson(
-            promptText = promptText,
-            inlinePngImages = inlinePngImages,
-            responseMimeType = responseMimeType,
-            responseSchemaJson = responseSchemaJson,
-            systemInstruction = systemInstruction,
-            temperature = temperature
-        )
-
         while (candidateQueue.isNotEmpty()) {
             val activeModelId = candidateQueue.removeFirst()
             if (!triedModels.add(activeModelId)) continue
 
             var attempt429 = 0
+            var omitThinkingConfig = false
             while (true) {
+                val activeThinkingBudget = if (omitThinkingConfig) {
+                    null
+                } else {
+                    resolveEffectiveThinkingBudget(activeModelId, thinkingBudget)
+                }
+                val payloadJson = buildGenerateContentRequestJson(
+                    promptText = promptText,
+                    inlinePngImages = inlinePngImages,
+                    responseMimeType = responseMimeType,
+                    responseSchemaJson = responseSchemaJson,
+                    systemInstruction = systemInstruction,
+                    temperature = temperature,
+                    thinkingBudget = activeThinkingBudget
+                )
                 acquireRateLimitSlot()
 
                 val endpoint = "${baseUrl.trimEnd('/')}/v1beta/models/$activeModelId:generateContent"
@@ -247,6 +254,14 @@ class GeminiClient(
                         lastFailure = err
                         if (firstFailedModelId == null) firstFailedModelId = activeModelId
                         break
+                    }
+
+                    result.statusCode == 400 &&
+                        !omitThinkingConfig &&
+                        activeThinkingBudget != null &&
+                        isThinkingConfigRejectedError(result.bodyText) -> {
+                        omitThinkingConfig = true
+                        continue
                     }
 
                     result.statusCode == 401 || result.statusCode == 403 -> {
@@ -361,7 +376,7 @@ class GeminiClient(
     }
 
     companion object {
-        const val DEFAULT_MIN_REQUEST_INTERVAL_MS = 1_000L
+        const val DEFAULT_MIN_REQUEST_INTERVAL_MS = 400L
         const val DEFAULT_MAX_REQUESTS_PER_MINUTE = 15
         const val DEFAULT_MAX_RETRIES_ON_429 = 3
         const val DEFAULT_BASE_BACKOFF_MS = 1_500L
@@ -375,6 +390,8 @@ class GeminiClient(
             .build()
 
         const val DEFAULT_INLINE_IMAGE_LONG_EDGE_PX = 1536
+        const val PAGE_FORMAT_IMAGE_EDGE_PX = 1024
+        const val DEFAULT_THINKING_BUDGET_DISABLED = 0
         const val MIN_INLINE_IMAGE_LONG_EDGE_PX = 512
         const val MAX_INLINE_IMAGE_LONG_EDGE_PX = 2048
 
@@ -455,13 +472,33 @@ class GeminiClient(
             return parsed[fieldName]?.toString()?.trim()?.takeIf { it.isNotEmpty() }
         }
 
+        internal fun resolveEffectiveThinkingBudget(
+            modelId: String,
+            explicitBudget: Int? = null
+        ): Int? {
+            if (explicitBudget != null) return explicitBudget
+            val normalized = modelId.lowercase()
+            return if (normalized.contains("gemini-2.5") && !normalized.contains("pro")) {
+                DEFAULT_THINKING_BUDGET_DISABLED
+            } else {
+                null
+            }
+        }
+
+        internal fun isThinkingConfigRejectedError(bodyJson: String): Boolean {
+            if (bodyJson.isBlank()) return false
+            val lower = bodyJson.lowercase()
+            return lower.contains("thinking") || lower.contains("thinking_budget") || lower.contains("thinkingconfig")
+        }
+
         internal fun buildGenerateContentRequestJson(
             promptText: String,
             inlinePngImages: List<ByteArray>,
             responseMimeType: String?,
             responseSchemaJson: String?,
             systemInstruction: String?,
-            temperature: Float?
+            temperature: Float?,
+            thinkingBudget: Int? = null
         ): String {
             val sb = StringBuilder(256)
             sb.append('{')
@@ -492,7 +529,8 @@ class GeminiClient(
 
             val hasGenConfig = !responseMimeType.isNullOrBlank() ||
                 !responseSchemaJson.isNullOrBlank() ||
-                temperature != null
+                temperature != null ||
+                thinkingBudget != null
             if (hasGenConfig) {
                 sb.append(",\"generationConfig\":{")
                 var needComma = false
@@ -511,6 +549,13 @@ class GeminiClient(
                     if (needComma) sb.append(',')
                     sb.append("\"temperature\":")
                     sb.append(temperature)
+                    needComma = true
+                }
+                if (thinkingBudget != null) {
+                    if (needComma) sb.append(',')
+                    sb.append("\"thinkingConfig\":{\"thinkingBudget\":")
+                    sb.append(thinkingBudget)
+                    sb.append('}')
                 }
                 sb.append('}')
             }

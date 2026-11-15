@@ -337,4 +337,82 @@ class GeminiClientAndCatalogTest {
             requestedUrls
         )
     }
+
+    @Test
+    fun thinkingBudgetZeroIsAppliedToGemini25FlashAndFallsBackCleanlyOnHttp400() = runBlocking {
+        assertEquals(0, GeminiClient.resolveEffectiveThinkingBudget("gemini-2.5-flash"))
+        assertEquals(0, GeminiClient.resolveEffectiveThinkingBudget("gemini-2.5-flash-lite"))
+        assertNull(GeminiClient.resolveEffectiveThinkingBudget("gemini-2.0-flash"))
+        assertNull(GeminiClient.resolveEffectiveThinkingBudget("gemini-2.5-pro"))
+
+        val jsonWithThinking = GeminiClient.buildGenerateContentRequestJson(
+            promptText = "Format page",
+            inlinePngImages = emptyList(),
+            responseMimeType = "application/json",
+            responseSchemaJson = null,
+            systemInstruction = null,
+            temperature = 0.1f,
+            thinkingBudget = 0
+        )
+        assertTrue(jsonWithThinking.contains("\"thinkingConfig\":{\"thinkingBudget\":0}"))
+
+        val storage = InMemoryAiSettingsStorage()
+        val consentStore = AiConsentStore(storage, JvmAesGcmCipher(), clockNowMs = { 5_000L })
+        consentStore.saveApiKey("AIzaSyThinkingFallbackKey")
+        consentStore.recordConsentAccepted(enableAi = true)
+
+        val requestBodies = mutableListOf<String>()
+        val interceptor = Interceptor { chain ->
+            val req = chain.request()
+            if (req.url.encodedPath.endsWith("/v1beta/models")) {
+                return@Interceptor Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body(
+                        """{"models":[{"name":"models/gemini-2.5-flash","supportedGenerationMethods":["generateContent"]}]}"""
+                            .toResponseBody("application/json".toMediaType())
+                    )
+                    .build()
+            }
+            val sink = okio.Buffer()
+            req.body?.writeTo(sink)
+            val bodyStr = sink.readUtf8()
+            requestBodies += bodyStr
+            if (bodyStr.contains("thinkingConfig")) {
+                Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(400)
+                    .message("Bad Request")
+                    .body("""{"error":{"message":"Unknown name \"thinkingConfig\" at generation_config"}}""".toResponseBody("application/json".toMediaType()))
+                    .build()
+            } else {
+                Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body("""{"candidates":[{"content":{"parts":[{"text":"{\"elements\":[]}"}]}}]}""".toResponseBody("application/json".toMediaType()))
+                    .build()
+            }
+        }
+
+        val httpClient = OkHttpClient.Builder().addInterceptor(interceptor).build()
+        val client = GeminiClient(
+            consentStore = consentStore,
+            modelCatalog = ModelCatalog(httpClient = httpClient),
+            httpClient = httpClient,
+            minRequestIntervalMs = 0L
+        )
+        val res = client.generateContent(
+            trigger = UserInitiatedAiTrigger.HANDWRITING_TO_MARKDOWN,
+            promptText = "Format"
+        )
+        assertEquals("{\"elements\":[]}", res.text)
+        assertEquals(2, requestBodies.size)
+        assertTrue(requestBodies[0].contains("\"thinkingConfig\":{\"thinkingBudget\":0}"))
+        assertFalse(requestBodies[1].contains("thinkingConfig"))
+    }
 }

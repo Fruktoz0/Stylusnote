@@ -547,6 +547,9 @@ interface PageTextSearchDao {
     @Query("SELECT rawText FROM page_text_fts WHERE notebookId = :notebookId")
     suspend fun getRecognizedTextsForNotebook(notebookId: String): List<String>
 
+    @Query("SELECT pageId, notebookId, rawText FROM page_text_fts WHERE notebookId = :notebookId")
+    suspend fun getPageEntriesForNotebook(notebookId: String): List<PageSearchHit>
+
     @Query("SELECT pageId, notebookId, rawText, asciiFoldedText FROM page_text_fts")
     suspend fun getAllFtsEntries(): List<PageTextFtsEntity>
 

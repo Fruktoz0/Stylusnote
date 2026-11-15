@@ -9,10 +9,12 @@ import hu.bdev.stylusnote.core.math.ShapeMeta
 import hu.bdev.stylusnote.domain.model.AffineTransform2D
 import hu.bdev.stylusnote.domain.model.BrushConfig
 import hu.bdev.stylusnote.domain.model.BrushToolType
+import hu.bdev.stylusnote.domain.model.CanvasAction
 import hu.bdev.stylusnote.domain.model.GeometricShapeType
 import hu.bdev.stylusnote.domain.model.PageObject
 import hu.bdev.stylusnote.domain.model.PersistedStrokeRecord
 import hu.bdev.stylusnote.domain.model.StrokeLayerType
+import hu.bdev.stylusnote.domain.repository.CanvasStateHolder
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -407,6 +409,52 @@ class StrokeJournalRoundTripTest {
         assertEquals(40f, loaded.originalStrokes.first().samples.first().xPt, 1e-3f)
         assertEquals(35f, loaded.originalStrokes.first().samples.first().yPt, 1e-3f)
         assertTrue(loaded.originalStrokes.first().shapeMeta != null)
+    }
+
+    @Test
+    fun enqueueCanvasActionInverseAndForwardPersistObjectsBeforeCompactCloseAndReopen() = runBlocking {
+        val pageDir = File(tempRoot, "page-undo-object-sync")
+        val initialText = PageObject.FormattedTextObject(
+            id = "fmt-ai-undo-1",
+            zOrder = 210L,
+            bounds = DocRect(20f, 30f, 180f, 70f),
+            text = "Első szöveg",
+            sourceStrokeIds = listOf("s-1")
+        )
+        val updatedText = initialText.copy(text = "Második módosított szöveg")
+
+        // 1. Add object, update it, enqueue Undo of the Update + enqueue Undo of the Add, then immediately closeBlocking.
+        val j1 = StrokeJournal(pageDirectory = pageDir, fsyncDebounceMs = 0L)
+        j1.openAndRecover()
+        val addAction = CanvasAction.AddedObject(initialText)
+        val updateAction = CanvasAction.UpdatedObject(initialText, updatedText)
+        j1.applyCanvasActionForward(addAction)
+        j1.applyCanvasActionForward(updateAction)
+
+        j1.enqueueCanvasActionInverse(updateAction)
+        j1.enqueueCanvasActionInverse(addAction)
+        j1.closeBlocking(compactBeforeClose = true)
+
+        // 2. Reopen and confirm undone AI object stayed absent across compaction + reopen.
+        val j2 = StrokeJournal(pageDirectory = pageDir, fsyncDebounceMs = 0L)
+        val afterUndo = j2.openAndRecover()
+        assertTrue("Undone AI object must not reappear after close/reopen", afterUndo.objects.isEmpty())
+
+        // 3. Redo both via enqueueCanvasActionForward, closeBlocking, and verify persisted restoration.
+        j2.enqueueCanvasActionForward(
+            CanvasAction.CompositeAction(
+                actions = listOf(addAction, updateAction),
+                description = "Redo AI + Edit"
+            )
+        )
+        j2.closeBlocking(compactBeforeClose = true)
+
+        val j3 = StrokeJournal(pageDirectory = pageDir, fsyncDebounceMs = 0L)
+        val afterRedo = j3.openAndRecover()
+        j3.closeBlocking(compactBeforeClose = false)
+
+        val restored = afterRedo.objects.single() as PageObject.FormattedTextObject
+        assertEquals("Második módosított szöveg", restored.text)
     }
 }
 

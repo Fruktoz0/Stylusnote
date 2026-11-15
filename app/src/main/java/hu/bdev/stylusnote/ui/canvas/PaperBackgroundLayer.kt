@@ -558,10 +558,6 @@ object PaperBackgroundRenderer {
                 headerBottom,
                 majorRulePaint
             )
-            val marginX = pageBounds.leftPt + 72f
-            canvas.drawLine(marginX, pageBounds.topPt, marginX, pageBounds.bottomPt, marginAccentPaint)
-        } else if (visibleBounds.leftPt <= 72f && visibleBounds.rightPt >= 72f) {
-            canvas.drawLine(72f, visibleBounds.topPt, 72f, visibleBounds.bottomPt, marginAccentPaint)
         }
     }
 

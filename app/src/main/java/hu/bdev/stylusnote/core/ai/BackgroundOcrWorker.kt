@@ -200,7 +200,7 @@ class BackgroundOcrWorker(
 
             val pageDir = File(applicationContext.filesDir, "pages/${page.id}")
             if (!pageDir.exists()) {
-                searchDao.replacePageOcrText(page.id, page.notebookId, "")
+                searchDao.replacePageOcrText(page.id, page.notebookId, page.title.orEmpty())
                 pageDao.markOcrSyncState(page.id, needsSync = false, updatedAtMs = System.currentTimeMillis())
                 continue
             }
@@ -232,7 +232,11 @@ class BackgroundOcrWorker(
                 }
             }
 
-            val joinedText = recognizedLines.joinToString(separator = "\n")
+            val joinedText = SearchTextIndexer.combinePageIndexText(
+                ocrLines = recognizedLines,
+                objects = recovery.objects,
+                pageTitle = page.title
+            )
             searchDao.replacePageOcrText(
                 pageId = page.id,
                 notebookId = page.notebookId,
