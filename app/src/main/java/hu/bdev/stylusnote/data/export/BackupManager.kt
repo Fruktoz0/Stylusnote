@@ -13,6 +13,7 @@ import hu.bdev.stylusnote.data.local.PageEntity
 import hu.bdev.stylusnote.data.local.PageFileFormat
 import hu.bdev.stylusnote.data.local.PageTextFtsEntity
 import hu.bdev.stylusnote.data.local.StylusNoteDatabaseConverters
+import hu.bdev.stylusnote.data.local.SyncTombstoneEntity
 import hu.bdev.stylusnote.data.local.TagEntity
 import hu.bdev.stylusnote.domain.model.NotebookCover
 import kotlinx.coroutines.Dispatchers
@@ -33,6 +34,7 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.security.MessageDigest
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
@@ -42,7 +44,7 @@ import java.util.zip.ZipOutputStream
  * Explicitly omits any API keys, DataStore preferences, or Keystore metadata (Section 8).
  */
 data class BackupManifest(
-    val formatVersion: Int = PageFileFormat.CURRENT_FORMAT_VERSION,
+    val formatVersion: Int = CURRENT_MANIFEST_VERSION,
     val appVersion: String = DEFAULT_APP_VERSION,
     val createdAtEpochMs: Long = System.currentTimeMillis(),
     val folders: List<FolderEntity> = emptyList(),
@@ -52,12 +54,22 @@ data class BackupManifest(
     val tags: List<TagEntity> = emptyList(),
     val tagLinks: List<NotebookTagCrossRef> = emptyList(),
     val bookmarks: List<BookmarkEntity> = emptyList(),
-    val ftsEntries: List<PageTextFtsEntity> = emptyList()
+    val ftsEntries: List<PageTextFtsEntity> = emptyList(),
+    val tombstones: List<SyncTombstoneEntity> = emptyList()
 ) {
     companion object {
+        const val MANIFEST_VERSION_V1: Int = 1
+        const val MANIFEST_VERSION_V2: Int = 2
+        const val CURRENT_MANIFEST_VERSION: Int = MANIFEST_VERSION_V2
         const val DEFAULT_APP_VERSION: String = "0.1.0-alpha"
     }
 }
+
+data class ManifestMergeResult(
+    val mergedManifest: BackupManifest,
+    val dirtyRemotePageIds: Set<String>,
+    val deletedPageIds: Set<String>
+)
 
 data class BackupExportSummary(
     val manifest: BackupManifest,
@@ -140,6 +152,9 @@ class BackupManager(
             writeUtf(out, p.notebookId)
             writeNullableUtf(out, p.chapterId)
             out.writeInt(p.pageIndexInNotebook)
+            if (manifest.formatVersion >= BackupManifest.MANIFEST_VERSION_V2) {
+                writeNullableUtf(out, p.title)
+            }
             writeUtf(out, conv.fromCanvasMode(p.canvasMode))
             writeUtf(out, conv.fromPageSizePreset(p.pageSizePreset))
             writeUtf(out, conv.fromPaperTemplateType(p.templateType))
@@ -183,6 +198,15 @@ class BackupManager(
             writeUtf(out, fts.notebookId)
             writeUtf(out, fts.rawText)
             writeUtf(out, fts.asciiFoldedText)
+        }
+
+        if (manifest.formatVersion >= BackupManifest.MANIFEST_VERSION_V2) {
+            out.writeInt(manifest.tombstones.size)
+            for (t in manifest.tombstones) {
+                writeUtf(out, t.entityType)
+                writeUtf(out, t.entityId)
+                out.writeLong(t.deletedAtEpochMs)
+            }
         }
 
         out.flush()
@@ -268,6 +292,11 @@ class BackupManager(
             val nbId = readUtf(input)
             val chId = readNullableUtf(input)
             val idx = input.readInt()
+            val title = if (formatVersion >= BackupManifest.MANIFEST_VERSION_V2) {
+                readNullableUtf(input)
+            } else {
+                null
+            }
             val cMode = conv.toCanvasMode(readUtf(input))
             val pPreset = conv.toPageSizePreset(readUtf(input))
             val tpl = conv.toPaperTemplateType(readUtf(input))
@@ -286,6 +315,7 @@ class BackupManager(
                     notebookId = nbId,
                     chapterId = chId,
                     pageIndexInNotebook = idx,
+                    title = title,
                     canvasMode = cMode,
                     pageSizePreset = pPreset,
                     templateType = tpl,
@@ -341,6 +371,27 @@ class BackupManager(
             )
         }
 
+        val tombstones = if (formatVersion >= BackupManifest.MANIFEST_VERSION_V2 && input.available() >= 4) {
+            val tCount = input.readInt().coerceAtLeast(0)
+            ArrayList<SyncTombstoneEntity>(tCount).apply {
+                repeat(tCount) {
+                    val entityType = readUtf(input)
+                    val entityId = readUtf(input)
+                    val deletedAt = input.readLong()
+                    add(
+                        SyncTombstoneEntity(
+                            compositeKey = SyncTombstoneEntity.key(entityType, entityId),
+                            entityType = entityType,
+                            entityId = entityId,
+                            deletedAtEpochMs = deletedAt
+                        )
+                    )
+                }
+            }
+        } else {
+            emptyList()
+        }
+
         return BackupManifest(
             formatVersion = formatVersion,
             appVersion = appVersion,
@@ -352,7 +403,8 @@ class BackupManager(
             tags = tags,
             tagLinks = tagLinks,
             bookmarks = bookmarks,
-            ftsEntries = ftsEntries
+            ftsEntries = ftsEntries,
+            tombstones = tombstones
         )
     }
 
@@ -443,6 +495,8 @@ class BackupManager(
             val tags = database.tagDao().observeAllTags().first()
             val links = database.tagDao().observeAllNotebookTagLinks().first()
             val bookmarks = database.bookmarkDao().observeAllBookmarks().first()
+            val ftsEntries = database.pageTextSearchDao().getAllFtsEntries()
+            val tombstones = database.syncMetadataDao().getAllTombstones()
             BackupManifest(
                 folders = folders,
                 notebooks = notebooks,
@@ -450,7 +504,9 @@ class BackupManager(
                 pages = pages,
                 tags = tags,
                 tagLinks = links,
-                bookmarks = bookmarks
+                bookmarks = bookmarks,
+                ftsEntries = ftsEntries,
+                tombstones = tombstones
             )
         }
 
@@ -458,6 +514,66 @@ class BackupManager(
         database: AppDatabase,
         manifest: BackupManifest
     ) = withContext(Dispatchers.IO) {
+        val localSnapshot = collectManifestFromDatabase(database)
+        val merged = mergeManifests(local = localSnapshot, remote = manifest)
+        writeMergedManifestToDatabase(database = database, mergeResult = merged)
+    }
+
+    /**
+     * Merges [remote] into the live Room database using LWW timestamps + [SyncTombstoneEntity]
+     * suppression and cleans up locally deleted page directories.
+     */
+    suspend fun mergeRemoteManifestIntoDatabase(
+        database: AppDatabase,
+        remote: BackupManifest
+    ): ManifestMergeResult = withContext(Dispatchers.IO) {
+        val local = collectManifestFromDatabase(database)
+        val merged = mergeManifests(local = local, remote = remote)
+        writeMergedManifestToDatabase(database = database, mergeResult = merged)
+        for (deletedPageId in merged.deletedPageIds) {
+            val pageDir = File(filesDir, "pages/$deletedPageId")
+            if (pageDir.exists()) {
+                pageDir.deleteRecursively()
+            }
+            database.syncMetadataDao().deleteSyncedAsset("pages/$deletedPageId")
+        }
+        merged
+    }
+
+    private suspend fun writeMergedManifestToDatabase(
+        database: AppDatabase,
+        mergeResult: ManifestMergeResult
+    ) {
+        val manifest = mergeResult.mergedManifest
+        if (manifest.tombstones.isNotEmpty()) {
+            database.syncMetadataDao().upsertTombstones(manifest.tombstones)
+        }
+        for (tombstone in manifest.tombstones) {
+            when (tombstone.entityType) {
+                SyncTombstoneEntity.TYPE_FOLDER ->
+                    database.folderDao().deleteFolderById(tombstone.entityId)
+                SyncTombstoneEntity.TYPE_NOTEBOOK ->
+                    database.notebookDao().deleteNotebookById(tombstone.entityId)
+                SyncTombstoneEntity.TYPE_CHAPTER ->
+                    database.chapterDao().deleteChapterById(tombstone.entityId)
+                SyncTombstoneEntity.TYPE_PAGE ->
+                    database.pageDao().deletePageById(tombstone.entityId)
+                SyncTombstoneEntity.TYPE_TAG ->
+                    database.tagDao().deleteTagById(tombstone.entityId)
+                SyncTombstoneEntity.TYPE_BOOKMARK ->
+                    database.bookmarkDao().deleteBookmarkById(tombstone.entityId)
+                SyncTombstoneEntity.TYPE_TAG_LINK -> {
+                    val sep = tombstone.entityId.indexOf('|')
+                    if (sep > 0) {
+                        database.tagDao().detachTagFromNotebook(
+                            notebookId = tombstone.entityId.substring(0, sep),
+                            tagId = tombstone.entityId.substring(sep + 1)
+                        )
+                    }
+                }
+            }
+        }
+
         // Insert parents before children to satisfy Room foreign keys cleanly.
         val pendingFolders = manifest.folders.toMutableList()
         val insertedFolders = HashSet<String>()
@@ -487,6 +603,89 @@ class BackupManager(
                 recognizedText = fts.rawText.ifBlank { AccentNormalizer.foldToAscii(fts.asciiFoldedText) }
             )
         }
+    }
+
+    /**
+     * Packages one relative subdirectory under [filesDir] (e.g. `pages/<pageId>`) into a deterministic
+     * ZIP payload for incremental per-page cloud sync.
+     */
+    suspend fun packageRelativeSubdirToZipBytes(relativeSubdir: String): ByteArray? =
+        withContext(Dispatchers.IO) {
+            val normalizedSubdir = relativeSubdir.replace('\\', '/').trim('/')
+            if (!isAllowedBackupEntryPath("$normalizedSubdir/placeholder")) return@withContext null
+            val targetDir = File(filesDir, normalizedSubdir)
+            if (!targetDir.exists() || !targetDir.isDirectory) return@withContext null
+            val files = targetDir.walkTopDown()
+                .filter { it.isFile }
+                .sortedBy { it.relativeTo(filesDir).path.replace('\\', '/') }
+                .toList()
+            packageFilesToDeterministicZipBytes(files)
+        }
+
+    /**
+     * Packages a single relative file under [filesDir] (e.g. `pdfs/<name>.pdf` or `covers/<name>`)
+     * into a deterministic ZIP payload for incremental cloud asset sync.
+     */
+    suspend fun packageRelativeFileToZipBytes(relativeFilePath: String): ByteArray? =
+        withContext(Dispatchers.IO) {
+            val normalizedPath = relativeFilePath.replace('\\', '/').trim('/')
+            if (!isAllowedBackupEntryPath(normalizedPath)) return@withContext null
+            val targetFile = File(filesDir, normalizedPath)
+            if (!targetFile.exists() || !targetFile.isFile) return@withContext null
+            packageFilesToDeterministicZipBytes(listOf(targetFile))
+        }
+
+    private fun packageFilesToDeterministicZipBytes(files: List<File>): ByteArray? {
+        if (files.isEmpty()) return null
+        val baos = ByteArrayOutputStream()
+        var wroteEntry = false
+        ZipOutputStream(baos).use { zip ->
+            for (file in files) {
+                val relPath = file.relativeTo(filesDir).path.replace('\\', '/')
+                if (isAllowedBackupEntryPath(relPath)) {
+                    val entry = ZipEntry(relPath).apply { time = 0L }
+                    zip.putNextEntry(entry)
+                    FileInputStream(file).use { input -> input.copyTo(zip) }
+                    zip.closeEntry()
+                    wroteEntry = true
+                }
+            }
+        }
+        return if (wroteEntry) baos.toByteArray() else null
+    }
+
+    /**
+     * Extracts a delta asset ZIP under [filesDir], rejecting any entry outside [allowedPrefix].
+     */
+    suspend fun extractRelativeSubdirZipBytes(
+        zipBytes: ByteArray,
+        allowedPrefix: String
+    ): Int = withContext(Dispatchers.IO) {
+        val normPrefix = allowedPrefix.replace('\\', '/').trim('/')
+        val canonicalRoot = filesDir.canonicalFile
+        var restored = 0
+        ZipInputStream(BufferedInputStream(zipBytes.inputStream())).use { zip ->
+            while (true) {
+                val entry = zip.nextEntry ?: break
+                val entryName = entry.name.replace('\\', '/')
+                val matchesTarget = entryName == normPrefix || entryName.startsWith("$normPrefix/")
+                if (entry.isDirectory ||
+                    !matchesTarget ||
+                    !isAllowedBackupEntryPath(entryName)
+                ) {
+                    zip.closeEntry()
+                    continue
+                }
+                val target = File(canonicalRoot, entryName).canonicalFile
+                if (target.path.startsWith(canonicalRoot.path + File.separator)) {
+                    target.parentFile?.mkdirs()
+                    FileOutputStream(target).use { out -> zip.copyTo(out) }
+                    restored++
+                }
+                zip.closeEntry()
+            }
+        }
+        restored
     }
 
     suspend fun exportToSafUri(
@@ -598,6 +797,138 @@ class BackupManager(
     companion object {
         const val MANIFEST_ENTRY_NAME: String = "manifest.bin"
         private val MANIFEST_MAGIC: ByteArray = byteArrayOf(0x53, 0x4E, 0x42, 0x4B) // "SNBK"
+
+        fun sha256Hex(bytes: ByteArray): String {
+            val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
+            return digest.joinToString(separator = "") { b -> "%02x".format(b) }
+        }
+
+        /**
+         * Pure LWW + tombstone merge between [local] and [remote] manifests so newer changes win
+         * on either device while deleted folders/notebooks/pages/bookmarks stay deleted.
+         */
+        fun mergeManifests(
+            local: BackupManifest,
+            remote: BackupManifest
+        ): ManifestMergeResult {
+            val tombstonesByKey = LinkedHashMap<String, SyncTombstoneEntity>()
+            for (t in local.tombstones + remote.tombstones) {
+                val existing = tombstonesByKey[t.compositeKey]
+                if (existing == null || t.deletedAtEpochMs > existing.deletedAtEpochMs) {
+                    tombstonesByKey[t.compositeKey] = t
+                }
+            }
+
+            fun tombstoneTime(type: String, id: String): Long? =
+                tombstonesByKey[SyncTombstoneEntity.key(type, id)]?.deletedAtEpochMs
+
+            fun isSuppressed(type: String, id: String, entityUpdatedAtMs: Long): Boolean {
+                val deletedAt = tombstoneTime(type, id) ?: return false
+                return deletedAt >= entityUpdatedAtMs
+            }
+
+            val folderMap = LinkedHashMap<String, FolderEntity>()
+            for (f in local.folders + remote.folders) {
+                if (isSuppressed(SyncTombstoneEntity.TYPE_FOLDER, f.id, f.updatedAtEpochMs)) continue
+                val existing = folderMap[f.id]
+                if (existing == null || f.updatedAtEpochMs > existing.updatedAtEpochMs) {
+                    folderMap[f.id] = f
+                }
+            }
+
+            val notebookMap = LinkedHashMap<String, NotebookEntity>()
+            for (nb in local.notebooks + remote.notebooks) {
+                if (isSuppressed(SyncTombstoneEntity.TYPE_NOTEBOOK, nb.id, nb.updatedAtEpochMs)) continue
+                val cleanFolderId = nb.folderId?.takeIf { folderMap.containsKey(it) }
+                val normalized = nb.copy(folderId = cleanFolderId)
+                val existing = notebookMap[nb.id]
+                if (existing == null || normalized.updatedAtEpochMs > existing.updatedAtEpochMs) {
+                    notebookMap[nb.id] = normalized
+                }
+            }
+
+            val chapterMap = LinkedHashMap<String, ChapterEntity>()
+            for (ch in local.chapters + remote.chapters) {
+                if (!notebookMap.containsKey(ch.notebookId)) continue
+                if (isSuppressed(SyncTombstoneEntity.TYPE_CHAPTER, ch.id, ch.createdAtEpochMs)) continue
+                chapterMap.putIfAbsent(ch.id, ch)
+            }
+
+            val localPagesById = local.pages.associateBy { it.id }
+            val dirtyRemotePageIds = LinkedHashSet<String>()
+            val pageMap = LinkedHashMap<String, PageEntity>()
+            for (p in local.pages + remote.pages) {
+                if (!notebookMap.containsKey(p.notebookId)) continue
+                if (isSuppressed(SyncTombstoneEntity.TYPE_PAGE, p.id, p.updatedAtEpochMs)) continue
+                val existing = pageMap[p.id]
+                if (existing == null || p.updatedAtEpochMs > existing.updatedAtEpochMs) {
+                    pageMap[p.id] = p
+                }
+            }
+            for ((pageId, chosen) in pageMap) {
+                val localPage = localPagesById[pageId]
+                if (localPage == null || chosen.updatedAtEpochMs > localPage.updatedAtEpochMs) {
+                    dirtyRemotePageIds.add(pageId)
+                }
+            }
+
+            val deletedPageIds = local.pages
+                .map { it.id }
+                .filter { !pageMap.containsKey(it) }
+                .toSet()
+
+            val tagMap = LinkedHashMap<String, TagEntity>()
+            for (t in local.tags + remote.tags) {
+                if (tombstoneTime(SyncTombstoneEntity.TYPE_TAG, t.id) != null) continue
+                tagMap.putIfAbsent(t.id, t)
+            }
+
+            val linkSet = LinkedHashSet<NotebookTagCrossRef>()
+            for (link in local.tagLinks + remote.tagLinks) {
+                if (!notebookMap.containsKey(link.notebookId) || !tagMap.containsKey(link.tagId)) continue
+                val linkKey = SyncTombstoneEntity.tagLinkId(link.notebookId, link.tagId)
+                if (tombstoneTime(SyncTombstoneEntity.TYPE_TAG_LINK, linkKey) != null) continue
+                linkSet.add(link)
+            }
+
+            val bookmarkMap = LinkedHashMap<String, BookmarkEntity>()
+            for (bm in local.bookmarks + remote.bookmarks) {
+                if (!notebookMap.containsKey(bm.notebookId) || !pageMap.containsKey(bm.pageId)) continue
+                if (isSuppressed(SyncTombstoneEntity.TYPE_BOOKMARK, bm.id, bm.createdAtEpochMs)) continue
+                bookmarkMap.putIfAbsent(bm.id, bm)
+            }
+
+            val ftsByPageId = LinkedHashMap<String, PageTextFtsEntity>()
+            for (fts in local.ftsEntries + remote.ftsEntries) {
+                if (!pageMap.containsKey(fts.pageId)) continue
+                // Prefer remote FTS when remote page won, otherwise keep latest non-blank entry.
+                val preferRemote = fts.pageId in dirtyRemotePageIds
+                val existing = ftsByPageId[fts.pageId]
+                if (existing == null || (preferRemote && remote.ftsEntries.contains(fts))) {
+                    ftsByPageId[fts.pageId] = fts
+                }
+            }
+
+            val mergedManifest = BackupManifest(
+                formatVersion = BackupManifest.CURRENT_MANIFEST_VERSION,
+                appVersion = remote.appVersion.ifBlank { local.appVersion },
+                createdAtEpochMs = maxOf(local.createdAtEpochMs, remote.createdAtEpochMs),
+                folders = folderMap.values.toList(),
+                notebooks = notebookMap.values.toList(),
+                chapters = chapterMap.values.toList(),
+                pages = pageMap.values.toList(),
+                tags = tagMap.values.toList(),
+                tagLinks = linkSet.toList(),
+                bookmarks = bookmarkMap.values.toList(),
+                ftsEntries = ftsByPageId.values.toList(),
+                tombstones = tombstonesByKey.values.toList()
+            )
+            return ManifestMergeResult(
+                mergedManifest = mergedManifest,
+                dirtyRemotePageIds = dirtyRemotePageIds,
+                deletedPageIds = deletedPageIds
+            )
+        }
 
         /**
          * Strict allowlist for backup entries: rejects directory traversal (`..`) and explicitly

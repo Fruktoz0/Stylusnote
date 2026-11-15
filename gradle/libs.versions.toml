@@ -24,6 +24,7 @@ jlatexmath = "0.2.0"
 
 # Networking (Gemini BYOK REST & WebDAV backup)
 okhttp = "4.12.0"
+playServicesAuth = "21.3.0"
 
 # Performance & Testing
 metricsPerformance = "1.0.0-beta02"
@@ -82,8 +83,9 @@ jlatexmath-android = { group = "ru.noties", name = "jlatexmath-android", version
 jlatexmath-android-font-cyrillic = { group = "ru.noties", name = "jlatexmath-android-font-cyrillic", version.ref = "jlatexmath" }
 jlatexmath-android-font-greek = { group = "ru.noties", name = "jlatexmath-android-font-greek", version.ref = "jlatexmath" }
 
-# OkHttp
+# OkHttp & Google Play Services Auth
 okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
+play-services-auth = { group = "com.google.android.gms", name = "play-services-auth", version.ref = "playServicesAuth" }
 
 # Metrics & Tests
 androidx-metrics-performance = { group = "androidx.metrics", name = "metrics-performance", version.ref = "metricsPerformance" }

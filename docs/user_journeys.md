@@ -124,3 +124,16 @@ flowchart TD
     P1["Bal oldalon függőlegesen eltolható LeftPagePullTab → LeftPageDrawer"] --> P2["Drag & Drop oldalsorrend, oldal átnevezése (Room v2 title) & + Új oldal létrehozása"]
 ```
 
+## 8. Inkrementális Felhőszinkron (Google Drive / WebDAV) és .zip Visszaállítás
+```mermaid
+flowchart LR
+    U["Füzet / Könyvespolc"] --> B1["Rövid koppintás a bal felső felhő ikonon<br/>(Első alkalommal vagy beállítás után azonnali szinkron)"]
+    U --> B2["Hosszú nyomás a füzetnév melletti<br/>vagy könyvespolc fejlécben lévő felhő ikonon"]
+    B2 --> D["CloudBackupDialog<br/>(ESC / háttérkattintás is zárja)"]
+    D --> GD["Google Drive (drive.file)<br/>Play Services OAuth → StylusNote Backups mappa"]
+    D --> WD["WebDAV (NAS / Nextcloud)<br/>URL + felhasználó + Keystore AES-GCM jelszó"]
+    D --> ZIP["Helyi / SAF .zip<br/>Export (.zip) & Import (.zip)"]
+    GD & WD --> SCH["CloudSyncScheduler<br/>Okos automata: lap/füzetváltás + onStop + 3p nyugalmi idő<br/>vagy Energiatakarékos (30p) / Kézi (+ Wi-Fi opció)"]
+    SCH --> ENG["CloudSyncEngine<br/>Room v3 tombstone + SHA-256 delta szinkron<br/>Csak módosult oldalak és fájlok feltöltése/letöltése"]
+```
+

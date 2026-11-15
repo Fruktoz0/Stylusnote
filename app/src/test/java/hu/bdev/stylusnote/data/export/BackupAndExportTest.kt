@@ -11,6 +11,7 @@ import hu.bdev.stylusnote.data.local.NotebookTagCrossRef
 import hu.bdev.stylusnote.data.local.PageEntity
 import hu.bdev.stylusnote.data.local.PageTextFtsEntity
 import hu.bdev.stylusnote.data.local.StrokeJournal
+import hu.bdev.stylusnote.data.local.SyncTombstoneEntity
 import hu.bdev.stylusnote.data.local.TagEntity
 import hu.bdev.stylusnote.domain.model.BrushConfig
 import hu.bdev.stylusnote.domain.model.BrushToolType
@@ -125,11 +126,29 @@ class BackupAndExportTest {
                 )
             ),
             chapters = listOf(ChapterEntity("ch-1", nbId, "Integrálszámítás", 0, 100L)),
-            pages = listOf(PageEntity(pageId, nbId, "ch-1", 0, createdAtEpochMs = 100L, updatedAtEpochMs = 300L)),
+            pages = listOf(
+                PageEntity(
+                    id = pageId,
+                    notebookId = nbId,
+                    chapterId = "ch-1",
+                    pageIndexInNotebook = 0,
+                    title = "1. előadás: Határértékek",
+                    createdAtEpochMs = 100L,
+                    updatedAtEpochMs = 300L
+                )
+            ),
             tags = listOf(TagEntity("tag-1", "Matek", 0xFF1E88E5.toInt())),
             tagLinks = listOf(NotebookTagCrossRef(nbId, "tag-1")),
             bookmarks = listOf(BookmarkEntity("bm-1", nbId, pageId, "Fontos tétel", createdAtEpochMs = 150L)),
-            ftsEntries = listOf(PageTextFtsEntity(pageId, nbId, "Tükörfúrógép", "tukorfurogep"))
+            ftsEntries = listOf(PageTextFtsEntity(pageId, nbId, "Tükörfúrógép", "tukorfurogep")),
+            tombstones = listOf(
+                SyncTombstoneEntity(
+                    compositeKey = SyncTombstoneEntity.key(SyncTombstoneEntity.TYPE_PAGE, "deleted-old-page"),
+                    entityType = SyncTombstoneEntity.TYPE_PAGE,
+                    entityId = "deleted-old-page",
+                    deletedAtEpochMs = 250L
+                )
+            )
         )
 
         val srcBackup = BackupManager(filesDir = sourceFilesDir)
@@ -204,6 +223,120 @@ class BackupAndExportTest {
         val polygon = loops.first()
         assertTrue("Expected closed polygon with >= 6 vertices", polygon.size >= 6)
         assertTrue(polygon.all { it.xPt.isFinite() && it.yPt.isFinite() })
+    }
+
+    @Test
+    fun legacyV1ManifestDecodesCleanlyAndPreservesAllFieldsWhenReencodedAsV2() {
+        val mgr = BackupManager(filesDir = sourceFilesDir)
+        val v1Manifest = BackupManifest(
+            formatVersion = BackupManifest.MANIFEST_VERSION_V1,
+            createdAtEpochMs = 5000L,
+            notebooks = listOf(
+                NotebookEntity(
+                    id = "nb-v1",
+                    title = "Régi v1 füzet",
+                    createdAtEpochMs = 100L,
+                    updatedAtEpochMs = 200L
+                )
+            ),
+            pages = listOf(
+                PageEntity(
+                    id = "pg-v1",
+                    notebookId = "nb-v1",
+                    pageIndexInNotebook = 0,
+                    title = null,
+                    createdAtEpochMs = 100L,
+                    updatedAtEpochMs = 200L
+                )
+            )
+        )
+
+        val encodedV1 = mgr.encodeManifest(v1Manifest)
+        val decodedV1 = mgr.decodeManifest(encodedV1)
+
+        assertEquals(BackupManifest.MANIFEST_VERSION_V1, decodedV1.formatVersion)
+        assertEquals(1, decodedV1.pages.size)
+        assertEquals(null, decodedV1.pages.single().title)
+        assertTrue(decodedV1.tombstones.isEmpty())
+    }
+
+    @Test
+    fun mergeManifestsUsesLastWriteWinsAndSuppressesTombstonedEntities() {
+        val local = BackupManifest(
+            notebooks = listOf(
+                NotebookEntity(id = "nb-keep", title = "Helyi újabb", createdAtEpochMs = 100L, updatedAtEpochMs = 500L),
+                NotebookEntity(id = "nb-old", title = "Régi cím", createdAtEpochMs = 100L, updatedAtEpochMs = 200L)
+            ),
+            pages = listOf(
+                PageEntity(id = "pg-1", notebookId = "nb-keep", pageIndexInNotebook = 0, title = "Régi", createdAtEpochMs = 100L, updatedAtEpochMs = 200L),
+                PageEntity(id = "pg-del", notebookId = "nb-keep", pageIndexInNotebook = 1, title = "Törlendő", createdAtEpochMs = 100L, updatedAtEpochMs = 300L)
+            )
+        )
+        val remote = BackupManifest(
+            notebooks = listOf(
+                NotebookEntity(id = "nb-keep", title = "Távoli régebbi", createdAtEpochMs = 100L, updatedAtEpochMs = 400L),
+                NotebookEntity(id = "nb-old", title = "Új távoli cím", createdAtEpochMs = 100L, updatedAtEpochMs = 600L)
+            ),
+            pages = listOf(
+                PageEntity(id = "pg-1", notebookId = "nb-keep", pageIndexInNotebook = 0, title = "Frissített", createdAtEpochMs = 100L, updatedAtEpochMs = 650L),
+                PageEntity(id = "pg-2", notebookId = "nb-old", pageIndexInNotebook = 0, title = "Új oldal", createdAtEpochMs = 600L, updatedAtEpochMs = 600L)
+            ),
+            tombstones = listOf(
+                SyncTombstoneEntity(
+                    compositeKey = SyncTombstoneEntity.key(SyncTombstoneEntity.TYPE_PAGE, "pg-del"),
+                    entityType = SyncTombstoneEntity.TYPE_PAGE,
+                    entityId = "pg-del",
+                    deletedAtEpochMs = 700L
+                )
+            )
+        )
+
+        val merged = BackupManager.mergeManifests(local = local, remote = remote)
+
+        val notebooksById = merged.mergedManifest.notebooks.associateBy { it.id }
+        assertEquals("Helyi újabb", notebooksById["nb-keep"]?.title)
+        assertEquals("Új távoli cím", notebooksById["nb-old"]?.title)
+
+        val pagesById = merged.mergedManifest.pages.associateBy { it.id }
+        assertEquals("Frissített", pagesById["pg-1"]?.title)
+        assertFalse(pagesById.containsKey("pg-del"))
+        assertTrue(pagesById.containsKey("pg-2"))
+        assertEquals(setOf("pg-1", "pg-2"), merged.dirtyRemotePageIds)
+        assertEquals(setOf("pg-del"), merged.deletedPageIds)
+    }
+
+    @Test
+    fun deltaSubdirZipIsDeterministicAndRejectsTraversalEntries() = runBlocking {
+        val pageDir = File(sourceFilesDir, "pages/pg-delta").apply { mkdirs() }
+        File(pageDir, "page.snote").writeBytes(byteArrayOf(1, 2, 3, 4))
+        File(pageDir, "images/pic.png").apply {
+            parentFile?.mkdirs()
+            writeBytes(byteArrayOf(9, 8, 7))
+        }
+
+        val srcMgr = BackupManager(filesDir = sourceFilesDir)
+        val zipA = srcMgr.packageRelativeSubdirToZipBytes("pages/pg-delta")!!
+        val zipB = srcMgr.packageRelativeSubdirToZipBytes("pages/pg-delta")!!
+        assertEquals(BackupManager.sha256Hex(zipA), BackupManager.sha256Hex(zipB))
+
+        // Inject an entry outside allowedPrefix to confirm prefix isolation.
+        val tampered = ByteArrayOutputStream().use { baos ->
+            ZipOutputStream(baos).use { zos ->
+                zos.putNextEntry(ZipEntry("pages/pg-delta/page.snote"))
+                zos.write(byteArrayOf(1, 2, 3, 4))
+                zos.closeEntry()
+                zos.putNextEntry(ZipEntry("pages/other-page/evil.snote"))
+                zos.write(byteArrayOf(5, 5))
+                zos.closeEntry()
+            }
+            baos.toByteArray()
+        }
+
+        val dstMgr = BackupManager(filesDir = targetFilesDir)
+        val restoredCount = dstMgr.extractRelativeSubdirZipBytes(tampered, "pages/pg-delta")
+        assertEquals(1, restoredCount)
+        assertTrue(File(targetFilesDir, "pages/pg-delta/page.snote").exists())
+        assertFalse(File(targetFilesDir, "pages/other-page/evil.snote").exists())
     }
 }
 

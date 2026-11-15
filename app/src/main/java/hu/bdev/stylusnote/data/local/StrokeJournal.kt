@@ -68,7 +68,8 @@ class StrokeJournal(
     private val fsyncDebounceMs: Long = DEFAULT_FSYNC_INTERVAL_MS,
     private val writerDispatcher: CoroutineDispatcher = Dispatchers.IO.limitedParallelism(1),
     private val activeBrushConfigProvider: () -> BrushConfig = { BrushConfig() },
-    private val shapeMetaProvider: (String) -> ShapeMeta? = { null }
+    private val shapeMetaProvider: (String) -> ShapeMeta? = { null },
+    private val onMutationCommitted: () -> Unit = {}
 ) : JournalCommitSink {
 
     val snapshotFile: File get() = File(pageDirectory, SNAPSHOT_FILE_NAME)
@@ -93,6 +94,16 @@ class StrokeJournal(
     @Volatile
     var sourceFormatVersion: Int = PageFileFormat.CURRENT_FORMAT_VERSION
         private set
+
+    @Volatile
+    var hasLocalMutationsSinceOpen: Boolean = false
+        private set
+
+    fun consumeLocalMutationsFlag(): Boolean {
+        val had = hasLocalMutationsSinceOpen
+        hasLocalMutationsSinceOpen = false
+        return had
+    }
 
     /**
      * Loads `page.snote` (if present), applies [FormatMigrator], replays valid `page.journal`
@@ -436,7 +447,9 @@ class StrokeJournal(
             } else {
                 scheduleDebouncedFsyncLocked()
             }
+            hasLocalMutationsSinceOpen = true
         }
+        onMutationCommitted()
     }
 
     private fun scheduleDebouncedFsyncLocked() {

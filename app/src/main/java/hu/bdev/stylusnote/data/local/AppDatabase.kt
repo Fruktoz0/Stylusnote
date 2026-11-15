@@ -263,6 +263,44 @@ data class PageTextFtsEntity(
     val asciiFoldedText: String
 )
 
+/**
+ * Tombstone tracking intentional deletions of folders, notebooks, chapters, pages, tags,
+ * tag links, and bookmarks so cloud sync never resurrects deleted items across devices.
+ */
+@Entity(tableName = "sync_tombstones")
+data class SyncTombstoneEntity(
+    @PrimaryKey val compositeKey: String,
+    val entityType: String,
+    val entityId: String,
+    val deletedAtEpochMs: Long
+) {
+    companion object {
+        const val TYPE_FOLDER: String = "folder"
+        const val TYPE_NOTEBOOK: String = "notebook"
+        const val TYPE_CHAPTER: String = "chapter"
+        const val TYPE_PAGE: String = "page"
+        const val TYPE_TAG: String = "tag"
+        const val TYPE_TAG_LINK: String = "tag_link"
+        const val TYPE_BOOKMARK: String = "bookmark"
+
+        fun key(entityType: String, entityId: String): String = "$entityType:$entityId"
+
+        fun tagLinkId(notebookId: String, tagId: String): String = "$notebookId|$tagId"
+    }
+}
+
+/**
+ * Per-asset SHA-256 sync ledger used by incremental cloud backup so unchanged pages, PDFs,
+ * and covers are skipped cleanly without re-uploading untouched blobs.
+ */
+@Entity(tableName = "cloud_synced_assets")
+data class CloudSyncedAssetEntity(
+    @PrimaryKey val assetPath: String,
+    val contentHashSha256: String,
+    val remoteFileId: String? = null,
+    val lastSyncedEpochMs: Long
+)
+
 data class PageSearchHit(
     val pageId: String,
     val notebookId: String,
@@ -394,6 +432,9 @@ interface PageDao {
     @Query("UPDATE pages SET title = :title, updatedAtEpochMs = :updatedAtMs WHERE id = :pageId")
     suspend fun renamePage(pageId: String, title: String?, updatedAtMs: Long)
 
+    @Query("UPDATE pages SET updatedAtEpochMs = :updatedAtMs WHERE id = :pageId")
+    suspend fun touchPageTimestamp(pageId: String, updatedAtMs: Long)
+
     @Transaction
     suspend fun reorderPagesInNotebook(
         notebookId: String,
@@ -506,11 +547,47 @@ interface PageTextSearchDao {
     @Query("SELECT rawText FROM page_text_fts WHERE notebookId = :notebookId")
     suspend fun getRecognizedTextsForNotebook(notebookId: String): List<String>
 
+    @Query("SELECT pageId, notebookId, rawText, asciiFoldedText FROM page_text_fts")
+    suspend fun getAllFtsEntries(): List<PageTextFtsEntity>
+
     suspend fun searchAccentInsensitive(userQuery: String): List<PageSearchHit> {
         val matchExpr = AccentNormalizer.buildFts4MatchQuery(userQuery)
         if (matchExpr.isEmpty()) return emptyList()
         return searchRawMatch(matchExpr)
     }
+}
+
+@Dao
+interface SyncMetadataDao {
+    @Query("SELECT * FROM sync_tombstones ORDER BY deletedAtEpochMs DESC")
+    suspend fun getAllTombstones(): List<SyncTombstoneEntity>
+
+    @Upsert
+    suspend fun upsertTombstone(tombstone: SyncTombstoneEntity)
+
+    @Upsert
+    suspend fun upsertTombstones(tombstones: List<SyncTombstoneEntity>)
+
+    @Query("DELETE FROM sync_tombstones WHERE compositeKey = :compositeKey")
+    suspend fun deleteTombstone(compositeKey: String)
+
+    @Query("DELETE FROM sync_tombstones WHERE deletedAtEpochMs < :cutoffEpochMs")
+    suspend fun pruneTombstonesBefore(cutoffEpochMs: Long)
+
+    @Query("SELECT * FROM cloud_synced_assets")
+    suspend fun getAllSyncedAssets(): List<CloudSyncedAssetEntity>
+
+    @Query("SELECT * FROM cloud_synced_assets WHERE assetPath = :assetPath LIMIT 1")
+    suspend fun getSyncedAsset(assetPath: String): CloudSyncedAssetEntity?
+
+    @Upsert
+    suspend fun upsertSyncedAsset(asset: CloudSyncedAssetEntity)
+
+    @Query("DELETE FROM cloud_synced_assets WHERE assetPath = :assetPath")
+    suspend fun deleteSyncedAsset(assetPath: String)
+
+    @Query("DELETE FROM cloud_synced_assets")
+    suspend fun clearAllSyncedAssets()
 }
 
 /**
@@ -526,9 +603,11 @@ interface PageTextSearchDao {
         TagEntity::class,
         NotebookTagCrossRef::class,
         BookmarkEntity::class,
-        PageTextFtsEntity::class
+        PageTextFtsEntity::class,
+        SyncTombstoneEntity::class,
+        CloudSyncedAssetEntity::class
     ],
-    version = 2,
+    version = 3,
     exportSchema = true
 )
 @TypeConverters(StylusNoteDatabaseConverters::class)
@@ -540,6 +619,43 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun tagDao(): TagDao
     abstract fun bookmarkDao(): BookmarkDao
     abstract fun pageTextSearchDao(): PageTextSearchDao
+    abstract fun syncMetadataDao(): SyncMetadataDao
+
+    /**
+     * Deletes an entity while atomically recording a [SyncTombstoneEntity] so cloud sync
+     * propagates intentional deletions across devices without resurrecting old rows.
+     */
+    suspend fun deleteWithTombstone(
+        entityType: String,
+        entityId: String,
+        deletedAtMs: Long = System.currentTimeMillis()
+    ) {
+        when (entityType) {
+            SyncTombstoneEntity.TYPE_FOLDER -> folderDao().deleteFolderById(entityId)
+            SyncTombstoneEntity.TYPE_NOTEBOOK -> notebookDao().deleteNotebookById(entityId)
+            SyncTombstoneEntity.TYPE_CHAPTER -> chapterDao().deleteChapterById(entityId)
+            SyncTombstoneEntity.TYPE_PAGE -> pageDao().deletePageById(entityId)
+            SyncTombstoneEntity.TYPE_TAG -> tagDao().deleteTagById(entityId)
+            SyncTombstoneEntity.TYPE_BOOKMARK -> bookmarkDao().deleteBookmarkById(entityId)
+            SyncTombstoneEntity.TYPE_TAG_LINK -> {
+                val sep = entityId.indexOf('|')
+                if (sep > 0) {
+                    tagDao().detachTagFromNotebook(
+                        notebookId = entityId.substring(0, sep),
+                        tagId = entityId.substring(sep + 1)
+                    )
+                }
+            }
+        }
+        syncMetadataDao().upsertTombstone(
+            SyncTombstoneEntity(
+                compositeKey = SyncTombstoneEntity.key(entityType, entityId),
+                entityType = entityType,
+                entityId = entityId,
+                deletedAtEpochMs = deletedAtMs
+            )
+        )
+    }
 
     companion object {
         const val DATABASE_NAME: String = "stylusnote.db"
@@ -554,9 +670,39 @@ abstract class AppDatabase : RoomDatabase() {
         }
 
         /**
-         * Explicit forward migration registry (`v1 -> v2`, etc.). Destructive fallback is never enabled.
+         * Adds incremental cloud sync tables (`sync_tombstones`, `cloud_synced_assets`) for v3.
          */
-        val ALL_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_1_2)
+        val MIGRATION_2_3: Migration = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `sync_tombstones` (
+                        `compositeKey` TEXT NOT NULL,
+                        `entityType` TEXT NOT NULL,
+                        `entityId` TEXT NOT NULL,
+                        `deletedAtEpochMs` INTEGER NOT NULL,
+                        PRIMARY KEY(`compositeKey`)
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `cloud_synced_assets` (
+                        `assetPath` TEXT NOT NULL,
+                        `contentHashSha256` TEXT NOT NULL,
+                        `remoteFileId` TEXT,
+                        `lastSyncedEpochMs` INTEGER NOT NULL,
+                        PRIMARY KEY(`assetPath`)
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
+        /**
+         * Explicit forward migration registry (`v1 -> v2 -> v3`). Destructive fallback is never enabled.
+         */
+        val ALL_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_1_2, MIGRATION_2_3)
 
         @Volatile
         private var instance: AppDatabase? = null

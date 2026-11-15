@@ -36,6 +36,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import hu.bdev.stylusnote.data.export.CloudSyncScheduler
 import hu.bdev.stylusnote.data.local.AppDatabase
 import hu.bdev.stylusnote.data.local.NotebookEntity
 import hu.bdev.stylusnote.data.local.PageEntity
@@ -100,6 +101,11 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         applyImmersiveFullscreen()
         configureHighRefreshRateDisplay()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        CloudSyncScheduler.onAppBackgrounded(this)
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -238,6 +244,7 @@ private fun StylusNoteAppRoot(
                     )
                 )
             }
+            CloudSyncScheduler.syncPeriodicSchedule(context)
         }
     }
 

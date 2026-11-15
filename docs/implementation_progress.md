@@ -179,13 +179,13 @@ Ez a dokumentum a `stylusnote_rendszerterv_v2.txt` alapján készült **17 lép�
 
 ## 3. Elfogadási Kritériumok (11. Fejezet)
 
-- [x] **Frame time:** p95 ≤ 6,94 ms pan/zoom közben 10 000 vonalas oldalon Xiaomi Pad 8-on *(Mérve `25097RP43G` tableten a `panAndZoom10kStrokesCanvasFrameTiming` 5-iterációs 10 000 vonalas benchmarkkal az V. ütem végső javításai után: `frameDurationCpuMs` **P50 = `4,50 ms`**, **P90 = `5,81 ms`**, **P95 = `6,47 ms`**, **P99 = `7,58 ms`**; `frameOverrunMs` **P50 = `-7,14 ms`**, **P90 = `-5,77 ms`**, **P95 = `-5,35 ms`**, **P99 = `-3,85 ms`**, medián `120,0` képkocka ✅)*
+- [x] **Frame time:** p95 ≤ 6,94 ms pan/zoom közben 10 000 vonalas oldalon Xiaomi Pad 8-on *(Mérve `25097RP43G` tableten a `panAndZoom10kStrokesCanvasFrameTiming` 5-iterációs 10 000 vonalas benchmarkkal a VI. ütem végezetén: `frameDurationCpuMs` **P50 = `4,55 ms`**, **P90 = `5,88 ms`**, **P95 = `6,48 ms`**, **P99 = `9,03 ms`**; `frameOverrunMs` **P50 = `-7,05 ms`**, **P90 = `-5,73 ms`**, **P95 = `-5,34 ms`**, **P99 = `-2,22 ms`**, medián `119,0` képkocka ✅)*
 - [ ] **Pontosság:** Tollhegy–tinta eltérés 400%-os nagyításnál ≤ 1 px *(Alap: `CanvasTransformMatrix` 400% teszt 10/10 `connectedDebugAndroidTest`-ben sikeres, `concat(matrix)` csempejavítás alkalmazva; kézi stylus / vizuális próba hátravan)*
 - [ ] **Memória:** 50 000 vonallal sincs OOM; raszter cache ≤ 192 MB *(Készüléken ellenőrzendő)*
 - [ ] **Betöltés:** 10 000 vonalas oldal megnyitása ≤ 1 s *(Készüléken ellenőrzendő)*
 - [ ] **Adatbiztonság:** Automatizált process-kill teszt rajzolás közben ≤ 1 s adatvesztéssel, hibátlan journal visszajátszás *(`StrokeJournal` truncated-tail recovery `connectedDebugAndroidTest`-ben sikeres; élő UI process-kill próba hátravan)*
 - [ ] **Round-trip:** Serializer, journal és backup/restore után azonos vonalak *(JVM `StrokeJournalRoundTripTest` 7/7 és `BackupAndExportTest` 3/3 sikeres; eszközön történő integrációs ellenőrzés hátravan)*
-- [x] **JVM Unit tesztek (`testDebugUnitTest` — 17 osztály, 85 teszt, 0 hiba, 0 kihagyás):**
+- [x] **JVM Unit tesztek (`testDebugUnitTest` — 19 osztály, 95 teszt, 0 hiba, 0 kihagyás):**
   - [x] `CanvasTransformMatrixTest` (7)
   - [x] `OneEuroFilterTest` (6)
   - [x] `SpatialIndexTest` (4, brute-force összevetés)
@@ -195,7 +195,9 @@ Ez a dokumentum a `stylusnote_rendszerterv_v2.txt` alapján készült **17 lép�
   - [x] `CanvasStateHolderTest` (6 tiszta Kotlin teszt; az 5 natív `libink.so` JNI teszt áthelyezve `StylusNoteInstrumentedValidationTest`-be)
   - [x] `StrokeJournalRoundTripTest` (7)
   - [x] `FtsAccentInsensitiveTest` (3)
-  - [x] `BackupAndExportTest` (3)
+  - [x] `BackupAndExportTest` (6)
+  - [x] `CloudSyncEngineTest` (3)
+  - [x] `CloudSyncSchedulerTest` (4)
   - [x] `GeminiClientAndCatalogTest` (4)
   - [x] `OcrLineSegmenterTest` (2)
   - [x] `FunctionEvaluatorTest` (3)
@@ -203,7 +205,7 @@ Ez a dokumentum a `stylusnote_rendszerterv_v2.txt` alapján készült **17 lép�
   - [x] `ToolDockPlacementTest` (6)
   - [x] `PageSelectionParserTest` (4)
   - [x] `FixedPageScrollNavigationTest` (8)
-- [x] **Műszerezett (`androidTest`) tesztek (`:app:connectedDebugAndroidTest`):** 10/10 teszt sikeres (`TEST-25097RP43G - 16-_app-.xml`, `0` hiba, `0` kihagyás, benne az 5 natív `libink.so` Ink JNI teszttel, a `Room` v1→v2 migrációs teszttel és az `@Upsert` kaszkád-regressziós teszttel)
+- [x] **Műszerezett (`androidTest`) tesztek (`:app:connectedDebugAndroidTest`):** 13/13 teszt sikeres (`TEST-25097RP43G - 16-_app-.xml`, `0` hiba, `0` kihagyás, benne az 5 natív `libink.so` Ink JNI teszttel, a `Room` migrációs tesztekkel, az `@Upsert` kaszkád-regressziós teszttel és a `CloudSyncUiAndDatabaseInstrumentedTest` Room v3 + UI tesztekkel)
 - [x] **V. ÜTEM – Lépés 40–47 (nyomonkövetés):**
   - [x] Lépés 40 – Diagnózis tableten (új oldal `@Upsert`/`CASCADE` fix ellenőrizve `2/2` oldallal, tenyér + késő tinta kiváltó okai azonosítva)
   - [x] Lépés 41 – Új oldal javítás + oldalnevek (`PageEntity.title`, `Migration(1,2)`, átnevezés a fiókban, `Room` v2 séma)
@@ -213,4 +215,10 @@ Ez a dokumentum a `stylusnote_rendszerterv_v2.txt` alapján készült **17 lép�
   - [x] Lépés 45 – Folyamatosan széthúzható ecsetpaletta (`Animatable` `312..472 dp` + `progressiveStudioReveal`), dinamikus külső alsó sarok-fogantyú
   - [x] Lépés 46 – Vektoros adaptív app ikon (1-es verzió: Swiss töltőtollhegy & tintaív `ic_launcher_*` vektorok + manifest bekötés)
   - [x] Lépés 47 – Verifikáció (`85/85` unit, `10/10` androidTest, `P95 = 6,47 ms` 144 Hz benchmark, APK telepítés + ikon vizuális ellenőrzés) & dokumentáció frissítve
+- [x] **VI. ÜTEM – Lépés 48–52 (Felhőszinkron & Biztonsági Mentés nyomonkövetés):**
+  - [x] Lépés 48 – `BackupManager v2` (`PageEntity.title` + FTS + tombstones) & `Room v3` (`sync_tombstones`, `cloud_synced_assets`, `MIGRATION_2_3`)
+  - [x] Lépés 49 – `CloudSyncBackend` (Google Drive REST v3 `drive.file` + Play Services `AuthorizationClient` & WebDAV) + `CloudSyncEngine` (inkrementális delta feltöltés/letöltés)
+  - [x] Lépés 50 – `CloudSyncScheduler` & `CloudSyncWorker` („Okos automata”: oldal/füzetváltás + `onStop` + 3 perces nyugalmi idő + választható 30p/kézi/Wi-Fi módok)
+  - [x] Lépés 51 – Felhő UI integráció (`CanvasTopToolbar` füzetnév melletti felhő ikon hosszan nyitható beállító menüvel, Könyvespolc fejléc-visszaállítás, `.zip` SAF export/import)
+  - [x] Lépés 52 – Teljes verifikáció (`95/95` unit, `13/13` androidTest, `P95 = 6,48 ms` 144 Hz benchmark, `installDebug` + tabletes dialógus/ESC vizuális ellenőrzés) + dokumentáció & Google Cloud OAuth beállítási útmutató
 - [x] **Lépés 39 (`Többoldalas oldallétrehozás, lapváltás és függőleges görgetés javítása`):** `NotebookPagePane` (`key(target.notebookId, target.pageId)`) és `AndroidView` (`key(transformMatrix, dryStrokeStore, dryInkRasterCache, journalCommitSink)`) állapotkötés javítása, `!usedComposite &&` eltávolítása a szomszédos lap-előnézetről (`StylusDrawingSurface.kt`), skálafüggő `resolveFixedPageScrollNavigation` küszöb, füzetszintű eszköz/teljes képernyő állapot kiemelése `NotebookWorkspaceScreen`-be, valamint frissített APK telepítése `25097RP43G`-re.

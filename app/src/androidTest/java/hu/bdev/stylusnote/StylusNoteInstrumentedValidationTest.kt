@@ -93,6 +93,51 @@ class StylusNoteInstrumentedValidationTest {
         context.deleteDatabase(dbName)
     }
 
+    @Test
+    fun migration2To3CreatesSyncTablesWithoutDataLoss() {
+        val dbName = "migration-v2-v3-test.db"
+        context.deleteDatabase(dbName)
+        migrationHelper.createDatabase(dbName, 2).apply {
+            execSQL(
+                """
+                INSERT INTO notebooks (id, title, isFavorite, defaultCanvasMode, defaultPageSizePreset, defaultTemplateType, ocrLanguage, createdAtEpochMs, updatedAtEpochMs, cover_texture, cover_primaryColorArgb, cover_spineColorArgb, cover_labelLayout, cover_typography, cover_subtitle)
+                VALUES ('nb-m2', 'Felhő füzet', 0, 'FIXED_PAGE', 'A4_PORTRAIT', 'GRID_5MM', 'HU', 1000, 1000, 'SOLID_MATTE', -13936540, -14991780, 'CENTERED', 'MODERN_SANS', '')
+                """.trimIndent()
+            )
+            execSQL(
+                """
+                INSERT INTO pages (id, notebookId, pageIndexInNotebook, title, canvasMode, pageSizePreset, templateType, invertPdfInOledMode, snapshotRelativePath, journalRelativePath, needsOcrSync, createdAtEpochMs, updatedAtEpochMs)
+                VALUES ('pg-m2', 'nb-m2', 0, 'Előadás 1', 'FIXED_PAGE', 'A4_PORTRAIT', 'GRID_5MM', 1, 'pages/pg-m2/page.snote', 'pages/pg-m2/page.journal', 0, 1000, 1000)
+                """.trimIndent()
+            )
+            close()
+        }
+        val migratedDb = migrationHelper.runMigrationsAndValidate(
+            dbName,
+            3,
+            true,
+            AppDatabase.MIGRATION_2_3
+        )
+        migratedDb.query("SELECT title FROM pages WHERE id = 'pg-m2'").use { c ->
+            assertTrue(c.moveToFirst())
+            assertEquals("Előadás 1", c.getString(0))
+        }
+        migratedDb.execSQL(
+            """
+            INSERT INTO sync_tombstones (compositeKey, entityType, entityId, deletedAtEpochMs)
+            VALUES ('page:old-1', 'page', 'old-1', 2000)
+            """.trimIndent()
+        )
+        migratedDb.execSQL(
+            """
+            INSERT INTO cloud_synced_assets (assetPath, contentHashSha256, remoteFileId, lastSyncedEpochMs)
+            VALUES ('pages/pg-m2', 'abc123', 'drive-file-1', 2000)
+            """.trimIndent()
+        )
+        migratedDb.close()
+        context.deleteDatabase(dbName)
+    }
+
     /**
      * Regression: `@Insert(REPLACE)` deletes+reinserts the parent row, which fired
      * `ON DELETE CASCADE` and wiped every page whenever `lastOpenedPageId` was updated

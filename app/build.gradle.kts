@@ -109,8 +109,9 @@ dependencies {
     implementation(libs.jlatexmath.android.font.cyrillic)
     implementation(libs.jlatexmath.android.font.greek)
 
-    // Networking & Performance
+    // Networking & Cloud Sync Auth
     implementation(libs.okhttp)
+    implementation(libs.play.services.auth)
     implementation(libs.androidx.metrics.performance)
 
     // Unit & Instrumented Tests

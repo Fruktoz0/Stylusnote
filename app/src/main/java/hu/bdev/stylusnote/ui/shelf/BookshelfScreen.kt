@@ -150,6 +150,7 @@ import hu.bdev.stylusnote.core.math.DocRect
 import hu.bdev.stylusnote.core.math.OledStrokeRenderCache
 import hu.bdev.stylusnote.core.math.ShapeMeta
 import hu.bdev.stylusnote.core.math.ShapeRecognizer
+import hu.bdev.stylusnote.data.export.CloudSyncScheduler
 import hu.bdev.stylusnote.data.export.ExportablePdfPage
 import hu.bdev.stylusnote.data.export.PdfExportManager
 import hu.bdev.stylusnote.data.export.PdfTileRenderer
@@ -163,6 +164,7 @@ import hu.bdev.stylusnote.data.local.PageEntity
 import hu.bdev.stylusnote.data.local.PageSearchHit
 import hu.bdev.stylusnote.data.local.StrokeBinarySerializer
 import hu.bdev.stylusnote.data.local.StrokeJournal
+import hu.bdev.stylusnote.data.local.SyncTombstoneEntity
 import hu.bdev.stylusnote.data.local.TagEntity
 import hu.bdev.stylusnote.domain.model.BrushConfig
 import hu.bdev.stylusnote.domain.model.BrushToolType
@@ -314,6 +316,7 @@ fun BookshelfScreen(
     var pdfImportTargetNotebook by remember { mutableStateOf<NotebookEntity?>(null) }
     var notebookLmExportTarget by remember { mutableStateOf<NotebookEntity?>(null) }
     var bookPdfExportTarget by remember { mutableStateOf<NotebookEntity?>(null) }
+    var showCloudBackupDialog by remember { mutableStateOf(false) }
     var shelfNoticeHu by remember { mutableStateOf<String?>(null) }
 
     val bookExportLauncher = rememberLauncherForActivityResult(
@@ -503,19 +506,30 @@ fun BookshelfScreen(
                             color = MaterialTheme.colorScheme.onSurface
                         )
                     }
-                    Surface(
-                        onClick = onToggleTheme,
-                        shape = CircleShape,
-                        color = MaterialTheme.colorScheme.surface,
-                        modifier = Modifier.size(34.dp)
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Icon(
-                                imageVector = if (isDarkTheme) Icons.Filled.LightMode else Icons.Filled.DarkMode,
-                                contentDescription = "Téma váltása",
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.size(18.dp)
-                            )
+                        CloudSyncStatusBadgeButton(
+                            onOpenSettingsDialog = { showCloudBackupDialog = true },
+                            size = 34.dp,
+                            containerColor = MaterialTheme.colorScheme.surface,
+                            onQuickSyncTriggered = { shelfNoticeHu = it }
+                        )
+                        Surface(
+                            onClick = onToggleTheme,
+                            shape = CircleShape,
+                            color = MaterialTheme.colorScheme.surface,
+                            modifier = Modifier.size(34.dp)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    imageVector = if (isDarkTheme) Icons.Filled.LightMode else Icons.Filled.DarkMode,
+                                    contentDescription = "Téma váltása",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
                         }
                     }
                 }
@@ -685,7 +699,8 @@ fun BookshelfScreen(
                                                     )
                                                 )
                                             }
-                                        database.folderDao().deleteFolderById(folder.id)
+                                        database.deleteWithTombstone(SyncTombstoneEntity.TYPE_FOLDER, folder.id)
+                                        CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
                                     }
                                 },
                                 modifier = Modifier.onGloballyPositioned { coords ->
@@ -914,7 +929,8 @@ fun BookshelfScreen(
                                         IconButton(
                                             onClick = {
                                                 scope.launch(Dispatchers.IO) {
-                                                    database.bookmarkDao().deleteBookmarkById(bm.id)
+                                                    database.deleteWithTombstone(SyncTombstoneEntity.TYPE_BOOKMARK, bm.id)
+                                                    CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
                                                 }
                                             }
                                         ) {
@@ -1110,7 +1126,8 @@ fun BookshelfScreen(
                                                 onClick = {
                                                     menuExpanded = false
                                                     scope.launch(Dispatchers.IO) {
-                                                        database.notebookDao().deleteNotebookById(notebook.id)
+                                                        database.deleteWithTombstone(SyncTombstoneEntity.TYPE_NOTEBOOK, notebook.id)
+                                                        CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
                                                     }
                                                 }
                                             )
@@ -1192,6 +1209,7 @@ fun BookshelfScreen(
                             updatedAtEpochMs = now
                         )
                     )
+                    CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
                 }
                 showNewFolderDialog = false
             },
@@ -1253,6 +1271,7 @@ fun BookshelfScreen(
                             updatedAtEpochMs = now
                         )
                     )
+                    CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
                 }
                 creatingNewNotebook = false
             },
@@ -1282,6 +1301,7 @@ fun BookshelfScreen(
                             updatedAtEpochMs = System.currentTimeMillis()
                         )
                     )
+                    CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
                 }
                 editingNotebook = null
             },
@@ -1302,7 +1322,8 @@ fun BookshelfScreen(
             },
             onDeleteNotebook = {
                 scope.launch(Dispatchers.IO) {
-                    database.notebookDao().deleteNotebookById(nb.id)
+                    database.deleteWithTombstone(SyncTombstoneEntity.TYPE_NOTEBOOK, nb.id)
+                    CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
                 }
                 inspectingNotebook = null
             },
@@ -1333,6 +1354,14 @@ fun BookshelfScreen(
             notebook = targetNb,
             database = database,
             onDismiss = { notebookLmExportTarget = null }
+        )
+    }
+
+    if (showCloudBackupDialog) {
+        CloudBackupDialog(
+            database = database,
+            onDismiss = { showCloudBackupDialog = false },
+            onBackupNotice = { shelfNoticeHu = it }
         )
     }
 }
@@ -1654,6 +1683,7 @@ private fun NotebookDetailsDialog(
     onDismiss: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
     val pages by database.pageDao().observePagesForNotebook(notebook.id).collectAsState(initial = emptyList())
     val chapters by database.chapterDao().observeChapters(notebook.id).collectAsState(initial = emptyList())
     val bookmarks by database.bookmarkDao().observeBookmarksForNotebook(notebook.id).collectAsState(initial = emptyList())
@@ -1705,12 +1735,16 @@ private fun NotebookDetailsDialog(
                                 onClick = {
                                     scope.launch(Dispatchers.IO) {
                                         if (attached) {
-                                            database.tagDao().detachTagFromNotebook(notebook.id, tag.id)
+                                            database.deleteWithTombstone(
+                                                SyncTombstoneEntity.TYPE_TAG_LINK,
+                                                SyncTombstoneEntity.tagLinkId(notebook.id, tag.id)
+                                            )
                                         } else {
                                             database.tagDao().attachTagToNotebook(
                                                 NotebookTagCrossRef(notebook.id, tag.id)
                                             )
                                         }
+                                        CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
                                     }
                                 },
                                 label = { Text(tag.name) }
@@ -1807,7 +1841,10 @@ private fun NotebookDetailsDialog(
                                             scope.launch(Dispatchers.IO) {
                                                 if (isBookmarked) {
                                                     bookmarks.firstOrNull { it.pageId == page.id }?.let { existing ->
-                                                        database.bookmarkDao().deleteBookmarkById(existing.id)
+                                                        database.deleteWithTombstone(
+                                                            SyncTombstoneEntity.TYPE_BOOKMARK,
+                                                            existing.id
+                                                        )
                                                     }
                                                 } else {
                                                     database.bookmarkDao().upsertBookmark(
@@ -1820,6 +1857,7 @@ private fun NotebookDetailsDialog(
                                                         )
                                                     )
                                                 }
+                                                CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
                                             }
                                         }
                                     ) {
@@ -2053,6 +2091,7 @@ private fun NotebookPagePane(
     var showPaperSettings by remember(target) { mutableStateOf(false) }
     var showAiCopilot by remember(target) { mutableStateOf(false) }
     var showConsentDialog by remember(target) { mutableStateOf(false) }
+    var showCloudBackupDialog by remember(target) { mutableStateOf(false) }
     var selectedObjectId by remember(target) { mutableStateOf<String?>(null) }
     var discoveredFlashModels by remember { mutableStateOf<List<GeminiModelInfo>>(emptyList()) }
     var copilotNoticeBannerHu by remember(target) { mutableStateOf<String?>(null) }
@@ -2091,7 +2130,10 @@ private fun NotebookPagePane(
         StrokeJournal(
             pageDirectory = File(context.filesDir, "pages/${target.pageId}"),
             activeBrushConfigProvider = { latestBrushConfig },
-            shapeMetaProvider = { strokeId -> canvasStateHolder.getShapeMeta(strokeId) }
+            shapeMetaProvider = { strokeId -> canvasStateHolder.getShapeMeta(strokeId) },
+            onMutationCommitted = {
+                CloudSyncScheduler.notifyLocalMutation(context)
+            }
         )
     }
 
@@ -2410,21 +2452,39 @@ private fun NotebookPagePane(
         historyRevisionTick++
     }
 
+    var switchedWithinWorkspace by remember(target.pageId) { mutableStateOf(false) }
+
     DisposableEffect(lifecycleOwner, strokeJournal, target.pageId, benchmarkStrokeCount) {
         if (benchmarkStrokeCount > 0) {
             return@DisposableEffect onDispose {}
         }
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
+                val hadLocalEdits = strokeJournal.consumeLocalMutationsFlag()
                 strokeJournal.flushAndSyncBlocking()
                 BackgroundOcrWorker.enqueueForPage(context, target.pageId)
+                if (hadLocalEdits) {
+                    CloudSyncScheduler.onNotebookExit(
+                        context = context,
+                        database = database,
+                        editedPageId = target.pageId
+                    )
+                }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
+            val hadLocalEdits = strokeJournal.consumeLocalMutationsFlag()
             strokeJournal.closeBlocking(compactBeforeClose = !strokeJournal.isReadOnly)
             BackgroundOcrWorker.enqueueForPage(context, target.pageId)
+            if (!switchedWithinWorkspace) {
+                CloudSyncScheduler.onNotebookExit(
+                    context = context,
+                    database = if (hadLocalEdits) database else null,
+                    editedPageId = if (hadLocalEdits) target.pageId else null
+                )
+            }
         }
     }
 
@@ -2434,13 +2494,20 @@ private fun NotebookPagePane(
 
     fun switchToPage(nextPageId: String) {
         if (nextPageId == target.pageId) return
+        switchedWithinWorkspace = true
         coroutineScope.launch {
             withContext(Dispatchers.IO) {
+                val hadLocalEdits = strokeJournal.consumeLocalMutationsFlag()
                 strokeJournal.flushAndSync()
+                val now = System.currentTimeMillis()
+                if (hadLocalEdits) {
+                    database.pageDao().touchPageTimestamp(target.pageId, now)
+                }
                 database.notebookDao().getNotebookById(target.notebookId)?.let { nb ->
                     database.notebookDao().upsertNotebook(nb.copy(lastOpenedPageId = nextPageId))
                 }
             }
+            CloudSyncScheduler.onPageTransition(context)
             onSelectPageTarget(OpenedPageTarget(target.notebookId, nextPageId))
         }
     }
@@ -2498,6 +2565,9 @@ private fun NotebookPagePane(
                     copilotNoticeBannerHu = "A jegyzetfüzet nem található az adatbázisban."
                 } else {
                     val (newPageId, newPageNum) = createdPair
+                    switchedWithinWorkspace = true
+                    CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
+                    CloudSyncScheduler.onPageTransition(context)
                     onShowLeftPageDrawerChange(false)
                     onShowWorkspaceBanner("${newPageNum}. oldal létrehozva")
                     onSelectPageTarget(OpenedPageTarget(target.notebookId, newPageId))
@@ -2749,6 +2819,8 @@ private fun NotebookPagePane(
                 notebookTitle = notebookTitle,
                 zoomPercentProvider = { currentZoomPercent },
                 onBackToShelf = onBackToShelf,
+                onOpenCloudBackupDialog = { showCloudBackupDialog = true },
+                onCloudQuickSyncTriggered = { msg -> onShowWorkspaceBanner(msg) },
                 onZoomOut = { applyStepZoom(0.8f) },
                 onResetZoom = { fitPageToViewportNow() },
                 onZoomIn = { applyStepZoom(1.25f) },
@@ -3020,6 +3092,7 @@ private fun NotebookPagePane(
                             orderedPageIds = orderedIds,
                             updatedAtMs = System.currentTimeMillis()
                         )
+                        CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
                     }
                 },
                 onRenamePage = { pageId, newTitle ->
@@ -3030,6 +3103,7 @@ private fun NotebookPagePane(
                             title = sanitized,
                             updatedAtMs = System.currentTimeMillis()
                         )
+                        CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
                     }
                 },
                 onDismiss = { onShowLeftPageDrawerChange(false) }
@@ -3052,6 +3126,7 @@ private fun NotebookPagePane(
                                     updatedAtEpochMs = System.currentTimeMillis()
                                 )
                             )
+                            CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
                         }
                     }
                 },
@@ -3124,6 +3199,14 @@ private fun NotebookPagePane(
                 }
             )
         }
+
+        if (showCloudBackupDialog) {
+            CloudBackupDialog(
+                database = database,
+                onDismiss = { showCloudBackupDialog = false },
+                onBackupNotice = { msg -> onShowWorkspaceBanner(msg) }
+            )
+        }
     }
 }
 
@@ -3132,6 +3215,8 @@ private fun CanvasTopToolbar(
     notebookTitle: String,
     zoomPercentProvider: () -> Int,
     onBackToShelf: () -> Unit,
+    onOpenCloudBackupDialog: () -> Unit,
+    onCloudQuickSyncTriggered: (String) -> Unit,
     onZoomOut: () -> Unit,
     onResetZoom: () -> Unit,
     onZoomIn: () -> Unit,
@@ -3174,6 +3259,13 @@ private fun CanvasTopToolbar(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.widthIn(max = 260.dp)
+            )
+
+            CloudSyncStatusBadgeButton(
+                onOpenSettingsDialog = onOpenCloudBackupDialog,
+                size = 30.dp,
+                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.72f),
+                onQuickSyncTriggered = onCloudQuickSyncTriggered
             )
 
             VerticalDivider(
