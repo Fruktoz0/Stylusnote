@@ -100,6 +100,7 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -1884,7 +1885,6 @@ private fun NotebookPagePane(
     var shapeStrokeWidthPt by remember { mutableStateOf(1.6f) }
     var shapeStrokeColorArgb by remember { mutableIntStateOf(0xFF111827.toInt()) }
     var shapeHasFill by remember { mutableStateOf(false) }
-    var isRunningNotebookOcr by remember(target.notebookId) { mutableStateOf(false) }
     var notebookOcrLanguage by remember(target.notebookId) { mutableStateOf(OcrLanguageTag.HUNGARIAN) }
     var showPaperSettings by remember(target) { mutableStateOf(false) }
     var showAiCopilot by remember(target) { mutableStateOf(false) }
@@ -1922,6 +1922,7 @@ private fun NotebookPagePane(
     var currentZoomPercent by remember(target) { mutableIntStateOf(100) }
     var externalDrawTick by remember { mutableLongStateOf(0L) }
     var historyRevisionTick by remember { mutableLongStateOf(0L) }
+    var viewportTransformTick by remember { mutableLongStateOf(0L) }
 
     val strokeJournal = remember(target) {
         StrokeJournal(
@@ -1947,6 +1948,7 @@ private fun NotebookPagePane(
         )
         dryInkRasterCache.onGestureSettled(transformMatrix.scale)
         syncZoomPercentFromMatrix()
+        if (canvasStateHolder.hasPageObjects) viewportTransformTick++
         externalDrawTick++
     }
 
@@ -1962,7 +1964,66 @@ private fun NotebookPagePane(
         )
         dryInkRasterCache.onGestureSettled(transformMatrix.scale)
         syncZoomPercentFromMatrix()
+        if (canvasStateHolder.hasPageObjects) viewportTransformTick++
         externalDrawTick++
+    }
+
+    fun viewportCenterDocPoint(): DocPoint = if (viewportSize.width > 0 && viewportSize.height > 0) {
+        transformMatrix.screenToDoc(
+            viewportSize.width * 0.5f,
+            viewportSize.height * 0.5f
+        )
+    } else {
+        DocPoint(
+            paperConfig.pageDimensions.widthPt * 0.5f,
+            paperConfig.pageDimensions.heightPt * 0.5f
+        )
+    }
+
+    val latestPageId by rememberUpdatedState(target.pageId)
+    val latestStrokeJournal by rememberUpdatedState(strokeJournal)
+    val insertImageLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { pickedUri ->
+        if (pickedUri == null) return@rememberLauncherForActivityResult
+        val activePageId = latestPageId
+        val activeJournal = latestStrokeJournal
+        coroutineScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    importPickedImageAsPageAsset(
+                        context = context,
+                        sourceUri = pickedUri,
+                        pageId = activePageId
+                    )
+                }
+            }.onSuccess { imported ->
+                val centerDoc = viewportCenterDocPoint()
+                val maxDocSpan = 260f
+                val longestPx = maxOf(imported.widthPx, imported.heightPx).toFloat().coerceAtLeast(1f)
+                val docW = (imported.widthPx / longestPx * maxDocSpan).coerceAtLeast(48f)
+                val docH = (imported.heightPx / longestPx * maxDocSpan).coerceAtLeast(48f)
+                val imgObj = PageObject.ImageObject(
+                    id = UUID.randomUUID().toString(),
+                    zOrder = canvasStateHolder.allocateObjectZOrder(),
+                    bounds = DocRect(
+                        leftPt = centerDoc.xPt - docW * 0.5f,
+                        topPt = centerDoc.yPt - docH * 0.5f,
+                        rightPt = centerDoc.xPt + docW * 0.5f,
+                        bottomPt = centerDoc.yPt + docH * 0.5f
+                    ),
+                    imageAssetRelativePath = imported.relativePath,
+                    rotationRadians = 0f
+                )
+                canvasStateHolder.addPageObject(imgObj)
+                activeJournal.appendAddObject(imgObj)
+                selectedObjectId = imgObj.id
+                historyRevisionTick++
+                viewportTransformTick++
+            }.onFailure { err ->
+                copilotNoticeBannerHu = "Kép beszúrása sikertelen: ${err.message ?: "ismeretlen hiba"}"
+            }
+        }
     }
 
     LaunchedEffect(isFullScreenCanvas) {
@@ -2349,7 +2410,13 @@ private fun NotebookPagePane(
                 }
             },
             onViewportSizeChanged = { viewportSize = it },
-            onViewportTransformChanged = { syncZoomPercentFromMatrix() },
+            onViewportTransformChanged = {
+                syncZoomPercentFromMatrix()
+                if (canvasStateHolder.hasPageObjects) viewportTransformTick++
+            },
+            onLiveViewportTransformChanged = {
+                if (canvasStateHolder.hasPageObjects) viewportTransformTick++
+            },
             onCanvasTouchStart = {
                 if (selectedObjectId != null) {
                     selectedObjectId = null
@@ -2457,6 +2524,41 @@ private fun NotebookPagePane(
                     historyRevisionTick++
                     coroutineScope.launch { strokeJournal.appendRemoveObject(objId) }
                 },
+                onRestoreOriginalStrokes = { targetObj ->
+                    val sourceRecords = when (targetObj) {
+                        is PageObject.LatexObject -> targetObj.originalStrokes
+                        is PageObject.FormattedTextObject -> targetObj.originalStrokes
+                        else -> emptyList()
+                    }
+                    if (sourceRecords.isNotEmpty()) {
+                        val pairs = sourceRecords.map { rec ->
+                            val (entry, _) = StrokeBinarySerializer.toIndexedDryStroke(rec)
+                            rec to entry
+                        }
+                        val metaMap = sourceRecords.mapNotNull { rec ->
+                            rec.shapeMeta?.let { meta -> rec.id to meta }
+                        }.toMap()
+                        val (dirtyBounds, insertedEntries) = canvasStateHolder.restoreObjectToOriginalStrokes(
+                            objectId = targetObj.id,
+                            restoredEntries = pairs.map { it.second },
+                            shapeMetas = metaMap
+                        )
+                        if (insertedEntries.isNotEmpty()) {
+                            val insertedById = insertedEntries.associateBy { it.id }
+                            val journalRecords = pairs.map { (rec, _) ->
+                                val finalEntry = insertedById[rec.id]
+                                if (finalEntry != null) rec.copy(zOrder = finalEntry.zIndex) else rec
+                            }
+                            dirtyBounds?.let { dryInkRasterCache.invalidateDocRect(it) }
+                            if (selectedObjectId == targetObj.id) selectedObjectId = null
+                            historyRevisionTick++
+                            coroutineScope.launch {
+                                strokeJournal.appendRemoveObject(targetObj.id)
+                                strokeJournal.appendAddStrokes(journalRecords)
+                            }
+                        }
+                    }
+                },
                 onRequestStepByStep = { latexObj ->
                     if (!consentState.isReadyForUserInitiatedCall) {
                         showConsentDialog = true
@@ -2475,6 +2577,7 @@ private fun NotebookPagePane(
                         }
                     }
                 },
+                viewportTransformTick = viewportTransformTick,
                 modifier = Modifier.fillMaxSize()
             )
         }
@@ -2636,7 +2739,6 @@ private fun NotebookPagePane(
             isDarkTheme = isDarkTheme,
             showDebugOverlay = showDebugOverlay,
             isFullScreen = isFullScreenCanvas,
-            isOcrRunning = isRunningNotebookOcr,
             onUpdateDockPrefs = { next ->
                 coroutineScope.launch { toolDockPrefsStore.savePrefs(next) }
             },
@@ -2644,37 +2746,7 @@ private fun NotebookPagePane(
             onOpenSettings = { showBrushSettings = true },
             onOpenPaperSettings = { showPaperSettings = true },
             onOpenShapes = { showShapePicker = true },
-            onTriggerNotebookOcr = {
-                if (!isRunningNotebookOcr) {
-                    coroutineScope.launch {
-                        if (!consentState.isReadyForUserInitiatedCall) {
-                            copilotNoticeBannerHu = "Állíts be Gemini API-kulcsot az OCR használatához (AI beállítások)."
-                            showConsentDialog = true
-                            return@launch
-                        }
-                        isRunningNotebookOcr = true
-                        try {
-                            val allPages = withContext(Dispatchers.IO) {
-                                database.pageDao().getPagesForNotebook(target.notebookId)
-                            }.ifEmpty { notebookPages }.ifEmpty { listOfNotNull(currentPageEntity) }
-                            val summary = executeAiFormattingAcrossPages(
-                                targets = allPages,
-                                onlyUnformattedOcr = true,
-                                formatText = true
-                            )
-                            copilotNoticeBannerHu = if (summary.formattedTextCount == 0) {
-                                "Nincs új formázatlan kézírás a füzetben (${notebookOcrLanguage.displayName})."
-                            } else {
-                                "OCR kész (${notebookOcrLanguage.displayName}): ${summary.formattedTextCount} új szövegblokk formázva ${allPages.size} oldalon."
-                            }
-                        } catch (err: Throwable) {
-                            copilotNoticeBannerHu = "OCR hiba: ${err.message ?: "ismeretlen hiba"}"
-                        } finally {
-                            isRunningNotebookOcr = false
-                        }
-                    }
-                }
-            },
+            onInsertImage = { insertImageLauncher.launch("image/*") },
             onUndo = {
                 canvasStateHolder.undo()?.let { dryInkRasterCache.invalidateDocRect(it) }
                 externalDrawTick++
@@ -2723,17 +2795,7 @@ private fun NotebookPagePane(
                     shapeStrokeWidthPt = strokeWidthPt
                     shapeStrokeColorArgb = strokeColorArgb
                     shapeHasFill = hasFill
-                    val centerDoc = if (viewportSize.width > 0 && viewportSize.height > 0) {
-                        transformMatrix.screenToDoc(
-                            viewportSize.width * 0.5f,
-                            viewportSize.height * 0.5f
-                        )
-                    } else {
-                        DocPoint(
-                            paperConfig.pageDimensions.widthPt * 0.5f,
-                            paperConfig.pageDimensions.heightPt * 0.5f
-                        )
-                    }
+                    val centerDoc = viewportCenterDocPoint()
                     val defaultHalfW = if (
                         shapeType == GeometricShapeType.LINE ||
                         shapeType == GeometricShapeType.ARROW ||
@@ -3035,6 +3097,49 @@ private fun rectsDifferOver1Px(a: Rect, b: Rect): Boolean =
         kotlin.math.abs(a.top - b.top) > 1f ||
         kotlin.math.abs(a.right - b.right) > 1f ||
         kotlin.math.abs(a.bottom - b.bottom) > 1f
+
+private data class ImportedImageAsset(
+    val relativePath: String,
+    val widthPx: Int,
+    val heightPx: Int
+)
+
+private fun importPickedImageAsPageAsset(
+    context: android.content.Context,
+    sourceUri: android.net.Uri,
+    pageId: String,
+    maxEdgePx: Int = 1600
+): ImportedImageAsset {
+    val source = android.graphics.ImageDecoder.createSource(context.contentResolver, sourceUri)
+    val bitmap = android.graphics.ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+        val srcW = info.size.width.coerceAtLeast(1)
+        val srcH = info.size.height.coerceAtLeast(1)
+        val longest = maxOf(srcW, srcH)
+        if (longest > maxEdgePx) {
+            val scale = maxEdgePx.toFloat() / longest.toFloat()
+            decoder.setTargetSize(
+                (srcW * scale).roundToInt().coerceAtLeast(1),
+                (srcH * scale).roundToInt().coerceAtLeast(1)
+            )
+        }
+    }
+    try {
+        val assetId = UUID.randomUUID().toString()
+        val relPath = "pages/$pageId/images/$assetId.png"
+        val outFile = File(context.filesDir, relPath)
+        outFile.parentFile?.mkdirs()
+        java.io.FileOutputStream(outFile).use { fos ->
+            bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, fos)
+        }
+        return ImportedImageAsset(
+            relativePath = relPath,
+            widthPx = bitmap.width.coerceAtLeast(1),
+            heightPx = bitmap.height.coerceAtLeast(1)
+        )
+    } finally {
+        bitmap.recycle()
+    }
+}
 
 @Volatile
 private var cachedSyntheticBenchmarkStrokes: List<IndexedDryStroke>? = null

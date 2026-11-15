@@ -267,6 +267,7 @@ fun StylusDrawingSurface(
     onCanvasStateMutated: () -> Unit = {},
     onViewportSizeChanged: (IntSize) -> Unit = {},
     onViewportTransformChanged: () -> Unit = {},
+    onLiveViewportTransformChanged: () -> Unit = {},
     onCanvasTouchStart: () -> Unit = {},
     onNavigationGestureEnd: () -> Unit = {},
     onAiAutoFormatLassoSelection: (selectedIds: Set<String>, onFormatted: (clearSelection: Boolean) -> Unit) -> Unit = { _, _ -> },
@@ -396,6 +397,7 @@ fun StylusDrawingSurface(
             var onTogglePenEraserCallback: () -> Unit = onTogglePenEraser
             var onMutatedCallback: () -> Unit = onCanvasStateMutated
             var onViewportTransformChangedCallback: () -> Unit = onViewportTransformChanged
+            var onLiveViewportTransformChangedCallback: () -> Unit = onLiveViewportTransformChanged
             var onCanvasTouchStartCallback: () -> Unit = onCanvasTouchStart
             var onNavigationGestureEndCallback: () -> Unit = onNavigationGestureEnd
         }
@@ -414,6 +416,7 @@ fun StylusDrawingSurface(
         onTogglePenEraserCallback = onTogglePenEraser
         onMutatedCallback = onCanvasStateMutated
         onViewportTransformChangedCallback = onViewportTransformChanged
+        onLiveViewportTransformChangedCallback = onLiveViewportTransformChanged
         onCanvasTouchStartCallback = onCanvasTouchStart
         onNavigationGestureEndCallback = onNavigationGestureEnd
     }
@@ -1198,6 +1201,7 @@ fun StylusDrawingSurface(
                         onTransformChanged = {
                             dryInkRasterCache.onGestureTransformChanged()
                             dryCanvasView.invalidate()
+                            routerConfigHolder.onLiveViewportTransformChangedCallback()
                             if (lassoRuntime.selectedIds.isNotEmpty() || lassoRuntime.activePolygon.isNotEmpty()) {
                                 lassoDrawTick.longValue++
                             }
@@ -1206,8 +1210,12 @@ fun StylusDrawingSurface(
                             postDelayed(settleRunnable, DryInkRasterCache.SETTLE_DEBOUNCE_MS)
                         },
                         onHoverStateChanged = { state ->
-                            hoverStateHolder.current = state
-                            hoverDrawTick.longValue++
+                            if (state.isVisible || hoverStateHolder.current.isVisible) {
+                                hoverStateHolder.current = state
+                                hoverDrawTick.longValue++
+                            } else {
+                                hoverStateHolder.current = state
+                            }
                         },
                         onTogglePenEraser = {
                             routerConfigHolder.onTogglePenEraserCallback()
@@ -1371,18 +1379,7 @@ fun StylusDrawingSurface(
             )
         }
 
-        // Layer 7: Hover cursor outline
-        if (hoverDrawTick.longValue > 0L && hoverStateHolder.current.isVisible) {
-            HoverCursorOverlay(
-                hoverStateProvider = { hoverStateHolder.current },
-                hoverTick = hoverDrawTick,
-                transformMatrix = transformMatrix,
-                brushSizePt = brushConfig.clampedSizePt,
-                brushColor = Color(brushConfig.effectiveColorArgb()),
-                isEraserMode = brushConfig.toolType.isEraser,
-                eraserRadiusPx = eraserRadiusPx
-            )
-        }
+        // Layer 7: Hover cursor outline intentionally disabled while stylus proximity & barrel button stay active.
 
         // Floating selection actions bar when Lasso has active strokes selected
         lassoSelectionVersion.longValue

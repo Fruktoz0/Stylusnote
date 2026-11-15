@@ -48,7 +48,7 @@ flowchart LR
     G -- formula --> L["jlatexmath validálás → LatexObject"]
     G -- text --> T["FormattedTextObject (nem-sticky kijelölés, HandwritingFontFamily)"]
     G -- shape --> SH2["Vektoros alakzat + ShapeMeta"]
-    L & T & SH2 --> U["Atomikus CompositeAction + StrokeJournal → 1 lépéses Undo"]
+    L & T & SH2 --> U["Atomikus CompositeAction (+ originalStrokes) + StrokeJournal → 1 lépéses Undo / 'Eredeti' gomb"]
 ```
 
 ---
@@ -72,12 +72,12 @@ flowchart TD
 
 ---
 
-## 4. 1-ujjas Pan & 2-ujjas Pinch-Zoom a 144 Hz-es GPU Kompozit Gyorsítótáron
+## 4. 1-ujjas Függőleges Pan & 2-ujjas Pinch-Zoom a 144 Hz-es GPU Kompozit Gyorsítótáron
 
 ```mermaid
 flowchart LR
-    A["1-ujjas pan vagy 2-ujjas pinch-zoom"] --> B["InProgressStrokesView: requestDisallowInterceptTouchEvent(true)"]
-    B --> C["StylusInputRouter (centroid horgony + skála) → DryCanvasView.invalidate() (Compose zoom-% szinkron csak gesztus végén)"]
+    A["1-ujjas függőleges pan (650 ms tenyérvédelem + 14 px slop) vagy 2-ujjas pinch-zoom"] --> B["InProgressStrokesView: requestDisallowInterceptTouchEvent(true)"]
+    B --> C["StylusInputRouter (dx=0f 1-ujjnál; centroid + skála 2-ujjnál) → DryCanvasView.invalidate() & viewportTransformTick (PageObject esetén)"]
     C --> E{"CompositePageSnapshot érvényes?"}
     E -- Igen (Fix oldal aktív gesztus alatt) --> F["1x GPU Hardware Bitmap TextureOp blit (4,37 ms P50 / 6,05 ms P95)"]
     E -- Nem (Végtelen vászon / lasszó / többoldalas szél) --> G["PaperBackgroundRenderer kötegelt rajz + 512x512 LRU csempék"]
@@ -99,12 +99,12 @@ flowchart TD
 
 ---
 
-## 6. Lebegő Eszköztár, Eszközmemória, Teljes Képernyő és AI Formázó
+## 6. Lebegő Eszköztár, StarNote Színes Ikonok, Eszközmemória & AI Formázó
 
 ```mermaid
 flowchart LR
-    T1["FloatingToolDock: globális (x,y), összecsukva Toll|Radír|Vissza + Teljes képernyő gomb"] --> T2["Eszközváltás → független perToolConfigs vastagság/szín/átlátszóság visszaállítás"]
-    T1 --> T3["Eszköz hosszú érintése → eszközhöz igazított 2 lépcsős BrushSettingsPopover (kompakt 1-8 pt ⇄ teljes stúdió + átlátszóság)"]
+    T1["FloatingToolDock: StarNote színes ikonok, globális (x,y), összecsukva Toll|Radír|Vissza + Teljes képernyő gomb"] --> T2["Eszközváltás → független perToolConfigs vastagság/szín/átlátszóság visszaállítás"]
+    T1 --> T3["Eszköz hosszú érintése → eszközhöz igazított 2 lépcsős BrushSettingsPopover (bal alsó '◢' sarok-fogantyú → teljes stúdió + átlátszóság)"]
     A1["Bal felső sarokba simuló CanvasTopToolbar AI gomb → AiCopilotSheet"] --> A2["Hatókör: Csak adott oldal / Teljes munkafüzet"]
     A2 --> A3["1. Teljes formázás (HandwritingFontFamily szöveg + ábrák + képletek)"]
     A2 --> A4["2. Csak alakzatok és képletek (kézírásos folyószöveg érintetlen marad)"]
@@ -112,14 +112,14 @@ flowchart LR
 
 ---
 
-## 7. Geometriai Alakzatok Beszúrása, Füzet-OCR és Oldalak Drag & Drop Átrendezése
+## 7. Geometriai Alakzatok (2D→3D), Képbeszúrás & Oldalak Drag & Drop Átrendezése
 
 ```mermaid
 flowchart TD
-    S1["FloatingToolDock: Alakzatok gomb → 2 oldalas ShapePickerPopover (24+8 2D/3D alakzat, szín, kitöltés)"] --> S2["Vászon közepére beszúrt GeometricShapeObject (SNOT tag=6)"]
+    S1["FloatingToolDock: Alakzatok gomb → animált HorizontalPager ShapePickerPopover (1. oldal 2D → 2. oldal 3D)"] --> S2["Papírhoz rögzített GeometricShapeObject (SNOT tag=6) pan/zoom szinkronnal"]
     S2 --> S3["4 sarok méretező + felső forgató fogantyú + kitöltés/szín/törlés menü → PdfExportManager vektoros export"]
-    O1["FloatingToolDock: OCR gomb"] --> O2["Még nem formázott kézírások szűrése (kiemelők és kész blokkok kihagyva)"]
-    O2 --> O3["Összes oldal átírása a füzet ocrLanguage nyelvén → FormattedTextObject"]
+    I1["FloatingToolDock: Kép beszúrása gomb → galériakép (ImageDecoder)"] --> I2["Papírhoz rögzített PageObject.ImageObject (SNOT tag=7, pages/<id>/images/)"]
+    I2 --> I3["4 sarok méretező + felső forgató fogantyú + zoom/forgatás/törlés menü → PdfExportManager"]
     P1["Bal oldalon függőlegesen eltolható LeftPagePullTab → LeftPageDrawer"] --> P2["Drag & Drop oldalsorrend módosítás (reorderPagesInNotebook) & + Új oldal létrehozása"]
 ```
 

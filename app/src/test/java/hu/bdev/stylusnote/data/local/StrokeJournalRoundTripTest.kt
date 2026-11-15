@@ -112,7 +112,8 @@ class StrokeJournalRoundTripTest {
                 fontSizePt = 20f,
                 canonicalColorArgb = 0xFF000000.toInt(),
                 rotationRadians = 0.05f,
-                sourceStrokeIds = listOf(stroke.id)
+                sourceStrokeIds = listOf(stroke.id),
+                originalStrokes = listOf(stroke)
             ),
             PageObject.FunctionPlotObject(
                 id = "plot-1",
@@ -152,7 +153,8 @@ class StrokeJournalRoundTripTest {
                 fontSizePt = 19f,
                 canonicalColorArgb = 0xFF1A1F29.toInt(),
                 rotationRadians = 0.02f,
-                sourceStrokeIds = listOf(stroke.id)
+                sourceStrokeIds = listOf(stroke.id),
+                originalStrokes = listOf(stroke)
             ),
             PageObject.GeometricShapeObject(
                 id = "shape-1",
@@ -164,6 +166,13 @@ class StrokeJournalRoundTripTest {
                 hasFill = true,
                 canonicalFillColorArgb = 0x26111827,
                 rotationRadians = 0.35f
+            ),
+            PageObject.ImageObject(
+                id = "image-1",
+                zOrder = 107L,
+                bounds = DocRect(150f, 360f, 390f, 540f),
+                imageAssetRelativePath = "pages/page-1/images/sample.png",
+                rotationRadians = 0.42f
             )
         )
 
@@ -367,6 +376,37 @@ class StrokeJournalRoundTripTest {
         assertEquals(0, summary.totalDiscardedCorruptRecords)
         assertTrue(File(dirA, StrokeJournal.SNAPSHOT_FILE_NAME).exists())
         assertTrue(File(dirB, StrokeJournal.SNAPSHOT_FILE_NAME).exists())
+    }
+
+    @Test
+    fun transformedFormattedObjectsRetainTransformedOriginalStrokesAcrossJournalReopen() = runBlocking {
+        val pageDir = File(tempRoot, "page-original-strokes")
+        val orig = sampleStroke(id = "stroke-orig-1", withShapeMeta = true)
+        val delta = AffineTransform2D.translation(dxPt = 30f, dyPt = 15f)
+        val formatted = PageObject.FormattedTextObject(
+            id = "fmt-restore-1",
+            zOrder = 200L,
+            bounds = DocRect(10f, 20f, 110f, 45f),
+            text = "Másodfokú egyenlet",
+            sourceStrokeIds = listOf(orig.id),
+            originalStrokes = listOf(orig)
+        ).transform(delta) as PageObject.FormattedTextObject
+
+        val j1 = StrokeJournal(pageDirectory = pageDir, fsyncDebounceMs = 0L)
+        j1.openAndRecover()
+        j1.appendAddObject(formatted)
+        j1.closeBlocking(compactBeforeClose = false)
+
+        val j2 = StrokeJournal(pageDirectory = pageDir, fsyncDebounceMs = 0L)
+        val recovered = j2.openAndRecover()
+        j2.closeBlocking(compactBeforeClose = false)
+
+        val loaded = recovered.objects.single() as PageObject.FormattedTextObject
+        assertEquals(1, loaded.originalStrokes.size)
+        assertEquals(orig.id, loaded.originalStrokes.first().id)
+        assertEquals(40f, loaded.originalStrokes.first().samples.first().xPt, 1e-3f)
+        assertEquals(35f, loaded.originalStrokes.first().samples.first().yPt, 1e-3f)
+        assertTrue(loaded.originalStrokes.first().shapeMeta != null)
     }
 }
 

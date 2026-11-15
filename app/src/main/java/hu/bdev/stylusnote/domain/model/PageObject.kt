@@ -116,11 +116,13 @@ sealed interface PageObject {
         val fontSizePt: Float = 18f,
         val canonicalColorArgb: Int = BrushConfig.DEFAULT_INK_COLOR_ARGB,
         val rotationRadians: Float = 0f,
-        val sourceStrokeIds: List<String> = emptyList()
+        val sourceStrokeIds: List<String> = emptyList(),
+        val originalStrokes: List<PersistedStrokeRecord> = emptyList()
     ) : PageObject {
         override fun transform(affine: AffineTransform2D): PageObject = copy(
             bounds = affine.transformRect(bounds),
-            fontSizePt = (fontSizePt * affine.averageScaleFactor()).coerceIn(8f, 120f)
+            fontSizePt = (fontSizePt * affine.averageScaleFactor()).coerceIn(8f, 120f),
+            originalStrokes = originalStrokes.map { it.withTransform(affine) }
         )
     }
 
@@ -181,11 +183,13 @@ sealed interface PageObject {
         val fontSizePt: Float = 18f,
         val canonicalColorArgb: Int = BrushConfig.DEFAULT_INK_COLOR_ARGB,
         val rotationRadians: Float = 0f,
-        val sourceStrokeIds: List<String> = emptyList()
+        val sourceStrokeIds: List<String> = emptyList(),
+        val originalStrokes: List<PersistedStrokeRecord> = emptyList()
     ) : PageObject {
         override fun transform(affine: AffineTransform2D): PageObject = copy(
             bounds = affine.transformRect(bounds),
-            fontSizePt = (fontSizePt * affine.averageScaleFactor()).coerceIn(10f, 96f)
+            fontSizePt = (fontSizePt * affine.averageScaleFactor()).coerceIn(10f, 96f),
+            originalStrokes = originalStrokes.map { it.withTransform(affine) }
         )
     }
 
@@ -220,51 +224,79 @@ sealed interface PageObject {
             )
         }
     }
+
+    /**
+     * Movable, resizable, freely rotatable raster image inserted onto the paper from gallery/files.
+     */
+    data class ImageObject(
+        override val id: String,
+        override val zOrder: Long,
+        override val bounds: DocRect,
+        val imageAssetRelativePath: String,
+        val rotationRadians: Float = 0f
+    ) : PageObject {
+        override fun transform(affine: AffineTransform2D): PageObject {
+            val scale = affine.averageScaleFactor()
+            val newCenter = affine.transformPoint(bounds.centerXPt, bounds.centerYPt)
+            val halfW = (bounds.widthPt * 0.5f * scale).coerceAtLeast(12f)
+            val halfH = (bounds.heightPt * 0.5f * scale).coerceAtLeast(12f)
+            val deltaRot = atan2(affine.shearY, affine.scaleX)
+            return copy(
+                bounds = DocRect(
+                    leftPt = newCenter.xPt - halfW,
+                    topPt = newCenter.yPt - halfH,
+                    rightPt = newCenter.xPt + halfW,
+                    bottomPt = newCenter.yPt + halfH
+                ),
+                rotationRadians = rotationRadians + deltaRot
+            )
+        }
+    }
 }
 
 /**
- * Vector shape catalog ordered to match the 4x6 geometry grid + essential 2D shapes.
+ * Vector shape catalog ordered with simple 2D shapes first (Page 0) and 3D solids second (Page 1).
  */
 enum class GeometricShapeType(
     val displayNameHu: String,
     val is3D: Boolean = false,
     val catalogPage: Int = 0
 ) {
-    // Page 0: 4x6 grid matching the Geometry Shapes reference panel
-    TRAPEZOID("Trapéz"),
-    PARALLELOGRAM("Paralelogramma"),
-    DIAMOND("Rombusz"),
-    PENTAGON("Ötszög"),
-    HEXAGON("Hatszög"),
-    OCTAGON("Nyolcszög"),
-    CIRCLE("Kör"),
-    ELLIPSE("Ellipszis"),
-    STAR_FIVE("Csillag"),
-    CONE("Kúp", is3D = true),
-    TETRAHEDRON("Háromoldalú gúla", is3D = true),
-    SQUARE_PYRAMID("Négyoldalú gúla", is3D = true),
-    ROOF_TRIANGULAR_PRISM("Fekvő hasáb", is3D = true),
-    OBLIQUE_PYRAMID("Ferde gúla", is3D = true),
-    UPRIGHT_TRIANGULAR_PRISM("Háromszög hasáb", is3D = true),
-    RECTANGULAR_PRISM("Téglatest", is3D = true),
-    CUBE("Kocka", is3D = true),
-    PENTAGONAL_PRISM("Ötszögű hasáb", is3D = true),
-    HEXAGONAL_PRISM("Hatszögű hasáb", is3D = true),
-    CYLINDER("Henger", is3D = true),
-    HOLLOW_CYLINDER("Üreges henger", is3D = true),
-    FRUSTUM_PYRAMID("Csonkagúla", is3D = true),
-    FRUSTUM_CONE("Csonkakúp", is3D = true),
-    HEMISPHERE("Félgömb", is3D = true),
+    // Page 0: Simple 2D shapes, lines, arrows, coordinate axes & basic polygons
+    LINE("Egyenes szakasz", catalogPage = 0),
+    ARROW("Nyíl", catalogPage = 0),
+    DOUBLE_ARROW("Kétirányú nyíl", catalogPage = 0),
+    AXES_2D("Koordináta-rendszer", catalogPage = 0),
+    RECTANGLE("Téglalap", catalogPage = 0),
+    ROUNDED_RECTANGLE("Lekerekített téglalap", catalogPage = 0),
+    CIRCLE("Kör", catalogPage = 0),
+    ELLIPSE("Ellipszis", catalogPage = 0),
+    TRIANGLE("Háromszög", catalogPage = 0),
+    RIGHT_TRIANGLE("Derékszögű háromszög", catalogPage = 0),
+    DIAMOND("Rombusz", catalogPage = 0),
+    PARALLELOGRAM("Paralelogramma", catalogPage = 0),
+    TRAPEZOID("Trapéz", catalogPage = 0),
+    PENTAGON("Ötszög", catalogPage = 0),
+    HEXAGON("Hatszög", catalogPage = 0),
+    OCTAGON("Nyolcszög", catalogPage = 0),
+    STAR_FIVE("Csillag", catalogPage = 0),
 
-    // Page 1: Essential 2D shapes & arrows
-    RECTANGLE("Téglalap", catalogPage = 1),
-    ROUNDED_RECTANGLE("Lekerekített téglalap", catalogPage = 1),
-    TRIANGLE("Háromszög", catalogPage = 1),
-    RIGHT_TRIANGLE("Derékszögű háromszög", catalogPage = 1),
-    LINE("Egyenes szakasz", catalogPage = 1),
-    ARROW("Nyíl", catalogPage = 1),
-    DOUBLE_ARROW("Kétirányú nyíl", catalogPage = 1),
-    AXES_2D("Koordináta-rendszer", catalogPage = 1);
+    // Page 1: 3D geometric solids (with dashed hidden back edges)
+    CUBE("Kocka", is3D = true, catalogPage = 1),
+    RECTANGULAR_PRISM("Téglatest", is3D = true, catalogPage = 1),
+    CYLINDER("Henger", is3D = true, catalogPage = 1),
+    HOLLOW_CYLINDER("Üreges henger", is3D = true, catalogPage = 1),
+    CONE("Kúp", is3D = true, catalogPage = 1),
+    TETRAHEDRON("Háromoldalú gúla", is3D = true, catalogPage = 1),
+    SQUARE_PYRAMID("Négyoldalú gúla", is3D = true, catalogPage = 1),
+    OBLIQUE_PYRAMID("Ferde gúla", is3D = true, catalogPage = 1),
+    ROOF_TRIANGULAR_PRISM("Fekvő hasáb", is3D = true, catalogPage = 1),
+    UPRIGHT_TRIANGULAR_PRISM("Háromszög hasáb", is3D = true, catalogPage = 1),
+    PENTAGONAL_PRISM("Ötszögű hasáb", is3D = true, catalogPage = 1),
+    HEXAGONAL_PRISM("Hatszögű hasáb", is3D = true, catalogPage = 1),
+    FRUSTUM_PYRAMID("Csonkagúla", is3D = true, catalogPage = 1),
+    FRUSTUM_CONE("Csonkakúp", is3D = true, catalogPage = 1),
+    HEMISPHERE("Félgömb", is3D = true, catalogPage = 1);
 
     companion object {
         fun forCatalogPage(page: Int): List<GeometricShapeType> = entries.filter { it.catalogPage == page }

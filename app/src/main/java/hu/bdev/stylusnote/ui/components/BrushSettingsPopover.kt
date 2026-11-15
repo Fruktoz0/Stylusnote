@@ -11,7 +11,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -409,64 +409,14 @@ fun BrushSettingsPopover(
                 shadowElevation = 16.dp,
                 color = MaterialTheme.colorScheme.surface
             ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(IntrinsicSize.Min)
+                Box(
+                    modifier = Modifier.fillMaxWidth()
                 ) {
-                    // Left edge drag/pull grip handle for smoothly expanding Stage 1 -> Stage 2.
-                    var cumulativeDragPx by remember { mutableFloatStateOf(0f) }
-                    Box(
-                        modifier = Modifier
-                            .width(26.dp)
-                            .fillMaxHeight()
-                            .background(surfacePalette.groupedCardBackground.copy(alpha = 0.65f))
-                            .pointerInput(isExpandedFullStudio) {
-                                detectHorizontalDragGestures(
-                                    onDragStart = { cumulativeDragPx = 0f },
-                                    onHorizontalDrag = { change, dragAmount ->
-                                        change.consume()
-                                        cumulativeDragPx += dragAmount
-                                        if (!isExpandedFullStudio && cumulativeDragPx < -32f) {
-                                            isExpandedFullStudio = true
-                                        } else if (isExpandedFullStudio && cumulativeDragPx > 32f) {
-                                            isExpandedFullStudio = false
-                                        }
-                                    }
-                                )
-                            }
-                            .clickable { isExpandedFullStudio = !isExpandedFullStudio },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Column(
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .width(4.dp)
-                                    .height(34.dp)
-                                    .clip(CircleShape)
-                                    .background(MaterialTheme.colorScheme.outline)
-                            )
-                            Icon(
-                                imageVector = if (isExpandedFullStudio) {
-                                    Icons.Filled.ChevronRight
-                                } else {
-                                    Icons.Filled.ChevronLeft
-                                },
-                                contentDescription = if (isExpandedFullStudio) "Kompakt nézet" else "Teljes funkciók",
-                                tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(18.dp)
-                            )
-                        }
-                    }
-
                     Column(
                         modifier = Modifier
-                            .weight(1f)
+                            .fillMaxWidth()
                             .verticalScroll(rememberScrollState())
-                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                            .padding(start = 18.dp, end = 14.dp, top = 12.dp, bottom = 18.dp),
                         verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         // Header
@@ -1039,6 +989,70 @@ fun BrushSettingsPopover(
                                     }
                                 }
                             }
+                        }
+                    }
+
+                    // Bottom-left diagonal corner grip indicating Stage 1 <-> Stage 2 expansion.
+                    var cornerDragX by remember { mutableFloatStateOf(0f) }
+                    var cornerDragY by remember { mutableFloatStateOf(0f) }
+                    val gripStrokeColor = if (isExpandedFullStudio) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f)
+                    }
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomStart)
+                            .padding(start = 6.dp, bottom = 6.dp)
+                            .size(26.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .pointerInput(isExpandedFullStudio) {
+                                detectDragGestures(
+                                    onDragStart = {
+                                        cornerDragX = 0f
+                                        cornerDragY = 0f
+                                    },
+                                    onDrag = { change, dragAmount ->
+                                        change.consume()
+                                        cornerDragX += dragAmount.x
+                                        cornerDragY += dragAmount.y
+                                        val outwardScore = cornerDragY - cornerDragX
+                                        if (!isExpandedFullStudio && outwardScore > 36f) {
+                                            isExpandedFullStudio = true
+                                        } else if (isExpandedFullStudio && outwardScore < -36f) {
+                                            isExpandedFullStudio = false
+                                        }
+                                    }
+                                )
+                            }
+                            .clickable(
+                                onClickLabel = if (isExpandedFullStudio) "Kompakt nézet" else "Teljes funkciók"
+                            ) {
+                                isExpandedFullStudio = !isExpandedFullStudio
+                            }
+                            .padding(4.dp),
+                        contentAlignment = Alignment.BottomStart
+                    ) {
+                        Canvas(modifier = Modifier.fillMaxSize()) {
+                            val strokePx = 1.8.dp.toPx()
+                            val w = size.width
+                            val h = size.height
+                            // Outer diagonal corner stroke
+                            drawLine(
+                                color = gripStrokeColor,
+                                start = androidx.compose.ui.geometry.Offset(w * 0.10f, h * 0.10f),
+                                end = androidx.compose.ui.geometry.Offset(w * 0.90f, h * 0.90f),
+                                strokeWidth = strokePx,
+                                cap = StrokeCap.Round
+                            )
+                            // Inner diagonal corner stroke closer to bottom-left corner
+                            drawLine(
+                                color = gripStrokeColor,
+                                start = androidx.compose.ui.geometry.Offset(w * 0.10f, h * 0.48f),
+                                end = androidx.compose.ui.geometry.Offset(w * 0.52f, h * 0.90f),
+                                strokeWidth = strokePx,
+                                cap = StrokeCap.Round
+                            )
                         }
                     }
                 }

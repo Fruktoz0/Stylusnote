@@ -1,7 +1,9 @@
 package hu.bdev.stylusnote.data.export
 
 import android.content.Context
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import java.io.File
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
@@ -440,6 +442,26 @@ class PdfExportManager(
                     fillColorArgb = obj.canonicalFillColorArgb,
                     rotationRadians = obj.rotationRadians
                 )
+            }
+
+            is PageObject.ImageObject -> {
+                val appContext = context ?: return
+                val imgFile = File(appContext.filesDir, obj.imageAssetRelativePath)
+                if (!imgFile.isFile) return
+                val bitmap = BitmapFactory.decodeFile(imgFile.absolutePath) ?: return
+                try {
+                    val dstRect = RectF(obj.bounds.leftPt, obj.bounds.topPt, obj.bounds.rightPt, obj.bounds.bottomPt)
+                    val saveCount = canvas.save()
+                    val deg = (obj.rotationRadians * 180.0 / PI).toFloat()
+                    if (abs(deg) > 0.01f) {
+                        canvas.rotate(deg, dstRect.centerX(), dstRect.centerY())
+                    }
+                    val imgPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+                    canvas.drawBitmap(bitmap, null, dstRect, imgPaint)
+                    canvas.restoreToCount(saveCount)
+                } finally {
+                    bitmap.recycle()
+                }
             }
         }
     }

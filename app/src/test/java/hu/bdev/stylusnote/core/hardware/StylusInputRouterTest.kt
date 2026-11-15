@@ -364,7 +364,7 @@ class StylusInputRouterTest {
             )
         )
         assertEquals(2, toggleCount)
-        assertTrue(lastHover.isVisible)
+        assertFalse(lastHover.isVisible)
         assertEquals(100f, lastHover.docXPt, 1e-4f)
         assertEquals(200f, lastHover.docYPt, 1e-4f)
 
@@ -500,7 +500,8 @@ class StylusInputRouterTest {
         assertEquals(0, sink.rawStartCount)
         assertEquals(1, transformChanges)
         assertEquals(2.0f, transform.scale, 1e-6f)
-        assertEquals(70f, transform.panXPx, 1e-4f)
+        // Single-finger pan must remain strictly vertical (panXPx unchanged, only panYPx moves).
+        assertEquals(10f, transform.panXPx, 1e-4f)
         assertEquals(-60f, transform.panYPx, 1e-4f)
 
         val up = StylusMotionFrame(
@@ -515,6 +516,113 @@ class StylusInputRouterTest {
         )
         assertTrue(router.processTouchFrame(up))
         assertEquals(1, gestureEndedCount)
+    }
+
+    @Test
+    fun palmTouchDuringHoverGraceWindowOrLargeContactDoesNotPanCanvas() {
+        val transform = CanvasTransformMatrix(initialScale = 1.0f, initialPanXPx = 0f, initialPanYPx = 0f)
+        val sink = FakeWetStrokeSink()
+        val router = StylusInputRouter(transform, OneEuroFilter(0f), sink)
+
+        // 1. Stylus lifts from paper at t = 1000ms -> starts 650ms palm grace window
+        router.processTouchFrame(
+            StylusMotionFrame(
+                action = StylusAction.DOWN,
+                actionIndex = 0,
+                flags = 0,
+                buttonState = 0,
+                eventTimeMs = 950L,
+                eventTimeNanos = 950_000_000L,
+                pointers = listOf(StylusPointerSnapshot(1, MotionEvent.TOOL_TYPE_STYLUS, 300f, 300f, 0.5f, 0f, 0f)),
+                rawEvent = FakeEvent("s-down")
+            )
+        )
+        router.processTouchFrame(
+            StylusMotionFrame(
+                action = StylusAction.UP,
+                actionIndex = 0,
+                flags = 0,
+                buttonState = 0,
+                eventTimeMs = 1000L,
+                eventTimeNanos = 1_000_000_000L,
+                pointers = listOf(StylusPointerSnapshot(1, MotionEvent.TOOL_TYPE_STYLUS, 310f, 300f, 0f, 0f, 0f)),
+                rawEvent = FakeEvent("s-up")
+            )
+        )
+
+        // 2. Hand rests / shifts vertically at t = 1200ms (inside 650ms grace window) -> must NOT pan
+        router.processTouchFrame(
+            StylusMotionFrame(
+                action = StylusAction.DOWN,
+                actionIndex = 0,
+                flags = 0,
+                buttonState = 0,
+                eventTimeMs = 1200L,
+                eventTimeNanos = 1_200_000_000L,
+                pointers = listOf(StylusPointerSnapshot(2, MotionEvent.TOOL_TYPE_FINGER, 400f, 500f, 1f, 0f, 0f)),
+                rawEvent = FakeEvent("palm-down")
+            )
+        )
+        assertFalse(
+            router.processTouchFrame(
+                StylusMotionFrame(
+                    action = StylusAction.MOVE,
+                    actionIndex = 0,
+                    flags = 0,
+                    buttonState = 0,
+                    eventTimeMs = 1250L,
+                    eventTimeNanos = 1_250_000_000L,
+                    pointers = listOf(StylusPointerSnapshot(2, MotionEvent.TOOL_TYPE_FINGER, 400f, 400f, 1f, 0f, 0f)),
+                    rawEvent = FakeEvent("palm-move")
+                )
+            )
+        )
+        assertEquals(0f, transform.panYPx, 1e-4f)
+        router.processTouchFrame(
+            StylusMotionFrame(
+                action = StylusAction.UP,
+                actionIndex = 0,
+                flags = 0,
+                buttonState = 0,
+                eventTimeMs = 1280L,
+                eventTimeNanos = 1_280_000_000L,
+                pointers = listOf(StylusPointerSnapshot(2, MotionEvent.TOOL_TYPE_FINGER, 400f, 400f, 1f, 0f, 0f)),
+                rawEvent = FakeEvent("palm-up")
+            )
+        )
+
+        // 3. After grace window expires (t = 2000ms), an oversized palm patch still must NOT pan
+        router.processTouchFrame(
+            StylusMotionFrame(
+                action = StylusAction.DOWN,
+                actionIndex = 0,
+                flags = 0,
+                buttonState = 0,
+                eventTimeMs = 2000L,
+                eventTimeNanos = 2_000_000_000L,
+                pointers = listOf(
+                    StylusPointerSnapshot(3, MotionEvent.TOOL_TYPE_FINGER, 400f, 500f, 1f, 0f, 0f, touchMajorPx = 140f)
+                ),
+                rawEvent = FakeEvent("big-palm-down")
+            )
+        )
+        assertFalse(
+            router.processTouchFrame(
+                StylusMotionFrame(
+                    action = StylusAction.MOVE,
+                    actionIndex = 0,
+                    flags = 0,
+                    buttonState = 0,
+                    eventTimeMs = 2020L,
+                    eventTimeNanos = 2_020_000_000L,
+                    pointers = listOf(
+                        StylusPointerSnapshot(3, MotionEvent.TOOL_TYPE_FINGER, 400f, 420f, 1f, 0f, 0f, touchMajorPx = 140f)
+                    ),
+                    rawEvent = FakeEvent("big-palm-move")
+                )
+            )
+        )
+        assertEquals(0f, transform.panYPx, 1e-4f)
     }
 }
 

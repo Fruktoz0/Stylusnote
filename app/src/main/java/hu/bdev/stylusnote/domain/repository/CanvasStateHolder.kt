@@ -436,6 +436,9 @@ class CanvasStateHolder(
         }
     }
 
+    val hasPageObjects: Boolean
+        get() = synchronized(stateLock) { objectsById.isNotEmpty() }
+
     fun allPageObjects(): List<PageObject> = synchronized(stateLock) {
         objectsById.values.sortedBy { it.zOrder }
     }
@@ -502,6 +505,37 @@ class CanvasStateHolder(
         applyForwardLocked(composite)
         pushUndoActionLocked(composite)
         composite.affectedBounds
+    }
+
+    /**
+     * Atomically removes an AI-formatted [PageObject] ([objectId]) and restores [restoredEntries]
+     * inside one Undo/Redo-compatible [CanvasAction.CompositeAction], returning the dirty canvas
+     * bounds and normalized [IndexedDryStroke]s.
+     */
+    fun restoreObjectToOriginalStrokes(
+        objectId: String,
+        restoredEntries: List<IndexedDryStroke>,
+        shapeMetas: Map<String, ShapeMeta> = emptyMap()
+    ): Pair<DocRect?, List<IndexedDryStroke>> = synchronized(stateLock) {
+        val existingObj = objectsById[objectId] ?: return null to emptyList()
+        if (restoredEntries.isEmpty()) return null to emptyList()
+
+        val normalized = restoredEntries.map { ensureProperLayerZIndex(it) }
+        if (shapeMetas.isNotEmpty()) {
+            shapeMetaById.putAll(shapeMetas)
+        }
+
+        val composite = CanvasAction.CompositeAction(
+            actions = listOf(
+                CanvasAction.RemovedObject(existingObj),
+                CanvasAction.AddedStrokes(normalized)
+            ),
+            description = "Eredeti kézírás visszaállítása"
+        )
+        applyForwardLocked(composite)
+        pushUndoActionLocked(composite)
+        val dirtyBounds = mergeBounds(listOf(existingObj.bounds) + normalized.map { it.bounds })
+        dirtyBounds to normalized
     }
 
     /**

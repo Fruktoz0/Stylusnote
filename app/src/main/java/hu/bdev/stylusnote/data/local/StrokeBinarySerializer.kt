@@ -46,6 +46,7 @@ object StrokeBinarySerializer {
     private const val OBJECT_TAG_PDF_PAGE_REF: Int = 4
     private const val OBJECT_TAG_FORMATTED_TEXT: Int = 5
     private const val OBJECT_TAG_GEOMETRIC_SHAPE: Int = 6
+    private const val OBJECT_TAG_IMAGE: Int = 7
 
     fun encodeStrokeRecord(record: PersistedStrokeRecord): ByteArray {
         val baos = ByteArrayOutputStream(256)
@@ -266,6 +267,7 @@ object StrokeBinarySerializer {
             is PageObject.PdfPageRefObject -> OBJECT_TAG_PDF_PAGE_REF
             is PageObject.FormattedTextObject -> OBJECT_TAG_FORMATTED_TEXT
             is PageObject.GeometricShapeObject -> OBJECT_TAG_GEOMETRIC_SHAPE
+            is PageObject.ImageObject -> OBJECT_TAG_IMAGE
         }
         out.writeByte(tag)
         writeIdentifier(out, obj.id)
@@ -285,6 +287,7 @@ object StrokeBinarySerializer {
                 for (srcId in obj.sourceStrokeIds) {
                     writeIdentifier(out, srcId)
                 }
+                writeEmbeddedStrokeList(out, obj.originalStrokes)
             }
             is PageObject.FunctionPlotObject -> {
                 writeUtfString(out, obj.expression)
@@ -319,6 +322,7 @@ object StrokeBinarySerializer {
                 for (srcId in obj.sourceStrokeIds) {
                     writeIdentifier(out, srcId)
                 }
+                writeEmbeddedStrokeList(out, obj.originalStrokes)
             }
             is PageObject.GeometricShapeObject -> {
                 writeUtfString(out, obj.shapeType.name)
@@ -326,6 +330,10 @@ object StrokeBinarySerializer {
                 out.writeInt(obj.canonicalStrokeColorArgb)
                 out.writeBoolean(obj.hasFill)
                 out.writeInt(obj.canonicalFillColorArgb)
+                out.writeFloat(obj.rotationRadians)
+            }
+            is PageObject.ImageObject -> {
+                writeUtfString(out, obj.imageAssetRelativePath)
                 out.writeFloat(obj.rotationRadians)
             }
         }
@@ -356,6 +364,7 @@ object StrokeBinarySerializer {
                 for (i in 0 until srcCount) {
                     srcIds.add(readIdentifier(input))
                 }
+                val originalStrokes = if (input.available() > 0) readEmbeddedStrokeList(input) else emptyList()
                 PageObject.LatexObject(
                     id = id,
                     zOrder = zOrder,
@@ -364,7 +373,8 @@ object StrokeBinarySerializer {
                     fontSizePt = fontSize,
                     canonicalColorArgb = color,
                     rotationRadians = rotation,
-                    sourceStrokeIds = srcIds
+                    sourceStrokeIds = srcIds,
+                    originalStrokes = originalStrokes
                 )
             }
             OBJECT_TAG_FUNCTION_PLOT -> PageObject.FunctionPlotObject(
@@ -414,6 +424,7 @@ object StrokeBinarySerializer {
                 for (i in 0 until srcCount) {
                     srcIds.add(readIdentifier(input))
                 }
+                val originalStrokes = if (input.available() > 0) readEmbeddedStrokeList(input) else emptyList()
                 PageObject.FormattedTextObject(
                     id = id,
                     zOrder = zOrder,
@@ -422,7 +433,8 @@ object StrokeBinarySerializer {
                     fontSizePt = fontSize,
                     canonicalColorArgb = color,
                     rotationRadians = rotation,
-                    sourceStrokeIds = srcIds
+                    sourceStrokeIds = srcIds,
+                    originalStrokes = originalStrokes
                 )
             }
             OBJECT_TAG_GEOMETRIC_SHAPE -> {
@@ -444,6 +456,17 @@ object StrokeBinarySerializer {
                     canonicalStrokeColorArgb = canonicalStrokeColorArgb,
                     hasFill = hasFill,
                     canonicalFillColorArgb = canonicalFillColorArgb,
+                    rotationRadians = rotationRadians
+                )
+            }
+            OBJECT_TAG_IMAGE -> {
+                val assetPath = readUtfString(input)
+                val rotationRadians = input.readFloat()
+                PageObject.ImageObject(
+                    id = id,
+                    zOrder = zOrder,
+                    bounds = bounds,
+                    imageAssetRelativePath = assetPath,
                     rotationRadians = rotationRadians
                 )
             }
@@ -621,6 +644,30 @@ object StrokeBinarySerializer {
         val bytes = ByteArray(len)
         input.readFully(bytes)
         return bytes
+    }
+
+    private fun writeEmbeddedStrokeList(
+        out: DataOutputStream,
+        strokes: List<PersistedStrokeRecord>
+    ) {
+        out.writeInt(strokes.size)
+        for (stroke in strokes) {
+            val encoded = encodeStrokeRecord(stroke)
+            out.writeInt(encoded.size)
+            out.write(encoded)
+        }
+    }
+
+    private fun readEmbeddedStrokeList(input: DataInputStream): List<PersistedStrokeRecord> {
+        val count = input.readInt().coerceAtLeast(0)
+        val result = ArrayList<PersistedStrokeRecord>(count)
+        for (i in 0 until count) {
+            val len = input.readInt().coerceAtLeast(0)
+            val bytes = ByteArray(len)
+            input.readFully(bytes)
+            result.add(decodeStrokeRecord(bytes))
+        }
+        return result
     }
 }
 

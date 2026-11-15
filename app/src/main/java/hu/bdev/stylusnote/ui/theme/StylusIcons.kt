@@ -10,13 +10,26 @@ import androidx.compose.ui.graphics.vector.path
 import androidx.compose.ui.unit.dp
 
 /**
- * Custom StarNote-inspired minimalist stroke icon set (IMG_2724 / IMG_2725 / IMG_2727):
- * - Consistent 24x24 viewport, 1.75f stroke weight, rounded caps & joins.
- * - SolidColor(Color.Black) allows Material [androidx.compose.material3.Icon] tinting across themes.
+ * Custom StarNote-inspired icon set (IMG_2724 / IMG_2725 / IMG_2727):
+ * - Consistent 24x24 viewport with rounded caps & joins.
+ * - Toolbar icons carry multi-tone StarNote colors (rendered via `Color.Unspecified`);
+ *   [StarFourPoint], [BallpointPen], [Pencil], and [OcrText] preserve SolidColor(Color.Black) for tinting.
  */
 object StylusIcons {
 
     private val strokeBrush = SolidColor(Color.Black)
+    private val inkOutlineBrush = SolidColor(Color(0xFF334155))
+    private val inkDarkBrush = SolidColor(Color(0xFF1E293B))
+    private val sleeveFillBrush = SolidColor(Color(0xFFF1F5F9))
+    private val fountainCollarBrush = SolidColor(Color(0xFF3B82F6))
+    private val highlighterBodyBrush = SolidColor(Color(0xFFFDE68A))
+    private val highlighterTipBrush = SolidColor(Color(0xFFF59E0B))
+    private val highlighterSwipeBrush = SolidColor(Color(0xFFFBBF24))
+    private val eraserCoralBrush = SolidColor(Color(0xFFE25C5C))
+    private val eraserRuleBrush = SolidColor(Color(0xFF64748B))
+    private val vectorSweepBrush = SolidColor(Color(0xFF0EA5E9))
+    private val lassoPrimaryBrush = SolidColor(Color(0xFF0EA5E9))
+    private val lassoAccentBrush = SolidColor(Color(0xFF2563EB))
 
     val FountainPen: ImageVector by lazy {
         ImageVector.Builder(
@@ -26,43 +39,51 @@ object StylusIcons {
             viewportWidth = 24f,
             viewportHeight = 24f
         ).apply {
-            // Nib tip triangle & shoulders oriented bottom-left -> top-right
+            // Nib metallic body & outline
             path(
-                fill = null,
-                stroke = strokeBrush,
-                strokeLineWidth = 1.75f,
+                fill = sleeveFillBrush,
+                stroke = inkOutlineBrush,
+                strokeLineWidth = 1.5f,
                 strokeLineCap = StrokeCap.Round,
                 strokeLineJoin = StrokeJoin.Round
             ) {
-                moveTo(3.5f, 20.5f)
-                lineTo(6.2f, 12.2f)
-                lineTo(13.8f, 4.6f)
-                lineTo(19.4f, 10.2f)
-                lineTo(11.8f, 17.8f)
+                moveTo(3.4f, 20.6f)
+                lineTo(5.8f, 12.2f)
+                lineTo(12.0f, 6.0f)
+                lineTo(18.0f, 12.0f)
+                lineTo(11.8f, 18.2f)
                 close()
             }
-            // Collar band
+            // Royal-blue StarNote collar & grip section
             path(
-                fill = null,
-                stroke = strokeBrush,
-                strokeLineWidth = 1.75f,
+                fill = fountainCollarBrush,
+                stroke = inkOutlineBrush,
+                strokeLineWidth = 1.5f,
                 strokeLineCap = StrokeCap.Round,
                 strokeLineJoin = StrokeJoin.Round
             ) {
-                moveTo(12.2f, 6.2f)
-                lineTo(17.8f, 11.8f)
-                // Barrel extension
-                moveTo(15.2f, 3.2f)
-                lineTo(20.8f, 8.8f)
-                // Nib split slit
-                moveTo(3.5f, 20.5f)
+                moveTo(11.8f, 6.2f)
+                lineTo(14.8f, 3.2f)
+                lineTo(20.8f, 9.2f)
+                lineTo(17.8f, 12.2f)
+                close()
+            }
+            // Nib split slit
+            path(
+                fill = null,
+                stroke = inkDarkBrush,
+                strokeLineWidth = 1.45f,
+                strokeLineCap = StrokeCap.Round,
+                strokeLineJoin = StrokeJoin.Round
+            ) {
+                moveTo(3.4f, 20.6f)
                 lineTo(9.8f, 14.2f)
             }
             // Breather hole dot
-            path(fill = strokeBrush) {
-                moveTo(11.2f, 12.8f)
-                arcTo(1.2f, 1.2f, 0f, true, true, 8.8f, 12.8f)
-                arcTo(1.2f, 1.2f, 0f, true, true, 11.2f, 12.8f)
+            path(fill = inkDarkBrush) {
+                moveTo(11.4f, 12.9f)
+                arcTo(1.2f, 1.2f, 0f, true, true, 9.0f, 12.9f)
+                arcTo(1.2f, 1.2f, 0f, true, true, 11.4f, 12.9f)
             }
         }.build()
     }
@@ -137,33 +158,49 @@ object StylusIcons {
             viewportWidth = 24f,
             viewportHeight = 24f
         ).apply {
+            // Glowing amber underline swipe
             path(
                 fill = null,
-                stroke = strokeBrush,
-                strokeLineWidth = 1.75f,
+                stroke = highlighterSwipeBrush,
+                strokeLineWidth = 2.4f,
+                strokeLineCap = StrokeCap.Round
+            ) {
+                moveTo(3.6f, 20.6f)
+                lineTo(15.2f, 20.6f)
+            }
+            // Wide marker barrel
+            path(
+                fill = highlighterBodyBrush,
+                stroke = inkOutlineBrush,
+                strokeLineWidth = 1.5f,
                 strokeLineCap = StrokeCap.Round,
                 strokeLineJoin = StrokeJoin.Round
             ) {
-                // Wide marker body
                 moveTo(14.8f, 3.2f)
                 lineTo(20.8f, 9.2f)
                 lineTo(11.4f, 18.6f)
                 lineTo(5.4f, 12.6f)
                 close()
-                // Chisel nib trap
+            }
+            // Amber chisel tip
+            path(
+                fill = highlighterTipBrush,
+                stroke = inkOutlineBrush,
+                strokeLineWidth = 1.5f,
+                strokeLineCap = StrokeCap.Round,
+                strokeLineJoin = StrokeJoin.Round
+            ) {
                 moveTo(5.6f, 12.8f)
                 lineTo(3.4f, 17.6f)
                 lineTo(6.6f, 20.2f)
                 lineTo(11.2f, 18.4f)
-                // Marker base underline swipe
-                moveTo(3.5f, 20.5f)
-                lineTo(12.5f, 20.5f)
+                close()
             }
         }.build()
     }
 
     /**
-     * Tilted rectangular block eraser outline replacing the legacy scissors icon.
+     * StarNote two-tone coral & white block eraser for precision pixel/split erasing.
      */
     val PrecisionEraser: ImageVector by lazy {
         ImageVector.Builder(
@@ -173,33 +210,51 @@ object StylusIcons {
             viewportWidth = 24f,
             viewportHeight = 24f
         ).apply {
+            // Lower white paper sleeve
             path(
-                fill = null,
-                stroke = strokeBrush,
-                strokeLineWidth = 1.75f,
+                fill = sleeveFillBrush,
+                stroke = inkOutlineBrush,
+                strokeLineWidth = 1.5f,
                 strokeLineCap = StrokeCap.Round,
                 strokeLineJoin = StrokeJoin.Round
             ) {
-                // Tilted eraser block (approx -42 deg)
-                moveTo(13.6f, 4.2f)
-                lineTo(19.8f, 10.4f)
-                lineTo(10.6f, 19.6f)
-                lineTo(5.6f, 19.6f)
-                lineTo(4.0f, 18.0f)
-                lineTo(4.0f, 13.8f)
+                moveTo(4.0f, 13.8f)
+                lineTo(8.9f, 8.9f)
+                lineTo(15.0f, 15.0f)
+                lineTo(10.5f, 19.5f)
+                lineTo(5.6f, 19.5f)
+                lineTo(4.0f, 17.9f)
                 close()
-                // Mid-sleeve divider distinguishing top & tip
-                moveTo(9.0f, 8.8f)
-                lineTo(15.2f, 15.0f)
-                // Clean baseline under the eraser corner
-                moveTo(12.8f, 19.6f)
-                lineTo(20.0f, 19.6f)
+            }
+            // Coral red rubber eraser top
+            path(
+                fill = eraserCoralBrush,
+                stroke = inkOutlineBrush,
+                strokeLineWidth = 1.5f,
+                strokeLineCap = StrokeCap.Round,
+                strokeLineJoin = StrokeJoin.Round
+            ) {
+                moveTo(8.9f, 8.9f)
+                lineTo(13.6f, 4.2f)
+                lineTo(19.8f, 10.4f)
+                lineTo(15.0f, 15.0f)
+                close()
+            }
+            // Clean precision baseline under the eraser
+            path(
+                fill = null,
+                stroke = eraserRuleBrush,
+                strokeLineWidth = 1.6f,
+                strokeLineCap = StrokeCap.Round
+            ) {
+                moveTo(13.0f, 19.7f)
+                lineTo(20.0f, 19.7f)
             }
         }.build()
     }
 
     /**
-     * Whole-stroke eraser: block eraser plus dashed deleted segment cue.
+     * Whole-stroke eraser: StarNote coral block eraser plus sky-blue dashed erased stroke cue.
      */
     val VectorEraser: ImageVector by lazy {
         ImageVector.Builder(
@@ -209,36 +264,55 @@ object StylusIcons {
             viewportWidth = 24f,
             viewportHeight = 24f
         ).apply {
+            // Lower paper sleeve
             path(
-                fill = null,
-                stroke = strokeBrush,
-                strokeLineWidth = 1.75f,
+                fill = sleeveFillBrush,
+                stroke = inkOutlineBrush,
+                strokeLineWidth = 1.5f,
                 strokeLineCap = StrokeCap.Round,
                 strokeLineJoin = StrokeJoin.Round
             ) {
-                // Smaller shifted eraser silhouette
-                moveTo(12.8f, 3.8f)
-                lineTo(18.6f, 9.6f)
+                moveTo(3.8f, 12.6f)
+                lineTo(8.3f, 8.1f)
+                lineTo(14.2f, 14.0f)
                 lineTo(10.2f, 18.0f)
                 lineTo(5.4f, 18.0f)
                 lineTo(3.8f, 16.4f)
-                lineTo(3.8f, 12.8f)
                 close()
-                moveTo(8.3f, 8.3f)
-                lineTo(14.1f, 14.1f)
-                // Dashed erased path segments below
-                moveTo(4.0f, 20.5f)
-                lineTo(8.0f, 20.5f)
-                moveTo(11.0f, 20.5f)
-                lineTo(15.0f, 20.5f)
-                moveTo(18.0f, 20.5f)
-                lineTo(20.5f, 20.5f)
+            }
+            // Coral rubber head
+            path(
+                fill = eraserCoralBrush,
+                stroke = inkOutlineBrush,
+                strokeLineWidth = 1.5f,
+                strokeLineCap = StrokeCap.Round,
+                strokeLineJoin = StrokeJoin.Round
+            ) {
+                moveTo(8.3f, 8.1f)
+                lineTo(12.8f, 3.6f)
+                lineTo(18.7f, 9.5f)
+                lineTo(14.2f, 14.0f)
+                close()
+            }
+            // Sky-blue dashed vector stroke fragments below
+            path(
+                fill = null,
+                stroke = vectorSweepBrush,
+                strokeLineWidth = 1.85f,
+                strokeLineCap = StrokeCap.Round
+            ) {
+                moveTo(4.0f, 20.6f)
+                lineTo(8.0f, 20.6f)
+                moveTo(11.0f, 20.6f)
+                lineTo(15.0f, 20.6f)
+                moveTo(18.0f, 20.6f)
+                lineTo(20.4f, 20.6f)
             }
         }.build()
     }
 
     /**
-     * True dashed freeform loop lasso matching StarNote IMG_2724.
+     * True dashed freeform loop lasso in sky-blue/indigo matching StarNote IMG_2724.
      */
     val Lasso: ImageVector by lazy {
         ImageVector.Builder(
@@ -250,8 +324,8 @@ object StylusIcons {
         ).apply {
             path(
                 fill = null,
-                stroke = strokeBrush,
-                strokeLineWidth = 1.75f,
+                stroke = lassoPrimaryBrush,
+                strokeLineWidth = 1.85f,
                 strokeLineCap = StrokeCap.Round,
                 strokeLineJoin = StrokeJoin.Round
             ) {
@@ -267,9 +341,21 @@ object StylusIcons {
                 // Left arc dashes
                 moveTo(4.0f, 13.4f)
                 quadTo(2.8f, 10.0f, 4.6f, 7.6f)
-                // Lasso knot loop & tail at bottom-left/bottom-center
+            }
+            // Deep indigo lasso tail & knot dot
+            path(
+                fill = null,
+                stroke = lassoAccentBrush,
+                strokeLineWidth = 1.9f,
+                strokeLineCap = StrokeCap.Round
+            ) {
                 moveTo(8.0f, 17.0f)
                 quadTo(8.5f, 20.5f, 6.0f, 21.4f)
+            }
+            path(fill = lassoAccentBrush) {
+                moveTo(9.4f, 16.7f)
+                arcTo(1.5f, 1.5f, 0f, true, true, 6.4f, 16.7f)
+                arcTo(1.5f, 1.5f, 0f, true, true, 9.4f, 16.7f)
             }
         }.build()
     }
@@ -300,7 +386,7 @@ object StylusIcons {
     }
 
     /**
-     * Geometric shapes tool icon (overlapping square and circle) for inserting 2D/3D primitives.
+     * StarNote 2x2 multi-colored geometric shapes palette icon (circle, diamond, triangle, square).
      */
     val ShapesTool: ImageVector by lazy {
         ImageVector.Builder(
@@ -310,28 +396,112 @@ object StylusIcons {
             viewportWidth = 24f,
             viewportHeight = 24f
         ).apply {
+            // Top-left coral circle
+            path(
+                fill = SolidColor(Color(0xFFFEE2E2)),
+                stroke = SolidColor(Color(0xFFEF4444)),
+                strokeLineWidth = 1.55f
+            ) {
+                moveTo(10.8f, 7.4f)
+                arcTo(3.4f, 3.4f, 0f, isMoreThanHalf = true, isPositiveArc = false, 4.0f, 7.4f)
+                arcTo(3.4f, 3.4f, 0f, isMoreThanHalf = true, isPositiveArc = false, 10.8f, 7.4f)
+                close()
+            }
+            // Top-right emerald diamond
+            path(
+                fill = SolidColor(Color(0xFFD1FAE5)),
+                stroke = SolidColor(Color(0xFF10B981)),
+                strokeLineWidth = 1.55f,
+                strokeLineJoin = StrokeJoin.Round
+            ) {
+                moveTo(16.6f, 3.8f)
+                lineTo(20.2f, 7.4f)
+                lineTo(16.6f, 11.0f)
+                lineTo(13.0f, 7.4f)
+                close()
+            }
+            // Bottom-left blue triangle
+            path(
+                fill = SolidColor(Color(0xFFDBEAFE)),
+                stroke = SolidColor(Color(0xFF3B82F6)),
+                strokeLineWidth = 1.55f,
+                strokeLineJoin = StrokeJoin.Round
+            ) {
+                moveTo(7.4f, 13.0f)
+                lineTo(11.0f, 19.8f)
+                lineTo(3.8f, 19.8f)
+                close()
+            }
+            // Bottom-right amber square
+            path(
+                fill = SolidColor(Color(0xFFFEF3C7)),
+                stroke = SolidColor(Color(0xFFF59E0B)),
+                strokeLineWidth = 1.55f,
+                strokeLineJoin = StrokeJoin.Round
+            ) {
+                moveTo(13.4f, 13.4f)
+                lineTo(19.8f, 13.4f)
+                lineTo(19.8f, 19.8f)
+                lineTo(13.4f, 19.8f)
+                close()
+            }
+        }.build()
+    }
+
+    /**
+     * StarNote colored gallery photo-insert icon (framed landscape with sun & mountains).
+     */
+    val InsertImage: ImageVector by lazy {
+        ImageVector.Builder(
+            name = "InsertImage",
+            defaultWidth = 24.dp,
+            defaultHeight = 24.dp,
+            viewportWidth = 24f,
+            viewportHeight = 24f
+        ).apply {
+            // Card sky background
+            path(
+                fill = SolidColor(Color(0xFFF8FAFC))
+            ) {
+                moveTo(3.5f, 4.5f)
+                lineTo(20.5f, 4.5f)
+                lineTo(20.5f, 19.5f)
+                lineTo(3.5f, 19.5f)
+                close()
+            }
+            // Warm sun circle
+            path(fill = SolidColor(Color(0xFFF59E0B))) {
+                moveTo(10.0f, 9.0f)
+                arcTo(1.9f, 1.9f, 0f, isMoreThanHalf = true, isPositiveArc = false, 6.2f, 9.0f)
+                arcTo(1.9f, 1.9f, 0f, isMoreThanHalf = true, isPositiveArc = false, 10.0f, 9.0f)
+                close()
+            }
+            // Distant emerald mountain
+            path(fill = SolidColor(Color(0xFF10B981))) {
+                moveTo(10.2f, 19.0f)
+                lineTo(15.6f, 11.2f)
+                lineTo(20.2f, 19.0f)
+                close()
+            }
+            // Foreground teal mountain
+            path(fill = SolidColor(Color(0xFF0D9488))) {
+                moveTo(3.8f, 19.0f)
+                lineTo(8.6f, 13.4f)
+                lineTo(13.8f, 19.0f)
+                close()
+            }
+            // Crisp slate border frame
             path(
                 fill = null,
-                stroke = strokeBrush,
-                strokeLineWidth = 1.75f,
+                stroke = SolidColor(Color(0xFF475569)),
+                strokeLineWidth = 1.65f,
                 strokeLineCap = StrokeCap.Round,
                 strokeLineJoin = StrokeJoin.Round
             ) {
-                // Top triangle
-                moveTo(12f, 3.2f)
-                lineTo(17.2f, 11.4f)
-                lineTo(6.8f, 11.4f)
-                close()
-                // Bottom-left square
-                moveTo(4f, 13.6f)
-                lineTo(10.8f, 13.6f)
-                lineTo(10.8f, 20.4f)
-                lineTo(4f, 20.4f)
-                close()
-                // Bottom-right circle (4 quadrant arcs)
-                moveTo(20.6f, 17f)
-                arcTo(3.6f, 3.6f, 0f, isMoreThanHalf = true, isPositiveArc = false, 13.4f, 17f)
-                arcTo(3.6f, 3.6f, 0f, isMoreThanHalf = true, isPositiveArc = false, 20.6f, 17f)
+                moveTo(3.5f, 4.5f)
+                lineTo(20.5f, 4.5f)
+                lineTo(20.5f, 19.5f)
+                lineTo(3.5f, 19.5f)
                 close()
             }
         }.build()

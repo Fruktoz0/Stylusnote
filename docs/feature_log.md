@@ -12,21 +12,21 @@ flowchart TD
         MA["MainActivity (144 Hz Lock + Immerzív Teljes Képernyő)"]
         BS["BookshelfScreen (2 Panel, Drag&Drop Kategória, FTS4, ... Menü, NotebookLM PDF)"]
         CTB["CanvasTopToolbar (Bal Felső Sarokhoz Csatolva, Zoom -/%/+ + AI Pill)"]
-        FTD["FloatingToolDock (Globális (x,y), Eszközmemória, Alakzatok, OCR, Teljes Képernyő)"]
-        SPP["ShapePickerPopover + GeometricShapeObject (24+8 2D/3D alakzat, tag=6)"]
+        FTD["FloatingToolDock (Globális (x,y), Eszközmemória, StarNote Színes Ikonok, Alakzatok, Képbeszúrás, Teljes Képernyő)"]
+        SPP["ShapePickerPopover (HorizontalPager 2D→3D) & GeometricShapeObject (tag=6) & ImageObject (tag=7)"]
         LPD["LeftPageDrawer (Függőlegesen Húzható Fül + Drag&Drop Oldalátrendezés)"]
         AIC["AiCopilotSheet (Beállítások + Hatókör + 2 Formázó Mód)"]
-        SDS["StylusDrawingSurface (Lasszó Sarok-Forgatás & ✨ AI + Szellemkép-mentes Mozgatás)"]
+        SDS["StylusDrawingSurface (Lasszó Sarok-Forgatás & ✨ AI + Papírhoz Rögzített PageObjectek)"]
         DCV["DryCanvasView (Hardware View Host)"]
         PBL["PaperBackgroundLayer (1. réteg, többoldalas lapelőnézet + GRID_SIMPLE_5MM)"]
         DIRC["DryInkRasterCache (GPU Kompozit + 512x512 LRU + excludedStrokeIds)"]
         IPS["InProgressStrokesView (4. wet front-buffer)"]
-        HCO["HoverCursorOverlay (7. réteg)"]
+        HCO["HoverCursorOverlay (Tollpötty letiltva; Focus Pen Pro gomb aktív)"]
     end
 
     subgraph CORE["Core Réteg (Matematika, Hardver, AI)"]
         CTM["CanvasTransformMatrix (PDF pt 1/72 in, 0.65x-5.0x, Fit-100%)"]
-        SIR["StylusInputRouter (Palm Rejection, 1-ujjas Pan, Pinch-Zoom, Predictor vs. 1€)"]
+        SIR["StylusInputRouter (650ms Tenyérvédelem + Hover-Zár, Csak Fel-Le 1-ujjas Pan, Pinch-Zoom)"]
         OEF["OneEuroFilter (0-100%)"]
         SI["SpatialIndex (R-fa / QuadTree)"]
         CLI["ColorLuminanceInverter (OLED HSL)"]
@@ -34,12 +34,12 @@ flowchart TD
     end
 
     subgraph DOMAIN["Domain Réteg"]
-        CSH["CanvasStateHolder (Rétegek, Radírok, Lasszó, FormattedTextObject, GeometricShapeObject, Undo/Redo)"]
+        CSH["CanvasStateHolder (Rétegek, Radírok, Lasszó, FormattedText/Latex + originalStrokes, Shapes, Images)"]
         BC["BrushConfig & CanvasAction"]
     end
 
     subgraph DATA["Data Réteg"]
-        SJ["StrokeJournal + PageFileFormat (SNOT tag 1..6 + CRC32 + ATOMIC_MOVE)"]
+        SJ["StrokeJournal + PageFileFormat (SNOT tag 1..7 + CRC32 + ATOMIC_MOVE)"]
         DB["AppDatabase (Room + FTS4 + reorderPagesInNotebook)"]
         PDF["PdfTileRenderer (Szelektív) & PdfExportManager & NotebookLM FileProvider"]
     end
@@ -206,3 +206,21 @@ flowchart TD
   - `testDebugUnitTest`: **69/69** teszt sikeres (16 osztály, 0 hiba, 0 kihagyás).
   - `:app:connectedDebugAndroidTest`: **8/8** teszt sikeres (`TEST-25097RP43G - 16-_app-.xml`, 0 hiba, 0 kihagyás).
   - `:benchmark:connectedBenchmarkAndroidTest` (`panAndZoom10kStrokesCanvasFrameTiming`, 5 iteráció, median `frameCount = 120,0`): **`frameDurationCpuMs` P50 = `4,37 ms`, P90 = `5,51 ms`, P95 = `6,05 ms` (≤ `6,94 ms` teljesítve ✅), P99 = `8,42 ms`**; **`frameOverrunMs` P50 = `-7,31 ms`, P90 = `-5,80 ms`, P95 = `-4,98 ms`, P99 = `-3,25 ms`** (0 eldobott képkocka).
+
+---
+
+### [2026-11-15] — IV. Ütem (Lépés 32–38): Tenyérvédelem, Függőleges 1-Ujjas Pan, Papírhoz Rögzített Objektumok, 2D/3D Lapozó, Eredeti Kézírás Visszaállítása, Képbeszúrás és StarNote Színes Ikonok
+
+- **Lépés 32 (`StylusInputRouter.kt`, `StylusDrawingSurface.kt`, `StylusInputRouterTest.kt`):**
+  - **Tenyérvédelem írás és kézfelemelés közben:** Beépült a `650 ms`-os tollutáni kegyelmi ablak (`POST_STYLUS_PALM_GRACE_WINDOW_MS = 650L`), a stylus hover proximity zár (`isStylusHovering`), a széles tenyérérintés-kizárás (`MAX_FINGER_CONTACT_MAJOR_PX = 95f`), valamint a `14 px`-es függőleges touch slop (`ONE_FINGER_VERTICAL_TOUCH_SLOP_PX = 14f`).
+  - **Csak fel-le 1 ujjas pan (`dx = 0f`) & tollpötty letiltása:** Az 1 ujjas görgetés kizárólag függőleges tengelyre korlátozódik (`transformMatrix.panBy(0f, dy)`), míg a 2 ujjas pinch-zoom + pan szabadon mozgatható; a zavaró lebegő `HoverCursorOverlay` pötty kikapcsolt (`isVisible = false`), miközben az `ACTION_HOVER_*` proximity zár és a Focus Pen Pro gomb továbbra is aktív maradt.
+- **Lépés 33 (`CanvasStateHolder.kt`, `StylusDrawingSurface.kt`, `LatexOverlayNode.kt`, `BookshelfScreen.kt`):** Aktív pan/zoom közben a `onLiveViewportTransformChanged` növeli a `viewportTransformTick` állapotot (kizárólag `canvasStateHolder.hasPageObjects == true` esetén, így sima kézírásos oldalakon nulla Compose terheléssel), így a beszúrt alakzatok, képek és AI-blokkok 1:1 arányban együtt mozognak és méreteződnek a papírral.
+- **Lépés 34 (`PageObject.kt`, `ShapePickerPopover.kt`, `BrushSettingsPopover.kt`):** A `GeometricShapeType` 0. oldalára kerültek az egyszerű 2D alakzatok/nyilak/koordináta-rendszerek, a 2. oldalra pedig a 3D testek simán animált `HorizontalPager` és animált oldalpötty-jelző kíséretében; a `BrushSettingsPopover` bal oldali teljes sávját a bal alsó sarokba helyezett `26.dp`-s átlós sarok-fogantyú (`◢`) váltotta fel.
+- **Lépés 35 (`PageObject.kt`, `StrokeBinarySerializer.kt`, `CanvasStateHolder.kt`, `LatexOverlayNode.kt`, `BookshelfScreen.kt`):** `LatexObject` és `FormattedTextObject` eltárolja az `originalStrokes: List<PersistedStrokeRecord>` listát `SNOT` perzisztenciával és transzformáció-követéssel; a kijelölő menü `"Eredeti"` gombja (`CanvasStateHolder.restoreObjectToOriginalStrokes`) 1 kattintással visszaállítja az eredeti vonásokat atomikus Undo/Redo támogatással.
+- **Lépés 36 (`PageObject.kt`, `StrokeBinarySerializer.kt`, `LatexOverlayNode.kt`, `PdfExportManager.kt`, `BookshelfScreen.kt`):** Új `PageObject.ImageObject` (`OBJECT_TAG_IMAGE = 7`) galériás (`GetContent("image/*")`) képbeszúrással, `ImageDecoder` orientációhelyes (`maxEdgePx = 1600`) mentéssel (`pages/<pageId>/images/<id>.png`), 32 MB `LruCache` dekódolással, közös `RotatableBoxInteractiveHandles` 4-sarkos méretezéssel / szabad forgatással és vektoros PDF export támogatással.
+- **Lépés 37 (`StylusIcons.kt`, `FloatingToolDock.kt`, `BookshelfScreen.kt`):** `OCR` gomb eltávolítva a lebegő eszköztárról és lecserélve a `"Kép beszúrása"` műveletre; az eszköztár (`CollapsedDockContent`, `ToolButtonsGroup`, `ActionButtonsGroup`) `IMG_2724` mintájú többszínű StarNote vektoros ikonokat jelenít meg (`preserveIconColors = true`, `Color.Unspecified`).
+- **Lépés 38 verifikációs eredményei (`25097RP43G` Xiaomi Pad 8 — Android 16 / SDK 36):**
+  - `.\gradlew testDebugUnitTest`: **71/71** JVM unit teszt sikeres (`16` osztály, `0` hiba, `0` kihagyás — kibővített `StylusInputRouterTest` `9/9` és `StrokeJournalRoundTripTest` `7/7` tesztekkel).
+  - `.\gradlew :app:connectedDebugAndroidTest`: **8/8** műszerezett teszt sikeres (`TEST-25097RP43G - 16-_app-.xml`, `0` hiba, `0` kihagyás).
+  - `.\gradlew :benchmark:connectedBenchmarkAndroidTest` (`panAndZoom10kStrokesCanvasFrameTiming`, 5 iteráció, median `frameCount = 120,0`, `CV = 0,95%`): **`frameDurationCpuMs` P50 = `4,30 ms`, P90 = `5,51 ms`, P95 = `5,95 ms` (≤ `6,94 ms` teljesítve ✅), P99 = `8,64 ms`**; **`frameOverrunMs` P50 = `-7,41 ms`, P90 = `-6,15 ms`, P95 = `-5,66 ms`, P99 = `-3,32 ms`** (0 eldobott képkocka).
+  - `.\gradlew :app:installDebug` + `am start -n hu.bdev.stylusnote/.MainActivity`: A friss `app-debug.apk` telepítve és elindítva a `25097RP43G` táblagépen.

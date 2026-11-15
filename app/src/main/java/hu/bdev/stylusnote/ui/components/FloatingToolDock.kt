@@ -106,8 +106,7 @@ fun FloatingToolDock(
     onToggleDebugOverlay: () -> Unit,
     onToggleFullScreen: () -> Unit = {},
     onOpenShapes: () -> Unit = {},
-    onTriggerNotebookOcr: () -> Unit = {},
-    isOcrRunning: Boolean = false,
+    onInsertImage: () -> Unit = {},
     onDockBoundsChanged: (Rect) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
@@ -241,12 +240,11 @@ fun FloatingToolDock(
                         isDarkTheme = isDarkTheme,
                         showDebugOverlay = showDebugOverlay,
                         isFullScreen = isFullScreen,
-                        isOcrRunning = isOcrRunning,
                         onUndo = onUndo,
                         onRedo = onRedo,
                         onFitPage = onFitPage,
                         onOpenShapes = onOpenShapes,
-                        onTriggerNotebookOcr = onTriggerNotebookOcr,
+                        onInsertImage = onInsertImage,
                         onOpenPaperSettings = onOpenPaperSettings,
                         onToggleTheme = onToggleTheme,
                         onToggleDebugOverlay = onToggleDebugOverlay,
@@ -302,12 +300,11 @@ fun FloatingToolDock(
                         isDarkTheme = isDarkTheme,
                         showDebugOverlay = showDebugOverlay,
                         isFullScreen = isFullScreen,
-                        isOcrRunning = isOcrRunning,
                         onUndo = onUndo,
                         onRedo = onRedo,
                         onFitPage = onFitPage,
                         onOpenShapes = onOpenShapes,
-                        onTriggerNotebookOcr = onTriggerNotebookOcr,
+                        onInsertImage = onInsertImage,
                         onOpenPaperSettings = onOpenPaperSettings,
                         onToggleTheme = onToggleTheme,
                         onToggleDebugOverlay = onToggleDebugOverlay,
@@ -382,6 +379,7 @@ private fun CollapsedDockContent(
             contentDescription = activePenTool.displayName,
             selected = isPenSelected,
             accentDotColor = accentColor,
+            preserveIconColors = true,
             onClick = { onSelectTool(activePenTool) },
             onLongClick = { onOpenToolSettings(activePenTool) }
         )
@@ -391,6 +389,7 @@ private fun CollapsedDockContent(
             selected = isEraserSelected,
             accentDotColor = null,
             selectedTintOverride = LocalStylusSurfacePalette.current.eraserAccent,
+            preserveIconColors = true,
             onClick = { onSelectTool(activeEraser) },
             onLongClick = { onOpenToolSettings(activeEraser) }
         )
@@ -500,6 +499,7 @@ private fun ToolButtonsGroup(
             selected = selected,
             accentDotColor = dotColor,
             selectedTintOverride = eraserTint,
+            preserveIconColors = true,
             onClick = { onSelectTool(tool) },
             onLongClick = {
                 if (!selected) {
@@ -586,12 +586,11 @@ private fun ActionButtonsGroup(
     isDarkTheme: Boolean,
     showDebugOverlay: Boolean,
     isFullScreen: Boolean,
-    isOcrRunning: Boolean,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
     onFitPage: () -> Unit,
     onOpenShapes: () -> Unit,
-    onTriggerNotebookOcr: () -> Unit,
+    onInsertImage: () -> Unit,
     onOpenPaperSettings: () -> Unit,
     onToggleTheme: () -> Unit,
     onToggleDebugOverlay: () -> Unit,
@@ -623,15 +622,17 @@ private fun ActionButtonsGroup(
         icon = StylusIcons.ShapesTool,
         contentDescription = "Alakzatok beszúrása",
         selected = false,
+        preserveIconColors = true,
         onClick = onOpenShapes,
         onLongClick = onOpenShapes
     )
     DockToolIconButton(
-        icon = StylusIcons.OcrText,
-        contentDescription = "Füzet OCR felismerés",
-        selected = isOcrRunning,
-        onClick = { if (!isOcrRunning) onTriggerNotebookOcr() },
-        onLongClick = { if (!isOcrRunning) onTriggerNotebookOcr() }
+        icon = StylusIcons.InsertImage,
+        contentDescription = "Kép beszúrása",
+        selected = false,
+        preserveIconColors = true,
+        onClick = onInsertImage,
+        onLongClick = onInsertImage
     )
     IconButton(
         onClick = onFitPage,
@@ -688,7 +689,8 @@ private fun DockToolIconButton(
     onClick: () -> Unit,
     onLongClick: () -> Unit,
     accentDotColor: Color? = null,
-    selectedTintOverride: Color? = null
+    selectedTintOverride: Color? = null,
+    preserveIconColors: Boolean = false
 ) {
     val surfacePalette = LocalStylusSurfacePalette.current
     val shape = RoundedCornerShape(12.dp)
@@ -698,16 +700,25 @@ private fun DockToolIconButton(
         else -> Color.Transparent
     }
     val fgColor = when {
+        preserveIconColors -> Color.Unspecified
         selected && selectedTintOverride != null -> selectedTintOverride
         selected -> MaterialTheme.colorScheme.primary
         else -> MaterialTheme.colorScheme.onSurfaceVariant
     }
+    val selectedBorderColor = selectedTintOverride ?: MaterialTheme.colorScheme.primary
 
     Box(
         modifier = Modifier
             .size(36.dp)
             .clip(shape)
             .background(bgColor)
+            .then(
+                if (selected && preserveIconColors) {
+                    Modifier.border(1.25.dp, selectedBorderColor.copy(alpha = 0.65f), shape)
+                } else {
+                    Modifier
+                }
+            )
             .combinedClickable(
                 onClick = onClick,
                 onLongClick = onLongClick
@@ -718,7 +729,7 @@ private fun DockToolIconButton(
             imageVector = icon,
             contentDescription = contentDescription,
             tint = fgColor,
-            modifier = Modifier.size(19.dp)
+            modifier = Modifier.size(if (preserveIconColors) 21.dp else 19.dp)
         )
         if (accentDotColor != null) {
             Box(
