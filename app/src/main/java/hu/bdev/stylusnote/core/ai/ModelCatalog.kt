@@ -261,7 +261,8 @@ class ModelCatalog(
     private val httpClient: OkHttpClient = defaultCatalogHttpClient(),
     private val baseUrl: String = DEFAULT_BASE_URL,
     private val clockNowMs: () -> Long = { System.currentTimeMillis() },
-    private val cacheTtlMs: Long = DEFAULT_CACHE_TTL_MS
+    private val cacheTtlMs: Long = DEFAULT_CACHE_TTL_MS,
+    private val extraHeaders: Map<String, String> = emptyMap()
 ) {
     private val mutex = Mutex()
     private val dynamicallyRetiredIds = LinkedHashSet<String>()
@@ -273,35 +274,70 @@ class ModelCatalog(
     }
 
     suspend fun refreshCatalog(apiKey: String): ModelResolutionResult {
-        val cleanKey = apiKey.trim()
-        require(cleanKey.isNotEmpty()) { "A modellkatalógus frissítéséhez API-kulcs szükséges." }
+        val cleanKey = GeminiApiSupport.validateHeaderSafeApiKey(apiKey)
+        val retiredSnapshot = mutex.withLock { dynamicallyRetiredIds.toSet() }
+        val accumulated = ArrayList<GeminiModelInfo>()
+        var nextPageToken: String? = null
+        var pageCount = 0
 
-        val url = "${baseUrl.trimEnd('/')}/v1beta/models?pageSize=200"
-        val request = Request.Builder()
-            .url(url)
-            .header("x-goog-api-key", cleanKey)
-            .get()
-            .build()
-
-        val bodyString = withContext(Dispatchers.IO) {
-            httpClient.newCall(request).execute().use { response ->
-                val rawBody = response.body?.string().orEmpty()
-                if (!response.isSuccessful) {
-                    throw ModelCatalogException(
-                        "A Gemini modellek lekérdezése sikertelen (HTTP ${response.code})."
-                    )
-                }
-                rawBody
+        while (pageCount < MAX_CATALOG_PAGES) {
+            val baseEndpoint = "${baseUrl.trimEnd('/')}/v1beta/models?pageSize=1000"
+            val url = if (nextPageToken != null) {
+                "$baseEndpoint&pageToken=${java.net.URLEncoder.encode(nextPageToken, "UTF-8")}"
+            } else {
+                baseEndpoint
             }
+            val builder = Request.Builder()
+                .url(url)
+                .header(GeminiApiSupport.HEADER_API_KEY, cleanKey)
+                .get()
+            extraHeaders.forEach { (k, v) ->
+                if (k.isNotBlank() && v.isNotBlank()) {
+                    builder.header(k, v)
+                }
+            }
+            val request = builder.build()
+
+            val bodyString = try {
+                withContext(Dispatchers.IO) {
+                    httpClient.newCall(request).execute().use { response ->
+                        val rawBody = response.body?.string().orEmpty()
+                        if (!response.isSuccessful) {
+                            throw ModelCatalogException(
+                                GeminiApiSupport.formatGoogleApiHttpError(
+                                    statusCode = response.code,
+                                    rawBody = rawBody,
+                                    operationLabelHu = "A Gemini modellek lekérdezése sikertelen",
+                                    androidHeaders = extraHeaders
+                                )
+                            )
+                        }
+                        rawBody
+                    }
+                }
+            } catch (mce: ModelCatalogException) {
+                throw mce
+            } catch (ioe: IOException) {
+                val detail = ioe.message?.takeIf { it.isNotBlank() } ?: ioe.javaClass.simpleName
+                throw ModelCatalogException(
+                    "Hálózati hiba a Gemini modellek lekérdezésekor: $detail",
+                    ioe
+                )
+            }
+
+            accumulated += parseModelsListJson(bodyString, retiredSnapshot)
+            val root = runCatching { GeminiJsonCodec.parseObject(bodyString) }.getOrNull()
+            nextPageToken = root?.get("nextPageToken")?.toString()?.takeIf { it.isNotBlank() }
+            pageCount++
+            if (nextPageToken == null) break
         }
 
-        val retiredSnapshot = mutex.withLock { dynamicallyRetiredIds.toSet() }
-        val parsed = parseModelsListJson(bodyString, retiredSnapshot)
+        val parsed = accumulated.distinctBy { it.id }
         mutex.withLock {
             cachedModels = parsed
             lastFetchedMs = clockNowMs()
         }
-        return selectBestFlashModel(parsed, userOverrideId = null)
+        return selectBestFlashModel(parsed, userOverrideId = null, dynamicallyRetiredIds = retiredSnapshot)
     }
 
     suspend fun resolveActiveFlashModel(
@@ -424,6 +460,7 @@ class ModelCatalog(
         const val DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com"
         const val DEFAULT_FALLBACK_FLASH_MODEL = "gemini-2.5-flash"
         const val DEFAULT_CACHE_TTL_MS = 6 * 60 * 60 * 1000L
+        private const val MAX_CATALOG_PAGES = 5
 
         val FALLBACK_FLASH_MODEL_CHAIN: List<String> = listOf(
             "gemini-2.5-flash",

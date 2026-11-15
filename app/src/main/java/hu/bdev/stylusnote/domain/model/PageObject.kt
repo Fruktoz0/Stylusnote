@@ -1,9 +1,13 @@
 package hu.bdev.stylusnote.domain.model
 
 import hu.bdev.stylusnote.core.hardware.StylusPointSample
+import hu.bdev.stylusnote.core.math.DocPoint
 import hu.bdev.stylusnote.core.math.DocRect
 import hu.bdev.stylusnote.core.math.ShapeMeta
+import kotlin.math.abs
 import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.sin
 
 /**
  * Z-ordered canvas layer for persisted ink strokes (Section 3 & 9.2).
@@ -37,7 +41,8 @@ data class PersistedStrokeRecord(
     val bounds: DocRect,
     val shapeMeta: ShapeMeta? = null,
     val serializedBrushFamily: ByteArray? = null,
-    val usedFallbackBrush: Boolean = false
+    val usedFallbackBrush: Boolean = false,
+    val attachedObjectId: String? = null
 ) {
     fun withTransform(affine: AffineTransform2D): PersistedStrokeRecord {
         val transformedSamples = samples.map { pt ->
@@ -71,6 +76,7 @@ data class PersistedStrokeRecord(
         if (shapeMeta != other.shapeMeta) return false
         if (!nullableByteArrayEquals(serializedBrushFamily, other.serializedBrushFamily)) return false
         if (usedFallbackBrush != other.usedFallbackBrush) return false
+        if (attachedObjectId != other.attachedObjectId) return false
         return true
     }
 
@@ -87,6 +93,7 @@ data class PersistedStrokeRecord(
         result = 31 * result + (shapeMeta?.hashCode() ?: 0)
         result = 31 * result + (serializedBrushFamily?.contentHashCode() ?: 0)
         result = 31 * result + usedFallbackBrush.hashCode()
+        result = 31 * result + (attachedObjectId?.hashCode() ?: 0)
         return result
     }
 
@@ -361,6 +368,111 @@ sealed interface PageObject {
         ): PageObject = (transform(affine) as ImageObject).copy(
             id = newId,
             zOrder = newZOrder
+        )
+    }
+}
+
+/**
+ * Pure geometry helpers for attaching handwritten ink strokes to under-ink [PageObject.ImageObject]s
+ * and keeping them aligned through translations, rotations, and non-uniform corner resizes.
+ */
+object ObjectAttachmentGeometry {
+    const val DEFAULT_ATTACHMENT_MARGIN_PT: Float = 2f
+
+    fun containsPointInRotatedRect(
+        xPt: Float,
+        yPt: Float,
+        bounds: DocRect,
+        rotationRadians: Float,
+        marginPt: Float = DEFAULT_ATTACHMENT_MARGIN_PT
+    ): Boolean {
+        val cx = bounds.centerXPt
+        val cy = bounds.centerYPt
+        val hw = bounds.widthPt * 0.5f + marginPt
+        val hh = bounds.heightPt * 0.5f + marginPt
+        val dx = xPt - cx
+        val dy = yPt - cy
+        if (abs(rotationRadians) < 1e-5f) {
+            return abs(dx) <= hw && abs(dy) <= hh
+        }
+        val c = cos(-rotationRadians)
+        val s = sin(-rotationRadians)
+        val localX = dx * c - dy * s
+        val localY = dx * s + dy * c
+        return abs(localX) <= hw && abs(localY) <= hh
+    }
+
+    fun isStrokeAttachedToImage(
+        points: List<DocPoint>,
+        image: PageObject.ImageObject,
+        marginPt: Float = DEFAULT_ATTACHMENT_MARGIN_PT
+    ): Boolean {
+        if (points.isEmpty()) return false
+        var insideCount = 0
+        for (i in 0 until points.size) {
+            val pt = points[i]
+            if (containsPointInRotatedRect(pt.xPt, pt.yPt, image.bounds, image.rotationRadians, marginPt)) {
+                insideCount++
+            }
+        }
+        return insideCount * 2 >= points.size
+    }
+
+    fun findTopmostImageForStroke(
+        points: List<DocPoint>,
+        objects: Collection<PageObject>,
+        marginPt: Float = DEFAULT_ATTACHMENT_MARGIN_PT
+    ): PageObject.ImageObject? {
+        if (points.isEmpty() || objects.isEmpty()) return null
+        var best: PageObject.ImageObject? = null
+        for (obj in objects) {
+            if (obj !is PageObject.ImageObject) continue
+            if (best != null && obj.zOrder <= best.zOrder) continue
+            if (isStrokeAttachedToImage(points, obj, marginPt)) {
+                best = obj
+            }
+        }
+        return best
+    }
+
+    fun computeOrientedBoxAffineTransform(
+        beforeBounds: DocRect,
+        beforeRotationRad: Float,
+        afterBounds: DocRect,
+        afterRotationRad: Float
+    ): AffineTransform2D {
+        val sx = (afterBounds.widthPt / beforeBounds.widthPt.coerceAtLeast(1e-3f)).coerceAtLeast(0.05f)
+        val sy = (afterBounds.heightPt / beforeBounds.heightPt.coerceAtLeast(1e-3f)).coerceAtLeast(0.05f)
+        return AffineTransform2D.translation(-beforeBounds.centerXPt, -beforeBounds.centerYPt)
+            .then(AffineTransform2D.rotationAround(-beforeRotationRad, 0f, 0f))
+            .then(AffineTransform2D(scaleX = sx, scaleY = sy))
+            .then(AffineTransform2D.rotationAround(afterRotationRad, 0f, 0f))
+            .then(AffineTransform2D.translation(afterBounds.centerXPt, afterBounds.centerYPt))
+    }
+
+    fun computeObjectInteractionAffine(
+        beforeObject: PageObject,
+        afterObject: PageObject
+    ): AffineTransform2D {
+        val beforeRot = when (beforeObject) {
+            is PageObject.ImageObject -> beforeObject.rotationRadians
+            is PageObject.GeometricShapeObject -> beforeObject.rotationRadians
+            is PageObject.FormattedTextObject -> beforeObject.rotationRadians
+            is PageObject.LatexObject -> beforeObject.rotationRadians
+            else -> 0f
+        }
+        val afterRot = when (afterObject) {
+            is PageObject.ImageObject -> afterObject.rotationRadians
+            is PageObject.GeometricShapeObject -> afterObject.rotationRadians
+            is PageObject.FormattedTextObject -> afterObject.rotationRadians
+            is PageObject.LatexObject -> afterObject.rotationRadians
+            else -> 0f
+        }
+        return computeOrientedBoxAffineTransform(
+            beforeBounds = beforeObject.bounds,
+            beforeRotationRad = beforeRot,
+            afterBounds = afterObject.bounds,
+            afterRotationRad = afterRot
         )
     }
 }

@@ -294,14 +294,13 @@ class AiConsentStore(
     }
 
     suspend fun saveApiKey(rawApiKey: String) {
-        val trimmed = rawApiKey.trim()
-        require(trimmed.isNotEmpty()) { "Az API-kulcs nem lehet üres." }
-        val encrypted = cipher.encrypt(trimmed.toByteArray(StandardCharsets.UTF_8))
+        val clean = GeminiApiSupport.validateHeaderSafeApiKey(rawApiKey)
+        val encrypted = cipher.encrypt(clean.toByteArray(StandardCharsets.UTF_8))
         val encoded = Base64.getEncoder().encodeToString(encrypted)
         storage.write(
             mapOf(
                 KEY_ENCRYPTED_API_KEY_B64 to encoded,
-                KEY_MASKED_API_KEY_PREVIEW to maskApiKey(trimmed)
+                KEY_MASKED_API_KEY_PREVIEW to maskApiKey(clean)
             )
         )
     }
@@ -322,7 +321,7 @@ class AiConsentStore(
         }
         return try {
             val plainBytes = cipher.decrypt(encrypted)
-            val key = String(plainBytes, StandardCharsets.UTF_8).trim()
+            val key = GeminiApiSupport.sanitizeApiKey(String(plainBytes, StandardCharsets.UTF_8))
             plainBytes.fill(0)
             key.ifEmpty { null }
         } catch (e: GeneralSecurityException) {

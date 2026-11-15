@@ -341,6 +341,22 @@ object PaperBackgroundRenderer {
     }
 
     /**
+     * Draws a crisp sheet border at `0..pageWidthPt x 0..pageHeightPt` on top of an opaque PDF
+     * background layer so sheets remain distinctly framed in both light and OLED dark modes.
+     */
+    @Synchronized
+    fun drawSheetBorderInCurrentDocSpace(
+        canvas: Canvas,
+        pageWidthPt: Float,
+        pageHeightPt: Float,
+        scale: Float,
+        palette: StylusSurfacePalette
+    ) {
+        configurePaints(scale = scale.coerceAtLeast(0.05f), palette = palette)
+        canvas.drawRect(0f, 0f, pageWidthPt, pageHeightPt, paperBorderPaint)
+    }
+
+    /**
      * Renders the complete fixed-page sheet (paper fill, clipped ruling/grid, and border) into an
      * offscreen bitmap whose origin (0, 0) corresponds to document origin scaled by [pageScale].
      */

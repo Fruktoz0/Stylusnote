@@ -101,6 +101,14 @@ object StrokeBinarySerializer {
             }
         }
 
+        val attachedObjectId = record.attachedObjectId
+        if (attachedObjectId == null) {
+            out.writeBoolean(false)
+        } else {
+            out.writeBoolean(true)
+            writeIdentifier(out, attachedObjectId)
+        }
+
         out.flush()
         return baos.toByteArray()
     }
@@ -184,6 +192,12 @@ object StrokeBinarySerializer {
             eraserRadiusDp = eraserRadiusDp
         )
 
+        val attachedObjectId = if (input.available() > 0 && input.readBoolean()) {
+            readIdentifier(input)
+        } else {
+            null
+        }
+
         return PersistedStrokeRecord(
             id = id,
             layer = layer,
@@ -196,7 +210,8 @@ object StrokeBinarySerializer {
             bounds = bounds,
             shapeMeta = shapeMeta,
             serializedBrushFamily = serializedBrushFamily,
-            usedFallbackBrush = fallbackFromToolCode
+            usedFallbackBrush = fallbackFromToolCode,
+            attachedObjectId = attachedObjectId
         )
     }
 
@@ -505,7 +520,8 @@ object StrokeBinarySerializer {
             bounds = entry.bounds,
             shapeMeta = shapeMeta,
             serializedBrushFamily = encodedFamily,
-            usedFallbackBrush = false
+            usedFallbackBrush = false,
+            attachedObjectId = entry.attachedObjectId
         )
     }
 
@@ -545,7 +561,8 @@ object StrokeBinarySerializer {
             stroke = stroke,
             bounds = bounds,
             zIndex = record.zOrder,
-            isHighlighter = record.layer == StrokeLayerType.HIGHLIGHTER
+            isHighlighter = record.layer == StrokeLayerType.HIGHLIGHTER,
+            attachedObjectId = record.attachedObjectId
         ) to usedFallback
     }
 

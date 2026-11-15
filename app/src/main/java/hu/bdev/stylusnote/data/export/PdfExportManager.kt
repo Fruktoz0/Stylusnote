@@ -1,41 +1,27 @@
 package hu.bdev.stylusnote.data.export
 
 import android.content.Context
-import android.graphics.BitmapFactory
 import android.graphics.Canvas
-import java.io.File
-import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
-import android.graphics.RectF
-import android.graphics.Typeface
 import android.graphics.pdf.PdfDocument
-import android.text.Layout
-import android.text.StaticLayout
-import android.text.TextPaint
 import androidx.ink.geometry.MutableVec
 import androidx.ink.strokes.Stroke
 import hu.bdev.stylusnote.core.hardware.StylusPointSample
-import hu.bdev.stylusnote.core.ai.FunctionEvaluator
 import hu.bdev.stylusnote.core.math.CanvasTransformMatrix
 import hu.bdev.stylusnote.core.math.DocPoint
-import hu.bdev.stylusnote.core.math.GeometricShapeRenderer
 import hu.bdev.stylusnote.core.math.PageDimensionsPt
 import hu.bdev.stylusnote.domain.model.BrushConfig
 import hu.bdev.stylusnote.domain.model.BrushToolType
 import hu.bdev.stylusnote.domain.model.PageObject
 import hu.bdev.stylusnote.domain.model.PagePaperConfig
 import hu.bdev.stylusnote.domain.model.PersistedStrokeRecord
-import hu.bdev.stylusnote.domain.model.StrokeLayerType
 import hu.bdev.stylusnote.ui.canvas.PaperBackgroundRenderer
 import hu.bdev.stylusnote.ui.theme.StylusSurfacePalette
-import ru.noties.jlatexmath.JLatexMathDrawable
 import java.io.OutputStream
 import kotlin.math.PI
-import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.hypot
-import kotlin.math.max
 import kotlin.math.roundToInt
 import kotlin.math.sin
 
@@ -263,42 +249,16 @@ class PdfExportManager(
                     )
                 }
 
-                // Layer 3: Highlighters (zOrder sorted), each isolated with saveLayerAlpha so
-                // self-overlap stays uniform translucent without additive darkening.
-                val sortedStrokes = exportPage.strokes.sortedBy { it.zOrder }
-                for (record in sortedStrokes) {
-                    if (record.layer != StrokeLayerType.HIGHLIGHTER) continue
-                    val path = buildStrokePath(record, exportPage.liveInkStrokesById[record.id])
-                    if (path.isEmpty) continue
-
-                    val alphaByte = (BrushConfig.HIGHLIGHTER_OPACITY * 255f).roundToInt().coerceIn(1, 255)
-                    val layerBounds = RectF(
-                        record.bounds.leftPt - record.sizePt,
-                        record.bounds.topPt - record.sizePt,
-                        record.bounds.rightPt + record.sizePt,
-                        record.bounds.bottomPt + record.sizePt
-                    )
-                    val saveId = canvas.saveLayerAlpha(layerBounds, alphaByte)
-                    fillPaint.color = (0xFF shl 24) or (record.canonicalColorArgb and 0x00FFFFFF)
-                    canvas.drawPath(path, fillPaint)
-                    canvas.restoreToCount(saveId)
-                }
-
-                // Layer 4: Standard Ink strokes drawn as crisp filled vector outline Paths.
-                for (record in sortedStrokes) {
-                    if (record.layer != StrokeLayerType.INK) continue
-                    val path = buildStrokePath(record, exportPage.liveInkStrokesById[record.id])
-                    if (path.isEmpty) continue
-
-                    fillPaint.color = record.brushConfig.effectiveColorArgb(record.canonicalColorArgb)
-                    canvas.drawPath(path, fillPaint)
-                }
-
-                // Layer 5: Embedded LaTeX, function curves, and derivation cards.
-                val sortedObjects = exportPage.objects.sortedBy { it.zOrder }
-                for (obj in sortedObjects) {
-                    drawPageObjectOnPdfCanvas(canvas, obj)
-                }
+                // Layers 2b–5: Under-ink images, highlighters, ink strokes, and embedded objects.
+                CanvasPageVectorRenderer.drawPageForegroundLayers(
+                    canvas = canvas,
+                    strokes = exportPage.strokes,
+                    objects = exportPage.objects,
+                    liveInkStrokesById = exportPage.liveInkStrokesById,
+                    isOledMode = false,
+                    context = context,
+                    fillPaint = fillPaint
+                )
 
                 pdfDocument.finishPage(page)
             }
@@ -308,210 +268,6 @@ class PdfExportManager(
         } finally {
             pdfDocument.close()
         }
-    }
-
-    private fun buildStrokePath(
-        record: PersistedStrokeRecord,
-        liveStroke: Stroke?
-    ): Path {
-        val inkLoops = liveStroke?.let { StrokeOutlineExtractor.extractOutlineLoops(it) }.orEmpty()
-        val loops = if (inkLoops.isNotEmpty()) {
-            inkLoops
-        } else {
-            StrokeOutlineExtractor.buildAnalyticalStrokeOutlineLoops(
-                samples = record.samples,
-                baseSizePt = record.sizePt,
-                toolType = record.brushConfig.toolType
-            )
-        }
-        return StrokeOutlineExtractor.loopsToAndroidPath(loops)
-    }
-
-    private fun drawPageObjectOnPdfCanvas(canvas: Canvas, obj: PageObject) {
-        when (obj) {
-            is PageObject.LatexObject -> {
-                val appContext = context
-                if (appContext != null) {
-                    try {
-                        val drawable = JLatexMathDrawable.builder(obj.latexSource)
-                            .textSize(obj.fontSizePt)
-                            .color(obj.canonicalColorArgb)
-                            .padding(4)
-                            .build()
-                        canvas.save()
-                        canvas.translate(obj.bounds.leftPt, obj.bounds.topPt)
-                        if (abs(obj.rotationRadians) > 1e-4f) {
-                            canvas.rotate(
-                                (obj.rotationRadians * 180.0 / PI).toFloat(),
-                                obj.bounds.widthPt * 0.5f,
-                                obj.bounds.heightPt * 0.5f
-                            )
-                        }
-                        drawable.setBounds(
-                            0,
-                            0,
-                            obj.bounds.widthPt.roundToInt().coerceAtLeast(16),
-                            obj.bounds.heightPt.roundToInt().coerceAtLeast(16)
-                        )
-                        drawable.draw(canvas)
-                        canvas.restore()
-                        return
-                    } catch (_: Throwable) {
-                        // Fall back to clean monospaced formula text if drawable fails to parse/load.
-                    }
-                }
-                val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = obj.canonicalColorArgb
-                    textSize = obj.fontSizePt.coerceIn(10f, 36f)
-                }
-                canvas.drawText(obj.latexSource, obj.bounds.leftPt + 4f, obj.bounds.topPt + textPaint.textSize, textPaint)
-            }
-
-            is PageObject.FunctionPlotObject -> {
-                drawPlotBox(canvas, obj)
-            }
-
-            is PageObject.DerivationCardObject -> {
-                val cardBg = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    style = Paint.Style.FILL
-                    color = Color.rgb(245, 247, 250)
-                }
-                val cardBorder = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    style = Paint.Style.STROKE
-                    strokeWidth = 1.0f
-                    color = Color.rgb(180, 190, 204)
-                }
-                val rect = RectF(obj.bounds.leftPt, obj.bounds.topPt, obj.bounds.rightPt, obj.bounds.bottomPt)
-                canvas.drawRoundRect(rect, 8f, 8f, cardBg)
-                canvas.drawRoundRect(rect, 8f, 8f, cardBorder)
-
-                val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = Color.rgb(20, 23, 28)
-                    textSize = 12f
-                    isFakeBoldText = true
-                }
-                val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = Color.rgb(55, 65, 81)
-                    textSize = 10f
-                }
-                canvas.drawText(obj.title, rect.left + 10f, rect.top + 18f, titlePaint)
-                var yCursor = rect.top + 34f
-                for (line in obj.stepsMarkdownLatex.lines()) {
-                    if (yCursor > rect.bottom - 8f) break
-                    canvas.drawText(line, rect.left + 10f, yCursor, bodyPaint)
-                    yCursor += 13f
-                }
-            }
-
-            is PageObject.PdfPageRefObject -> Unit
-
-            is PageObject.FormattedTextObject -> {
-                val textPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = obj.canonicalColorArgb
-                    textSize = obj.fontSizePt.coerceIn(10f, 72f)
-                    typeface = Typeface.create("cursive", Typeface.ITALIC)
-                }
-                val layoutWidthPx = (obj.bounds.widthPt - 8f).roundToInt().coerceAtLeast(32)
-                val layout = StaticLayout.Builder
-                    .obtain(obj.text, 0, obj.text.length, textPaint, layoutWidthPx)
-                    .setAlignment(Layout.Alignment.ALIGN_NORMAL)
-                    .setLineSpacing(2f, 1.1f)
-                    .setIncludePad(false)
-                    .build()
-                canvas.save()
-                canvas.translate(obj.bounds.leftPt + 4f, obj.bounds.topPt + 4f)
-                if (abs(obj.rotationRadians) > 1e-4f) {
-                    canvas.rotate(
-                        (obj.rotationRadians * 180.0 / PI).toFloat(),
-                        obj.bounds.widthPt * 0.5f,
-                        obj.bounds.heightPt * 0.5f
-                    )
-                }
-                layout.draw(canvas)
-                canvas.restore()
-            }
-
-            is PageObject.GeometricShapeObject -> {
-                GeometricShapeRenderer.drawShape(
-                    canvas = canvas,
-                    shapeType = obj.shapeType,
-                    bounds = RectF(obj.bounds.leftPt, obj.bounds.topPt, obj.bounds.rightPt, obj.bounds.bottomPt),
-                    strokeWidthPx = obj.strokeWidthPt.coerceIn(0.4f, 12f),
-                    strokeColorArgb = obj.canonicalStrokeColorArgb,
-                    hasFill = obj.hasFill,
-                    fillColorArgb = obj.canonicalFillColorArgb,
-                    rotationRadians = obj.rotationRadians
-                )
-            }
-
-            is PageObject.ImageObject -> {
-                val appContext = context ?: return
-                val imgFile = File(appContext.filesDir, obj.imageAssetRelativePath)
-                if (!imgFile.isFile) return
-                val bitmap = BitmapFactory.decodeFile(imgFile.absolutePath) ?: return
-                try {
-                    val dstRect = RectF(obj.bounds.leftPt, obj.bounds.topPt, obj.bounds.rightPt, obj.bounds.bottomPt)
-                    val saveCount = canvas.save()
-                    val deg = (obj.rotationRadians * 180.0 / PI).toFloat()
-                    if (abs(deg) > 0.01f) {
-                        canvas.rotate(deg, dstRect.centerX(), dstRect.centerY())
-                    }
-                    val imgPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-                    canvas.drawBitmap(bitmap, null, dstRect, imgPaint)
-                    canvas.restoreToCount(saveCount)
-                } finally {
-                    bitmap.recycle()
-                }
-            }
-        }
-    }
-
-    private fun drawPlotBox(canvas: Canvas, plot: PageObject.FunctionPlotObject) {
-        val rect = RectF(plot.bounds.leftPt, plot.bounds.topPt, plot.bounds.rightPt, plot.bounds.bottomPt)
-        val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeWidth = 0.8f
-            color = Color.rgb(140, 150, 165)
-        }
-        canvas.drawRect(rect, borderPaint)
-
-        // Axes when zero lies within domain/range
-        val xSpan = max(1e-3f, plot.domainMaxX - plot.domainMinX)
-        val ySpan = max(1e-3f, plot.rangeMaxY - plot.rangeMinY)
-        val axisPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeWidth = 1.0f
-            color = Color.rgb(90, 98, 110)
-        }
-        if (plot.domainMinX <= 0f && plot.domainMaxX >= 0f) {
-            val xZero = rect.left + ((0f - plot.domainMinX) / xSpan) * rect.width()
-            canvas.drawLine(xZero, rect.top, xZero, rect.bottom, axisPaint)
-        }
-        if (plot.rangeMinY <= 0f && plot.rangeMaxY >= 0f) {
-            val yZero = rect.bottom - ((0f - plot.rangeMinY) / ySpan) * rect.height()
-            canvas.drawLine(rect.left, yZero, rect.right, yZero, axisPaint)
-        }
-
-        val curvePath = FunctionEvaluator.buildPlotPathForBounds(plot)
-        if (!curvePath.isEmpty) {
-            val saveCount = canvas.save()
-            canvas.clipRect(rect)
-            val curvePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                style = Paint.Style.STROKE
-                strokeWidth = plot.strokeWidthPt.coerceIn(0.6f, 8f)
-                strokeCap = Paint.Cap.ROUND
-                strokeJoin = Paint.Join.ROUND
-                color = plot.canonicalColorArgb
-            }
-            canvas.drawPath(curvePath, curvePaint)
-            canvas.restoreToCount(saveCount)
-        }
-
-        val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = plot.canonicalColorArgb
-            textSize = 9.5f
-        }
-        canvas.drawText("y = ${plot.expression}", rect.left + 6f, rect.top + 12f, labelPaint)
     }
 }
 

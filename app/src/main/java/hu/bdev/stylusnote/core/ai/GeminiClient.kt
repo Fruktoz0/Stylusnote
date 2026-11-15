@@ -77,7 +77,8 @@ class GeminiClient(
     private val baseBackoffMs: Long = DEFAULT_BASE_BACKOFF_MS,
     private val maxBackoffMs: Long = DEFAULT_MAX_BACKOFF_MS,
     private val clockNowMs: () -> Long = { System.currentTimeMillis() },
-    private val delayMs: suspend (Long) -> Unit = { ms -> if (ms > 0L) delay(ms) }
+    private val delayMs: suspend (Long) -> Unit = { ms -> if (ms > 0L) delay(ms) },
+    private val extraHeaders: Map<String, String> = emptyMap()
 ) {
     private val rateLimiterMutex = Mutex()
     private val recentCallTimestampsMs = ArrayDeque<Long>()
@@ -112,10 +113,11 @@ class GeminiClient(
                 "Az AI Copilot jelenleg ki van kapcsolva a beállításokban."
             )
         }
-        val apiKey = consentStore.readDecryptedApiKey()
+        val rawKey = consentStore.readDecryptedApiKey()
             ?: throw MissingApiKeyException(
                 "Nincs beállítva saját Google AI Studio (BYOK) API-kulcs."
             )
+        val apiKey = GeminiApiSupport.validateHeaderSafeApiKey(rawKey)
 
         val (initialCandidates, initialNotice) = modelCatalog.buildCandidateFlashModelChain(
             apiKey = apiKey,
@@ -152,12 +154,17 @@ class GeminiClient(
                 acquireRateLimitSlot()
 
                 val endpoint = "${baseUrl.trimEnd('/')}/v1beta/models/$activeModelId:generateContent"
-                val request = Request.Builder()
+                val requestBuilder = Request.Builder()
                     .url(endpoint)
-                    .header("x-goog-api-key", apiKey)
+                    .header(GeminiApiSupport.HEADER_API_KEY, apiKey)
                     .header("Content-Type", "application/json; charset=utf-8")
                     .post(payloadJson.toRequestBody(JSON_MEDIA_TYPE))
-                    .build()
+                extraHeaders.forEach { (k, v) ->
+                    if (k.isNotBlank() && v.isNotBlank()) {
+                        requestBuilder.header(k, v)
+                    }
+                }
+                val request = requestBuilder.build()
 
                 val result = try {
                     withContext(Dispatchers.IO) {
@@ -267,14 +274,24 @@ class GeminiClient(
                     result.statusCode == 401 || result.statusCode == 403 -> {
                         throw GeminiHttpException(
                             result.statusCode,
-                            "Érvénytelen vagy jogosulatlan Gemini API-kulcs (HTTP ${result.statusCode})."
+                            GeminiApiSupport.formatGoogleApiHttpError(
+                                statusCode = result.statusCode,
+                                rawBody = result.bodyText,
+                                operationLabelHu = "Érvénytelen vagy jogosulatlan Gemini API-kulcs",
+                                androidHeaders = extraHeaders
+                            )
                         )
                     }
 
                     else -> {
                         lastFailure = GeminiHttpException(
                             result.statusCode,
-                            "Gemini API hiba ($activeModelId, HTTP ${result.statusCode}): ${extractApiErrorMessage(result.bodyText)}"
+                            GeminiApiSupport.formatGoogleApiHttpError(
+                                statusCode = result.statusCode,
+                                rawBody = result.bodyText,
+                                operationLabelHu = "Gemini API hiba ($activeModelId)",
+                                androidHeaders = extraHeaders
+                            )
                         )
                         if (firstFailedModelId == null) firstFailedModelId = activeModelId
                         break
@@ -366,13 +383,6 @@ class GeminiClient(
             text = text,
             promptTokensEstimate = reportedPromptTokens ?: fallbackEstimate
         )
-    }
-
-    private fun extractApiErrorMessage(bodyJson: String): String {
-        val root = runCatching { GeminiJsonCodec.parseObject(bodyJson) }.getOrNull()
-        val errorObj = root?.get("error") as? Map<*, *>
-        return errorObj?.get("message")?.toString()?.takeIf { it.isNotBlank() }
-            ?: bodyJson.take(240).ifBlank { "Ismeretlen hiba" }
     }
 
     companion object {

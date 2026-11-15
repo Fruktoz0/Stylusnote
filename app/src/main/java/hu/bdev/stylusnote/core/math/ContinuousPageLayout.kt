@@ -21,7 +21,9 @@ data class PageLayoutSlot(
     val leftPt: Float,
     val topPt: Float,
     val rightPt: Float,
-    val bottomPt: Float
+    val bottomPt: Float,
+    val pdfAssetId: String? = null,
+    val pdfPageIndex: Int = 0
 ) {
     val widthPt: Float get() = rightPt - leftPt
     val heightPt: Float get() = bottomPt - topPt
@@ -253,6 +255,13 @@ class ContinuousPageLayout private constructor(
         const val DEFAULT_PAGE_GAP_PT: Float = 24f
         const val DEFAULT_STROKE_SNAP_MARGIN_PT: Float = 20f
 
+        private data class ContinuousSlotSpec(
+            val pageId: String,
+            val config: PagePaperConfig,
+            val pdfAssetId: String? = null,
+            val pdfPageIndex: Int = 0
+        )
+
         fun build(
             pages: List<PageEntity>,
             gapPt: Float = DEFAULT_PAGE_GAP_PT
@@ -265,13 +274,18 @@ class ContinuousPageLayout private constructor(
                 )
             }
             val ordered = pages.sortedBy { it.pageIndexInNotebook }
-            val configs = ordered.map { page ->
-                page.id to page.pageSizePreset.toPagePaperConfig(
-                    canvasMode = page.canvasMode,
-                    templateType = page.templateType
+            val specs = ordered.map { page ->
+                ContinuousSlotSpec(
+                    pageId = page.id,
+                    config = page.pageSizePreset.toPagePaperConfig(
+                        canvasMode = page.canvasMode,
+                        templateType = page.templateType
+                    ),
+                    pdfAssetId = page.pdfAssetId,
+                    pdfPageIndex = (page.pdfPageIndex ?: 0).coerceAtLeast(0)
                 )
             }
-            return buildFromConfigs(entries = configs, gapPt = gapPt)
+            return buildFromSpecs(specs = specs, gapPt = gapPt)
         }
 
         fun buildFromConfigs(
@@ -285,29 +299,40 @@ class ContinuousPageLayout private constructor(
                     totalBoundsPt = DocRect(0f, 0f, 0f, 0f)
                 )
             }
+            val specs = entries.map { (pageId, config) ->
+                ContinuousSlotSpec(pageId = pageId, config = config)
+            }
+            return buildFromSpecs(specs = specs, gapPt = gapPt)
+        }
 
-            val maxWidthPt = entries.maxOf { (_, cfg) -> cfg.pageDimensions.widthPt }
-            val slots = ArrayList<PageLayoutSlot>(entries.size)
+        private fun buildFromSpecs(
+            specs: List<ContinuousSlotSpec>,
+            gapPt: Float
+        ): ContinuousPageLayout {
+            val maxWidthPt = specs.maxOf { it.config.pageDimensions.widthPt }
+            val slots = ArrayList<PageLayoutSlot>(specs.size)
             var currentTopPt = 0f
             var minLeftPt = Float.POSITIVE_INFINITY
             var maxRightPt = Float.NEGATIVE_INFINITY
 
-            entries.forEachIndexed { index, (pageId, config) ->
-                val widthPt = config.pageDimensions.widthPt
-                val heightPt = config.pageDimensions.heightPt
+            specs.forEachIndexed { index, spec ->
+                val widthPt = spec.config.pageDimensions.widthPt
+                val heightPt = spec.config.pageDimensions.heightPt
                 val leftPt = (maxWidthPt - widthPt) * 0.5f
                 val rightPt = leftPt + widthPt
                 val bottomPt = currentTopPt + heightPt
 
                 slots.add(
                     PageLayoutSlot(
-                        pageId = pageId,
+                        pageId = spec.pageId,
                         pageIndex = index,
-                        config = config,
+                        config = spec.config,
                         leftPt = leftPt,
                         topPt = currentTopPt,
                         rightPt = rightPt,
-                        bottomPt = bottomPt
+                        bottomPt = bottomPt,
+                        pdfAssetId = spec.pdfAssetId,
+                        pdfPageIndex = spec.pdfPageIndex
                     )
                 )
 

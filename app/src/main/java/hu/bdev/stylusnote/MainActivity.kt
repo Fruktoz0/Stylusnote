@@ -337,8 +337,13 @@ private fun FrameDebugOverlay(
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurface
             )
+            val cpuText = if (stats.hasRenderWorkSamples) {
+                "${"%.2f".format(stats.cpuWorkP50Ms)} / ${"%.2f".format(stats.cpuWorkP95Ms)} ms"
+            } else {
+                "— / — ms"
+            }
             Text(
-                text = "VSYNC p95: ${"%.2f".format(stats.vsyncP95Ms)} ms | frame: ${"%.2f".format(stats.lastRenderWorkMs)} ms",
+                text = "VSYNC p95: ${"%.2f".format(stats.vsyncP95Ms)} ms | CPU p50/p95: $cpuText",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurface
             )
@@ -347,13 +352,46 @@ private fun FrameDebugOverlay(
             } else {
                 "— ms"
             }
+            val gpuText = if (stats.hasGpuSamples) {
+                " | GPU p95: ${"%.2f".format(stats.gpuWorkP95Ms)} ms"
+            } else {
+                ""
+            }
             Text(
-                text = "Render p95: $renderP95Text (cél ≤ ${"%.2f".format(stats.frameBudgetMs)} ms)",
+                text = "Render p95: $renderP95Text$gpuText (cél ≤ ${"%.2f".format(stats.frameBudgetMs)} ms)",
                 style = MaterialTheme.typography.labelSmall,
                 color = statusColor
             )
         }
     }
+}
+
+private fun extractCpuAndGpuWorkNanos(frameMetrics: FrameMetrics): Pair<Long, Long> {
+    // Sum UI + RenderThread work stages directly instead of TOTAL_DURATION, which includes
+    // VSYNC queue wait and triple-buffer swap-buffer stall (~25–40 ms at 144 Hz).
+    val drawNs = frameMetrics.getMetric(FrameMetrics.DRAW_DURATION)
+    val syncNs = frameMetrics.getMetric(FrameMetrics.SYNC_DURATION)
+    val commandNs = frameMetrics.getMetric(FrameMetrics.COMMAND_ISSUE_DURATION)
+    val cpuStagesSupported = drawNs >= 0L || syncNs >= 0L || commandNs >= 0L
+    val cpuStagesNs =
+        frameMetrics.getMetric(FrameMetrics.INPUT_HANDLING_DURATION).coerceAtLeast(0L) +
+            frameMetrics.getMetric(FrameMetrics.ANIMATION_DURATION).coerceAtLeast(0L) +
+            frameMetrics.getMetric(FrameMetrics.LAYOUT_MEASURE_DURATION).coerceAtLeast(0L) +
+            drawNs.coerceAtLeast(0L) +
+            syncNs.coerceAtLeast(0L) +
+            commandNs.coerceAtLeast(0L)
+    val resolvedCpuNs = if (cpuStagesSupported) {
+        cpuStagesNs
+    } else {
+        frameMetrics.getMetric(FrameMetrics.TOTAL_DURATION).coerceAtLeast(0L)
+    }
+    val gpuNs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        val rawGpu = frameMetrics.getMetric(FrameMetrics.GPU_DURATION)
+        if (rawGpu >= 0L) rawGpu else -1L
+    } else {
+        -1L
+    }
+    return resolvedCpuNs to gpuNs
 }
 
 @Composable
@@ -384,22 +422,12 @@ private fun rememberFrameTimingStats(
 
         val metricsListener = Window.OnFrameMetricsAvailableListener { _, frameMetrics, _ ->
             if (frameMetrics.getMetric(FrameMetrics.FIRST_DRAW_FRAME) == 1L) return@OnFrameMetricsAvailableListener
-            val totalDurationNs = frameMetrics.getMetric(FrameMetrics.TOTAL_DURATION)
-            if (totalDurationNs > 0L) {
-                accumulator.recordRenderWorkDurationNanos(totalDurationNs)
-            } else {
-                // Fallback when TOTAL_DURATION is unavailable on older drivers: sum active UI/RT stages.
-                val cpuStagesNs =
-                    frameMetrics.getMetric(FrameMetrics.INPUT_HANDLING_DURATION).coerceAtLeast(0L) +
-                        frameMetrics.getMetric(FrameMetrics.ANIMATION_DURATION).coerceAtLeast(0L) +
-                        frameMetrics.getMetric(FrameMetrics.LAYOUT_MEASURE_DURATION).coerceAtLeast(0L) +
-                        frameMetrics.getMetric(FrameMetrics.DRAW_DURATION).coerceAtLeast(0L) +
-                        frameMetrics.getMetric(FrameMetrics.SYNC_DURATION).coerceAtLeast(0L) +
-                        frameMetrics.getMetric(FrameMetrics.COMMAND_ISSUE_DURATION).coerceAtLeast(0L) +
-                        frameMetrics.getMetric(FrameMetrics.SWAP_BUFFERS_DURATION).coerceAtLeast(0L)
-                if (cpuStagesNs > 0L) {
-                    accumulator.recordRenderWorkDurationNanos(cpuStagesNs)
-                }
+            val (cpuNs, gpuNs) = extractCpuAndGpuWorkNanos(frameMetrics)
+            if (cpuNs > 0L || gpuNs >= 0L) {
+                accumulator.recordFrameMetrics(
+                    cpuWorkNanos = cpuNs,
+                    gpuDurationNanos = gpuNs
+                )
             }
         }
 

@@ -415,4 +415,83 @@ class GeminiClientAndCatalogTest {
         assertTrue(requestBodies[0].contains("\"thinkingConfig\":{\"thinkingBudget\":0}"))
         assertFalse(requestBodies[1].contains("thinkingConfig"))
     }
+
+    @Test
+    fun refreshCatalogSanitizesKeysSendsAndroidHeadersFollowsPaginationAndSurfacesGoogleErrors() = runBlocking {
+        assertEquals("AIzaSyCleanKey123", GeminiApiSupport.sanitizeApiKey("  \"Bearer AIzaSyClean\n\u200BKey123\" "))
+        assertEquals("AIzaFromUrlKey99", GeminiApiSupport.sanitizeApiKey("https://example.com?foo=1&key=AIzaFromUrlKey99&x=2"))
+
+        val capturedHeaders = mutableListOf<Pair<String, String?>>()
+        var callCount = 0
+        val interceptor = Interceptor { chain ->
+            val req = chain.request()
+            capturedHeaders += "x-goog-api-key" to req.header("x-goog-api-key")
+            capturedHeaders += "X-Android-Package" to req.header("X-Android-Package")
+            capturedHeaders += "X-Android-Cert" to req.header("X-Android-Cert")
+            callCount++
+            val token = req.url.queryParameter("pageToken")
+            if (token == null) {
+                Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body(
+                        """{"models":[{"name":"models/gemini-2.0-flash","supportedGenerationMethods":["generateContent"]}],"nextPageToken":"page2"}"""
+                            .toResponseBody("application/json".toMediaType())
+                    )
+                    .build()
+            } else {
+                Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body(
+                        """{"models":[{"name":"models/gemini-2.5-flash","supportedGenerationMethods":["generateContent"]}]}"""
+                            .toResponseBody("application/json".toMediaType())
+                    )
+                    .build()
+            }
+        }
+        val headers = mapOf(
+            GeminiApiSupport.HEADER_ANDROID_PACKAGE to "hu.bdev.stylusnote",
+            GeminiApiSupport.HEADER_ANDROID_CERT to "0123456789abcdef0123456789abcdef01234567"
+        )
+        val catalog = ModelCatalog(
+            httpClient = OkHttpClient.Builder().addInterceptor(interceptor).build(),
+            extraHeaders = headers
+        )
+        val result = catalog.refreshCatalog(" \"AIzaSyDirty\nKey\u200B\" ")
+        assertEquals(2, callCount)
+        assertEquals("gemini-2.5-flash", result.selectedModelId)
+        assertTrue(capturedHeaders.contains("x-goog-api-key" to "AIzaSyDirtyKey"))
+        assertTrue(capturedHeaders.contains("X-Android-Package" to "hu.bdev.stylusnote"))
+        assertTrue(capturedHeaders.contains("X-Android-Cert" to "0123456789abcdef0123456789abcdef01234567"))
+
+        val errorInterceptor = Interceptor { chain ->
+            Response.Builder()
+                .request(chain.request())
+                .protocol(Protocol.HTTP_1_1)
+                .code(403)
+                .message("Forbidden")
+                .body(
+                    """{"error":{"code":403,"message":"Requests from this Android client application hu.bdev.stylusnote are blocked.","status":"PERMISSION_DENIED","details":[{"reason":"API_KEY_ANDROID_APP_BLOCKED"}]}}"""
+                        .toResponseBody("application/json".toMediaType())
+                )
+                .build()
+        }
+        val failingCatalog = ModelCatalog(
+            httpClient = OkHttpClient.Builder().addInterceptor(errorInterceptor).build(),
+            extraHeaders = headers
+        )
+        try {
+            failingCatalog.refreshCatalog("AIzaSyBlockedKey")
+            fail("Expected ModelCatalogException with detailed Google error message")
+        } catch (e: ModelCatalogException) {
+            val msg = e.message.orEmpty()
+            assertTrue("Expected HTTP 403 context in '$msg'", msg.contains("403"))
+            assertTrue("Expected package/SHA-1 hint in '$msg'", msg.contains("hu.bdev.stylusnote") && msg.contains("SHA-1"))
+        }
+    }
 }

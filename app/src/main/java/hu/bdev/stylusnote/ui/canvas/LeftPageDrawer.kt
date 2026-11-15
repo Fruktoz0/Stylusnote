@@ -1,6 +1,8 @@
 package hu.bdev.stylusnote.ui.canvas
 
+import android.graphics.Bitmap
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -31,10 +33,12 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DragIndicator
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -49,13 +53,16 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -63,6 +70,7 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
@@ -73,6 +81,27 @@ import androidx.compose.ui.zIndex
 import hu.bdev.stylusnote.data.local.PageEntity
 import hu.bdev.stylusnote.ui.theme.LocalStylusSurfacePalette
 import kotlin.math.roundToInt
+
+/**
+ * Pure helper computing which page should become active if [deletedPageId] is removed from [orderedPages].
+ * Returns `null` if deletion is disallowed (`orderedPages.size <= 1`) or if the active page remains unchanged.
+ */
+fun resolveNextActivePageAfterDelete(
+    orderedPages: List<PageEntity>,
+    deletedPageId: String,
+    currentActivePageId: String
+): PageEntity? {
+    if (orderedPages.size <= 1) return null
+    val deleteIndex = orderedPages.indexOfFirst { it.id == deletedPageId }
+    if (deleteIndex < 0) return null
+    val remaining = orderedPages.filter { it.id != deletedPageId }
+    if (remaining.isEmpty()) return null
+    return if (currentActivePageId == deletedPageId) {
+        remaining.getOrNull(deleteIndex) ?: remaining.last()
+    } else {
+        remaining.firstOrNull { it.id == currentActivePageId } ?: remaining.first()
+    }
+}
 
 /**
  * Compact left-edge pull handle shown when the active notebook uses [CanvasMode.FIXED_PAGE].
@@ -179,6 +208,10 @@ fun LeftPageDrawerOverlay(
     onAddNewPage: () -> Unit,
     onReorderPages: (List<String>) -> Unit = {},
     onRenamePage: (pageId: String, newTitle: String?) -> Unit = { _, _ -> },
+    onDeletePage: ((pageId: String) -> Unit)? = null,
+    thumbnailRenderer: PageThumbnailRenderer? = null,
+    pageThumbnailVersionProvider: (pageId: String) -> Long = { 0L },
+    livePageSnapshotProvider: ((pageId: String) -> PageThumbnailSourceSnapshot?)? = null,
     onDismiss: () -> Unit
 ) {
     val surfacePalette = LocalStylusSurfacePalette.current
@@ -192,6 +225,7 @@ fun LeftPageDrawerOverlay(
     var renamingPage by remember { mutableStateOf<PageEntity?>(null) }
     var renamingPageIndexOneBased by remember { mutableIntStateOf(1) }
     var renameDraft by remember { mutableStateOf("") }
+    var pendingDeletePage by remember { mutableStateOf<Pair<PageEntity, Int>?>(null) }
 
     LaunchedEffect(Unit) {
         focusRequester.requestFocus()
@@ -210,16 +244,20 @@ fun LeftPageDrawerOverlay(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black.copy(alpha = 0.28f))
-            .focusRequester(focusRequester)
-            .focusable()
             .onPreviewKeyEvent { keyEvent ->
                 if (keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.Escape) {
-                    onDismiss()
+                    when {
+                        pendingDeletePage != null -> pendingDeletePage = null
+                        renamingPage != null -> renamingPage = null
+                        else -> onDismiss()
+                    }
                     true
                 } else {
                     false
                 }
             }
+            .focusRequester(focusRequester)
+            .focusable()
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
@@ -374,17 +412,17 @@ fun LeftPageDrawerOverlay(
                                 horizontalAlignment = Alignment.CenterHorizontally,
                                 verticalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
+                                val customTitle = page.title?.trim()?.takeIf { it.isNotEmpty() }
+                                val labelText = if (customTitle != null) {
+                                    "${index + 1}. $customTitle"
+                                } else {
+                                    "${index + 1}. oldal"
+                                }
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.spacedBy(4.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    val customTitle = page.title?.trim()?.takeIf { it.isNotEmpty() }
-                                    val labelText = if (customTitle != null) {
-                                        "${index + 1}. $customTitle"
-                                    } else {
-                                        "${index + 1}. oldal"
-                                    }
                                     Text(
                                         text = labelText,
                                         style = MaterialTheme.typography.labelMedium,
@@ -413,6 +451,21 @@ fun LeftPageDrawerOverlay(
                                             modifier = Modifier.size(14.dp)
                                         )
                                     }
+                                    if (onDeletePage != null && localPages.size > 1) {
+                                        IconButton(
+                                            onClick = { pendingDeletePage = page to (index + 1) },
+                                            modifier = Modifier
+                                                .size(24.dp)
+                                                .testTag("delete_page_btn_${page.id}")
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Filled.Delete,
+                                                contentDescription = "Oldal törlése",
+                                                tint = MaterialTheme.colorScheme.error.copy(alpha = 0.85f),
+                                                modifier = Modifier.size(14.dp)
+                                            )
+                                        }
+                                    }
                                     Icon(
                                         imageVector = Icons.Filled.DragIndicator,
                                         contentDescription = "Sorrend mozgatása",
@@ -420,10 +473,44 @@ fun LeftPageDrawerOverlay(
                                         modifier = Modifier.size(16.dp)
                                     )
                                 }
+                                val thumbVersion = if (thumbnailRenderer != null) {
+                                    maxOf(
+                                        thumbnailRenderer.versionFor(page.id),
+                                        pageThumbnailVersionProvider(page.id)
+                                    )
+                                } else {
+                                    0L
+                                }
+                                val thumbBitmap by produceState<Bitmap?>(
+                                    initialValue = thumbnailRenderer?.getCached(
+                                        page = page,
+                                        isOledMode = surfacePalette.isOledDeepBlack,
+                                        versionToken = thumbVersion
+                                    ),
+                                    key1 = thumbnailRenderer,
+                                    key2 = page.id,
+                                    key3 = Triple(
+                                        thumbVersion,
+                                        page.updatedAtEpochMs,
+                                        surfacePalette.isOledDeepBlack
+                                    )
+                                ) {
+                                    if (thumbnailRenderer == null) {
+                                        value = null
+                                        return@produceState
+                                    }
+                                    value = thumbnailRenderer.getOrRenderThumbnail(
+                                        page = page,
+                                        palette = surfacePalette,
+                                        versionToken = thumbVersion,
+                                        liveSnapshot = livePageSnapshotProvider?.invoke(page.id)
+                                    )
+                                }
                                 Box(
                                     modifier = Modifier
                                         .fillMaxWidth(0.72f)
                                         .aspectRatio(0.71f)
+                                        .clip(RoundedCornerShape(6.dp))
                                         .background(
                                             color = surfacePalette.pagePaperBackground,
                                             shape = RoundedCornerShape(6.dp)
@@ -435,7 +522,15 @@ fun LeftPageDrawerOverlay(
                                         ),
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    if (page.pdfAssetId != null) {
+                                    val bmp = thumbBitmap
+                                    if (bmp != null && !bmp.isRecycled) {
+                                        Image(
+                                            bitmap = bmp.asImageBitmap(),
+                                            contentDescription = labelText,
+                                            contentScale = ContentScale.Fit,
+                                            modifier = Modifier.fillMaxSize()
+                                        )
+                                    } else if (page.pdfAssetId != null) {
                                         Icon(
                                             imageVector = Icons.Filled.PictureAsPdf,
                                             contentDescription = null,
@@ -482,8 +577,6 @@ fun LeftPageDrawerOverlay(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(Color.Black.copy(alpha = 0.42f))
-                    .focusRequester(dialogFocusRequester)
-                    .focusable()
                     .onPreviewKeyEvent { keyEvent ->
                         if (keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.Escape) {
                             renamingPage = null
@@ -492,6 +585,8 @@ fun LeftPageDrawerOverlay(
                             false
                         }
                     }
+                    .focusRequester(dialogFocusRequester)
+                    .focusable()
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null,
@@ -547,6 +642,91 @@ fun LeftPageDrawerOverlay(
                                 }
                             ) {
                                 Text("Mentés")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        val pendingDelete = pendingDeletePage
+        if (pendingDelete != null && onDeletePage != null) {
+            val (deleteEntity, deleteIdxOneBased) = pendingDelete
+            val deleteTitle = deleteEntity.title?.trim()?.takeIf { it.isNotEmpty() }
+                ?: "$deleteIdxOneBased. oldal"
+            val deleteFocusRequester = remember { FocusRequester() }
+            LaunchedEffect(deleteEntity.id) {
+                deleteFocusRequester.requestFocus()
+            }
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.42f))
+                    .onPreviewKeyEvent { keyEvent ->
+                        if (keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.Escape) {
+                            pendingDeletePage = null
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    .focusRequester(deleteFocusRequester)
+                    .focusable()
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = { pendingDeletePage = null }
+                    )
+                    .testTag("delete_page_confirm_backdrop"),
+                contentAlignment = Alignment.Center
+            ) {
+                Surface(
+                    modifier = Modifier
+                        .width(340.dp)
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) {},
+                    shape = RoundedCornerShape(18.dp),
+                    color = MaterialTheme.colorScheme.surface,
+                    tonalElevation = 8.dp,
+                    shadowElevation = 16.dp
+                ) {
+                    Column(
+                        modifier = Modifier.padding(20.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text(
+                            text = "Oldal törlése",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "Biztosan törlöd a(z) „$deleteTitle” oldalt? Az oldalon lévő jegyzetek és beszúrt objektumok véglegesen törlődnek.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.End
+                        ) {
+                            TextButton(onClick = { pendingDeletePage = null }) {
+                                Text("Mégse")
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Button(
+                                onClick = {
+                                    pendingDeletePage = null
+                                    localPages = localPages.filter { it.id != deleteEntity.id }
+                                    onDeletePage(deleteEntity.id)
+                                },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = MaterialTheme.colorScheme.error,
+                                    contentColor = MaterialTheme.colorScheme.onError
+                                ),
+                                modifier = Modifier.testTag("confirm_delete_page_btn")
+                            ) {
+                                Text("Törlés")
                             }
                         }
                     }

@@ -456,5 +456,82 @@ class StrokeJournalRoundTripTest {
         val restored = afterRedo.objects.single() as PageObject.FormattedTextObject
         assertEquals("Második módosított szöveg", restored.text)
     }
+
+    @Test
+    fun attachedObjectIdRoundTripsThroughBinaryAndReplaysPreL69PayloadsSafely() = runBlocking {
+        val attached = sampleStroke(id = "stroke-attached-1").copy(attachedObjectId = "img-obj-42")
+        val encodedAttached = StrokeBinarySerializer.encodeStrokeRecord(attached)
+        val decodedAttached = StrokeBinarySerializer.decodeStrokeRecord(encodedAttached)
+        assertEquals("img-obj-42", decodedAttached.attachedObjectId)
+        assertEquals(attached, decodedAttached)
+
+        val unattached = sampleStroke(id = "stroke-unattached-1").copy(attachedObjectId = null)
+        val encodedUnattached = StrokeBinarySerializer.encodeStrokeRecord(unattached)
+        assertEquals(null, StrokeBinarySerializer.decodeStrokeRecord(encodedUnattached).attachedObjectId)
+
+        // Pre-L69 binary payloads terminated right before the trailing attachedObjectId boolean flag.
+        val legacyPayload = encodedUnattached.copyOf(encodedUnattached.size - 1)
+        val decodedLegacy = StrokeBinarySerializer.decodeStrokeRecord(legacyPayload)
+        assertEquals(null, decodedLegacy.attachedObjectId)
+        assertEquals(unattached.id, decodedLegacy.id)
+        assertEquals(unattached.bounds, decodedLegacy.bounds)
+    }
+
+    @Test
+    fun imageObjectAndAttachedStrokeTransformReplayAndDeleteAcrossJournalReopen() = runBlocking {
+        val pageDir = File(tempRoot, "page-image-attached-replay")
+        val initialImage = PageObject.ImageObject(
+            id = "img-1",
+            zOrder = 10L,
+            bounds = DocRect(50f, 50f, 250f, 190f),
+            imageAssetRelativePath = "pages/p1/images/diagram.png",
+            rotationRadians = 0f
+        )
+        val attachedStroke = PersistedStrokeRecord(
+            id = "stroke-on-img",
+            layer = StrokeLayerType.INK,
+            zOrder = 20L,
+            brushConfig = BrushConfig(toolType = BrushToolType.FOUNTAIN_PEN, sizePt = 2f),
+            canonicalColorArgb = 0xFFDC2626.toInt(),
+            sizePt = 2f,
+            samples = listOf(
+                StylusPointSample(100f, 100f, 0L, 0.5f, 0f, 0f, false),
+                StylusPointSample(200f, 140f, 20L, 0.6f, 0f, 0f, false)
+            ),
+            bounds = DocRect(100f, 100f, 200f, 140f),
+            attachedObjectId = initialImage.id
+        )
+
+        val j1 = StrokeJournal(pageDirectory = pageDir, fsyncDebounceMs = 0L)
+        j1.openAndRecover()
+        j1.appendAddObject(initialImage)
+        j1.appendAddStrokes(listOf(attachedStroke))
+
+        val move = AffineTransform2D.translation(dxPt = 120f, dyPt = 60f)
+        val movedImage = initialImage.transform(move) as PageObject.ImageObject
+        j1.appendUpdateObject(movedImage)
+        j1.appendTransformStrokes(listOf(attachedStroke.id), move)
+        j1.closeBlocking(compactBeforeClose = true)
+
+        val j2 = StrokeJournal(pageDirectory = pageDir, fsyncDebounceMs = 0L)
+        val afterMove = j2.openAndRecover()
+        val reopenedImage = afterMove.objects.single() as PageObject.ImageObject
+        val reopenedStroke = afterMove.strokes.single()
+        assertEquals(movedImage.bounds, reopenedImage.bounds)
+        assertEquals("img-1", reopenedStroke.attachedObjectId)
+        assertEquals(220f, reopenedStroke.bounds.leftPt, 0.1f)
+        assertEquals(160f, reopenedStroke.bounds.topPt, 0.1f)
+
+        // Delete object + attached stroke together and confirm persistence after reopen.
+        j2.appendRemoveObject(reopenedImage.id)
+        j2.appendRemoveStrokes(listOf(reopenedStroke.id))
+        j2.closeBlocking(compactBeforeClose = true)
+
+        val j3 = StrokeJournal(pageDirectory = pageDir, fsyncDebounceMs = 0L)
+        val afterDelete = j3.openAndRecover()
+        j3.closeBlocking(compactBeforeClose = false)
+        assertTrue(afterDelete.objects.isEmpty())
+        assertTrue(afterDelete.strokes.isEmpty())
+    }
 }
 

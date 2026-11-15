@@ -55,6 +55,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -119,6 +120,7 @@ import hu.bdev.stylusnote.data.local.StrokeBinarySerializer
 import hu.bdev.stylusnote.data.local.StrokeJournal
 import hu.bdev.stylusnote.domain.model.AffineTransform2D
 import hu.bdev.stylusnote.domain.model.BrushConfig
+import hu.bdev.stylusnote.domain.model.ObjectAttachmentGeometry
 import hu.bdev.stylusnote.domain.model.OcrLanguageTag
 import hu.bdev.stylusnote.domain.model.PageObject
 import hu.bdev.stylusnote.domain.model.PersistedStrokeRecord
@@ -1184,6 +1186,9 @@ fun PageObjectsOverlayLayer(
     onDeleteObject: (String) -> Unit,
     onRequestStepByStep: (PageObject.LatexObject) -> Unit,
     onRestoreOriginalStrokes: (PageObject) -> Unit = {},
+    pageId: String? = null,
+    liveObjectInteractionController: LiveObjectInteractionController? = null,
+    onCommitObjectInteraction: ((beforeObject: PageObject, afterObject: PageObject, attachedAffine: AffineTransform2D) -> Unit)? = null,
     lassoPreviewObjectIds: Set<String> = emptySet(),
     lassoPreviewDeltaXPt: Float = 0f,
     lassoPreviewDeltaYPt: Float = 0f,
@@ -1200,6 +1205,56 @@ fun PageObjectsOverlayLayer(
     val scale = snapshot.scale.coerceAtLeast(0.1f)
     val currentScale by rememberUpdatedState(scale)
     var overlayCoords by remember { mutableStateOf<LayoutCoordinates?>(null) }
+    var activeDragPreview by remember(pageId) { mutableStateOf<LiveObjectInteractionPreview?>(null) }
+
+    DisposableEffect(pageId, selectedObjectId, liveObjectInteractionController) {
+        onDispose {
+            val active = activeDragPreview
+            if (active != null && (selectedObjectId == null || active.objectId == selectedObjectId)) {
+                activeDragPreview = null
+                if (liveObjectInteractionController?.activePreview?.objectId == active.objectId) {
+                    liveObjectInteractionController.updatePreview(null)
+                }
+            }
+        }
+    }
+
+    fun updateInteractivePreview(baseline: PageObject, updated: PageObject, attachedAffine: AffineTransform2D) {
+        if (onCommitObjectInteraction != null) {
+            val preview = LiveObjectInteractionPreview(
+                pageId = pageId,
+                objectId = updated.id,
+                beforeObject = baseline,
+                previewObject = updated,
+                attachedAffine = attachedAffine
+            )
+            activeDragPreview = preview
+            liveObjectInteractionController?.updatePreview(preview)
+        } else {
+            onUpdateObject(updated)
+        }
+    }
+
+    fun commitInteractivePreview(targetObjectId: String) {
+        val pending = activeDragPreview
+        activeDragPreview = null
+        liveObjectInteractionController?.updatePreview(null)
+        if (pending != null &&
+            pending.objectId == targetObjectId &&
+            pending.previewObject != pending.beforeObject
+        ) {
+            onCommitObjectInteraction?.invoke(
+                pending.beforeObject,
+                pending.previewObject,
+                pending.attachedAffine
+            )
+        }
+    }
+
+    fun cancelInteractivePreview() {
+        activeDragPreview = null
+        liveObjectInteractionController?.updatePreview(null)
+    }
 
     Box(
         modifier = modifier
@@ -1227,11 +1282,12 @@ fun PageObjectsOverlayLayer(
 
         for (rawObj in pageObjects) {
             if (rawObj is PageObject.PdfPageRefObject) continue
-            val obj = if (liveLassoAffine != null && rawObj.id in lassoPreviewObjectIds) {
+            val lassoObj = if (liveLassoAffine != null && rawObj.id in lassoPreviewObjectIds) {
                 rawObj.transform(liveLassoAffine)
             } else {
                 rawObj
             }
+            val obj = activeDragPreview?.takeIf { it.objectId == lassoObj.id }?.previewObject ?: lassoObj
 
             val screenTopLeft = transformMatrix.docToScreen(
                 obj.bounds.leftPt + pageOriginXPt,
@@ -1259,15 +1315,35 @@ fun PageObjectsOverlayLayer(
                     // objects only accept drag gestures while explicitly selected (post-insert or via Lasso).
                     .then(
                         if (isSelected) {
-                            Modifier.pointerInput(obj.id) {
+                            Modifier.pointerInput(pageId, obj.id) {
+                                var dragBaseline: PageObject? = null
+                                var totalDxPt = 0f
+                                var totalDyPt = 0f
                                 detectDragGestures(
+                                    onDragStart = {
+                                        dragBaseline = latestObj
+                                        totalDxPt = 0f
+                                        totalDyPt = 0f
+                                    },
                                     onDrag = { change, dragAmount ->
                                         change.consume()
-                                        val dxDoc = dragAmount.x / currentScale
-                                        val dyDoc = dragAmount.y / currentScale
-                                        onUpdateObject(
-                                            latestObj.transform(AffineTransform2D.translation(dxDoc, dyDoc))
+                                        val baseline = dragBaseline ?: latestObj.also { dragBaseline = it }
+                                        totalDxPt += dragAmount.x / currentScale
+                                        totalDyPt += dragAmount.y / currentScale
+                                        val affine = AffineTransform2D.translation(totalDxPt, totalDyPt)
+                                        updateInteractivePreview(
+                                            baseline = baseline,
+                                            updated = baseline.transform(affine),
+                                            attachedAffine = affine
                                         )
+                                    },
+                                    onDragEnd = {
+                                        dragBaseline = null
+                                        commitInteractivePreview(obj.id)
+                                    },
+                                    onDragCancel = {
+                                        dragBaseline = null
+                                        cancelInteractivePreview()
                                     }
                                 )
                             }
@@ -1333,6 +1409,7 @@ fun PageObjectsOverlayLayer(
                 else -> null
             }
             if (isSelected && boxRotationRadians != null) {
+                var handleBaselineObj by remember(obj.id) { mutableStateOf<PageObject?>(null) }
                 RotatableBoxInteractiveHandles(
                     objectId = obj.id,
                     bounds = obj.bounds,
@@ -1343,21 +1420,36 @@ fun PageObjectsOverlayLayer(
                     widthPx = widthPx,
                     heightPx = heightPx,
                     overlayCoordsProvider = { overlayCoords },
+                    onInteractionStart = {
+                        handleBaselineObj = latestObj
+                    },
                     onResizeBounds = { newBounds ->
+                        val baseline = handleBaselineObj ?: latestObj.also { handleBaselineObj = it }
                         val updated = when (val cur = latestObj) {
                             is PageObject.GeometricShapeObject -> cur.copy(bounds = newBounds)
                             is PageObject.ImageObject -> cur.copy(bounds = newBounds)
                             else -> cur
                         }
-                        onUpdateObject(updated)
+                        val affine = ObjectAttachmentGeometry.computeObjectInteractionAffine(baseline, updated)
+                        updateInteractivePreview(baseline = baseline, updated = updated, attachedAffine = affine)
                     },
                     onRotateRadians = { newAngle ->
+                        val baseline = handleBaselineObj ?: latestObj.also { handleBaselineObj = it }
                         val updated = when (val cur = latestObj) {
                             is PageObject.GeometricShapeObject -> cur.copy(rotationRadians = newAngle)
                             is PageObject.ImageObject -> cur.copy(rotationRadians = newAngle)
                             else -> cur
                         }
-                        onUpdateObject(updated)
+                        val affine = ObjectAttachmentGeometry.computeObjectInteractionAffine(baseline, updated)
+                        updateInteractivePreview(baseline = baseline, updated = updated, attachedAffine = affine)
+                    },
+                    onInteractionEnd = {
+                        handleBaselineObj = null
+                        commitInteractivePreview(obj.id)
+                    },
+                    onInteractionCancel = {
+                        handleBaselineObj = null
+                        cancelInteractivePreview()
                     }
                 )
             }
@@ -1374,6 +1466,14 @@ fun PageObjectsOverlayLayer(
                     screenTopLeft = screenTopLeft,
                     heightPx = heightPx,
                     onUpdateObject = onUpdateObject,
+                    onTransformObject = { beforeObj, afterObj ->
+                        if (onCommitObjectInteraction != null) {
+                            val affine = ObjectAttachmentGeometry.computeObjectInteractionAffine(beforeObj, afterObj)
+                            onCommitObjectInteraction(beforeObj, afterObj, affine)
+                        } else {
+                            onUpdateObject(afterObj)
+                        }
+                    },
                     onDeleteObject = { onDeleteObject(obj.id) },
                     onRestoreOriginalStrokes = { onRestoreOriginalStrokes(obj) },
                     onDeselect = { onSelectObject(null) },
@@ -1391,6 +1491,7 @@ private fun FloatingObjectActionPill(
     screenTopLeft: hu.bdev.stylusnote.core.math.ScreenPoint,
     heightPx: Float,
     onUpdateObject: (PageObject) -> Unit,
+    onTransformObject: (beforeObject: PageObject, afterObject: PageObject) -> Unit,
     onDeleteObject: () -> Unit,
     onRestoreOriginalStrokes: () -> Unit,
     onDeselect: () -> Unit,
@@ -1492,7 +1593,7 @@ private fun FloatingObjectActionPill(
                         is PageObject.LatexObject -> {
                             val cx = (obj.bounds.leftPt + obj.bounds.rightPt) * 0.5f
                             val cy = (obj.bounds.topPt + obj.bounds.bottomPt) * 0.5f
-                            onUpdateObject(obj.transform(AffineTransform2D.scalingAround(1.15f, 1.15f, cx, cy)))
+                            onTransformObject(obj, obj.transform(AffineTransform2D.scalingAround(1.15f, 1.15f, cx, cy)))
                         }
                         is PageObject.FormattedTextObject -> {
                             onUpdateObject(obj.copy(fontSizePt = (obj.fontSizePt + 2f).coerceAtMost(72f)))
@@ -1501,7 +1602,7 @@ private fun FloatingObjectActionPill(
                         is PageObject.ImageObject -> {
                             val cx = obj.bounds.centerXPt
                             val cy = obj.bounds.centerYPt
-                            onUpdateObject(obj.transform(AffineTransform2D.scalingAround(1.15f, 1.15f, cx, cy)))
+                            onTransformObject(obj, obj.transform(AffineTransform2D.scalingAround(1.15f, 1.15f, cx, cy)))
                         }
                         else -> Unit
                     }
@@ -1517,7 +1618,7 @@ private fun FloatingObjectActionPill(
                         is PageObject.LatexObject -> {
                             val cx = (obj.bounds.leftPt + obj.bounds.rightPt) * 0.5f
                             val cy = (obj.bounds.topPt + obj.bounds.bottomPt) * 0.5f
-                            onUpdateObject(obj.transform(AffineTransform2D.scalingAround(0.87f, 0.87f, cx, cy)))
+                            onTransformObject(obj, obj.transform(AffineTransform2D.scalingAround(0.87f, 0.87f, cx, cy)))
                         }
                         is PageObject.FormattedTextObject -> {
                             onUpdateObject(obj.copy(fontSizePt = (obj.fontSizePt - 2f).coerceAtLeast(10f)))
@@ -1526,7 +1627,7 @@ private fun FloatingObjectActionPill(
                         is PageObject.ImageObject -> {
                             val cx = obj.bounds.centerXPt
                             val cy = obj.bounds.centerYPt
-                            onUpdateObject(obj.transform(AffineTransform2D.scalingAround(0.87f, 0.87f, cx, cy)))
+                            onTransformObject(obj, obj.transform(AffineTransform2D.scalingAround(0.87f, 0.87f, cx, cy)))
                         }
                         else -> Unit
                     }
@@ -1545,7 +1646,7 @@ private fun FloatingObjectActionPill(
                             is PageObject.ImageObject -> obj.copy(rotationRadians = obj.rotationRadians + stepRad)
                             else -> obj
                         }
-                        onUpdateObject(updated)
+                        onTransformObject(obj, updated)
                     },
                     modifier = Modifier.size(28.dp)
                 ) {
@@ -2020,92 +2121,30 @@ private fun GeometricShapeOverlayNode(
     }
 }
 
-private object PageImageBitmapCache {
-    private val cache = object : LruCache<String, ImageBitmap>(32 * 1024) {
-        override fun sizeOf(key: String, value: ImageBitmap): Int =
-            ((value.width.toLong() * value.height.toLong() * 4L) / 1024L).toInt().coerceAtLeast(1)
-    }
-
-    fun get(key: String): ImageBitmap? = cache.get(key)
-
-    fun put(key: String, bitmap: ImageBitmap) {
-        cache.put(key, bitmap)
-    }
-}
-
 @Composable
 private fun ImageOverlayNode(
     imageObject: PageObject.ImageObject,
     isSelected: Boolean
 ) {
-    val context = LocalContext.current
-    val cacheKey = "${context.filesDir.absolutePath}::${imageObject.imageAssetRelativePath}"
-    val loadedBitmap by produceState<ImageBitmap?>(
-        initialValue = PageImageBitmapCache.get(cacheKey),
-        key1 = cacheKey
-    ) {
-        if (value != null) return@produceState
-        val decoded = withContext(Dispatchers.IO) {
-            val file = File(context.filesDir, imageObject.imageAssetRelativePath)
-            if (!file.isFile) return@withContext null
-            val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeFile(file.absolutePath, opts)
-            var sampleSize = 1
-            val maxEdge = maxOf(opts.outWidth, opts.outHeight)
-            while (maxEdge / sampleSize > 1600) {
-                sampleSize *= 2
-            }
-            val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sampleSize }
-            BitmapFactory.decodeFile(file.absolutePath, decodeOpts)?.asImageBitmap()
-        }
-        if (decoded != null) {
-            PageImageBitmapCache.put(cacheKey, decoded)
-        }
-        value = decoded
-    }
-
+    // Actual image bitmap renders in DryCanvasView beneath ink (Layer 2b); this Compose layer only
+    // hosts the selection dashed outline, corner resize/rotate handles, and touch hit target.
+    if (!isSelected) return
     val angleDeg = (imageObject.rotationRadians * 180.0 / PI).toFloat()
-    Box(
+    Canvas(
         modifier = Modifier
             .fillMaxSize()
             .graphicsLayer { rotationZ = angleDeg }
     ) {
-        val bmp = loadedBitmap
-        if (bmp != null) {
-            Image(
-                bitmap = bmp,
-                contentDescription = "Beszúrt kép",
-                contentScale = ContentScale.FillBounds,
-                modifier = Modifier.fillMaxSize()
+        drawRect(
+            color = Color(0xFF1A56DB),
+            style = Stroke(
+                width = 1.6.dp.toPx(),
+                pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(
+                    floatArrayOf(10f, 8f),
+                    0f
+                )
             )
-        } else {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = "Kép betöltése...",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-        }
-        if (isSelected) {
-            Canvas(modifier = Modifier.fillMaxSize()) {
-                drawRect(
-                    color = Color(0xFF1A56DB),
-                    style = Stroke(
-                        width = 1.6.dp.toPx(),
-                        pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(
-                            floatArrayOf(10f, 8f),
-                            0f
-                        )
-                    )
-                )
-            }
-        }
+        )
     }
 }
 
@@ -2121,7 +2160,10 @@ private fun RotatableBoxInteractiveHandles(
     heightPx: Float,
     overlayCoordsProvider: () -> LayoutCoordinates?,
     onResizeBounds: (DocRect) -> Unit,
-    onRotateRadians: (Float) -> Unit
+    onRotateRadians: (Float) -> Unit,
+    onInteractionStart: () -> Unit = {},
+    onInteractionEnd: () -> Unit = {},
+    onInteractionCancel: () -> Unit = {}
 ) {
     val latestBounds by rememberUpdatedState(bounds)
     val latestRotation by rememberUpdatedState(rotationRadians)
@@ -2166,8 +2208,12 @@ private fun RotatableBoxInteractiveHandles(
                 .size(28.dp)
                 .onGloballyPositioned { handleCoords = it }
                 .pointerInput(objectId, sx, sy) {
-                    detectDragGestures { change, _ ->
-                        change.consume()
+                    detectDragGestures(
+                        onDragStart = { onInteractionStart() },
+                        onDragEnd = { onInteractionEnd() },
+                        onDragCancel = { onInteractionCancel() },
+                        onDrag = { change, _ ->
+                            change.consume()
                         val oCoords = overlayCoordsProvider() ?: return@detectDragGestures
                         val hCoords = handleCoords ?: return@detectDragGestures
                         val overlayPt = oCoords.localPositionOf(hCoords, change.position)
@@ -2203,7 +2249,8 @@ private fun RotatableBoxInteractiveHandles(
                                 bottomPt = newCy + newH * 0.5f
                             )
                         )
-                    }
+                        }
+                    )
                 },
             contentAlignment = Alignment.Center
         ) {
@@ -2243,8 +2290,12 @@ private fun RotatableBoxInteractiveHandles(
             .border(1.8.dp, Color(0xFF1A56DB), CircleShape)
             .onGloballyPositioned { rotHandleCoords = it }
             .pointerInput(objectId) {
-                detectDragGestures { change, _ ->
-                    change.consume()
+                detectDragGestures(
+                    onDragStart = { onInteractionStart() },
+                    onDragEnd = { onInteractionEnd() },
+                    onDragCancel = { onInteractionCancel() },
+                    onDrag = { change, _ ->
+                        change.consume()
                     val oCoords = overlayCoordsProvider() ?: return@detectDragGestures
                     val hCoords = rotHandleCoords ?: return@detectDragGestures
                     val overlayPt = oCoords.localPositionOf(hCoords, change.position)
@@ -2259,6 +2310,7 @@ private fun RotatableBoxInteractiveHandles(
                     ) + (PI.toFloat() * 0.5f)
                     onRotateRadians(angle)
                 }
+                )
             },
         contentAlignment = Alignment.Center
     ) {

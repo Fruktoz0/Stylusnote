@@ -411,7 +411,9 @@ class MultiPageSessionManager(
         val index: Int,
         val presetName: String,
         val canvasModeName: String,
-        val templateName: String
+        val templateName: String,
+        val pdfAssetId: String?,
+        val pdfPageIndex: Int?
     )
 
     private val pool = SlidingWindowPagePool(
@@ -442,7 +444,9 @@ class MultiPageSessionManager(
                 index = it.pageIndexInNotebook,
                 presetName = it.pageSizePreset.name,
                 canvasModeName = it.canvasMode.name,
-                templateName = it.templateType.name
+                templateName = it.templateType.name,
+                pdfAssetId = it.pdfAssetId,
+                pdfPageIndex = it.pdfPageIndex
             )
         }
         if (signature != lastLayoutSignature) {

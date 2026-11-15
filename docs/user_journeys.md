@@ -168,6 +168,22 @@ flowchart LR
     M1 --> E1["Aktív ± 2 felett: aszinkron Dispatchers.IO journal lezárás és RAM felszabadítás"]
     S1["1 ujjas görgetés vagy stylus rajz bármelyik lapra"] --> H1["findSlotAtWorkspacePoint → lokális oldal-koordináták & StrokeJournal"]
     H1 --> UN["NotebookUndoCoordinator → lapok közötti pontos Undo/Redo (szükség esetén lemezes visszatöltés)"]
-    K1 --> FM["MainActivity FrameMetrics + Choreographer → szétválasztott VSYNC p95 vs Render p95 HUD"]
+    K1 --> FM["MainActivity FrameMetrics + Choreographer → szétválasztott VSYNC p95 vs CPU/GPU Render p95 HUD"]
+```
+
+---
+
+## 11. Élő PDF Háttér, Tinta Alatti Kép Horgonyzással, Valós Miniatűr Oldalfiók & Oldaltörlés
+
+```mermaid
+flowchart LR
+    PDF1["Könyvespolc: PDF import"] --> PDF2["PdfTileRenderer.importPdf + PageEntity (pdfAssetId, pdfPageIndex)"]
+    PDF2 --> PDF3["Vászon 2. réteg: prewarmBasePage + drawPdfPageForCanvasSyncOrRequest (aszinkron nagyítási részletcsempék + OLED opció)"]
+    IMG1["Kép beszúrása → PageObject.ImageObject"] --> IMG2["DryCanvasView 2b. réteg (tinta alatt) + toll/kiemelő a 3–4. rétegen felette"]
+    IMG2 --> IMG3["ObjectAttachmentGeometry: attachedObjectId rögzítése rajzoláskor"]
+    IMG3 --> IMG4["Kép húzás/méretezés/forgatás/törlés → LiveObjectInteractionController + 1 lépéses Undo/Redo elengedéskor"]
+    DR1["Bal oldalfiók: LeftPageDrawerOverlay"] --> DR2["PageThumbnailRenderer (16 MB LRU): papír + PDF + képek + vonások + objektumok kisképe"]
+    DR1 --> DR3["Kuka ikon (>1 oldal) → ESC/háttérrel zárható megerősítés → deleteWithTombstone + szomszédos lapra váltás"]
+    AI1["ConsentDialog: Gemini API-kulcs & Modellek"] --> AI2["GeminiApiSupport (sanitizeApiKey + X-Android-* fejléc + érthető REST hiba) → ModelCatalog /v1beta/models"]
 ```
 

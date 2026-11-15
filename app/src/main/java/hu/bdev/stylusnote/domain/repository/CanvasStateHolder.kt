@@ -17,6 +17,7 @@ import hu.bdev.stylusnote.core.math.SpatialIndex
 import hu.bdev.stylusnote.domain.model.AffineTransform2D
 import hu.bdev.stylusnote.domain.model.BrushConfig
 import hu.bdev.stylusnote.domain.model.CanvasAction
+import hu.bdev.stylusnote.domain.model.ObjectAttachmentGeometry
 import hu.bdev.stylusnote.domain.model.PageObject
 import hu.bdev.stylusnote.domain.model.mergeBounds
 import hu.bdev.stylusnote.ui.canvas.DryStrokeStore
@@ -49,6 +50,20 @@ data class CombinedDuplicateResult(
 data class SelectionRecolorResult(
     val affectedBounds: DocRect?,
     val updatedObjects: List<PageObject>
+)
+
+/** Result of committing an interactive object move/resize/rotate with any attached strokes. */
+data class ObjectInteractionCommitResult(
+    val action: CanvasAction?,
+    val affectedBounds: DocRect?,
+    val movedStrokeIds: List<String>
+)
+
+/** Result of deleting an embedded object together with any strokes attached to it. */
+data class ObjectDeleteCommitResult(
+    val action: CanvasAction?,
+    val affectedBounds: DocRect?,
+    val removedStrokeIds: List<String>
 )
 
 /**
@@ -506,6 +521,116 @@ class CanvasStateHolder(
         action.affectedBounds
     }
 
+    fun hasUnderInkObjects(): Boolean = synchronized(stateLock) {
+        objectsById.values.any { it is PageObject.ImageObject }
+    }
+
+    fun strokeIdsAttachedToObject(objectId: String): Set<String> = synchronized(stateLock) {
+        strokesById.values
+            .filter { it.attachedObjectId == objectId }
+            .mapTo(LinkedHashSet()) { it.id }
+    }
+
+    fun strokesAttachedToObject(objectId: String): List<IndexedDryStroke> = synchronized(stateLock) {
+        strokesById.values.filter { it.attachedObjectId == objectId }
+    }
+
+    /**
+     * Atomically commits an interactive object transformation ([beforeObject] -> [afterObject])
+     * together with any strokes attached to `afterObject.id` in a single Undo/Redo step.
+     */
+    fun commitObjectInteractionWithAttachedStrokes(
+        beforeObject: PageObject,
+        afterObject: PageObject,
+        attachedTransform: AffineTransform2D? = null
+    ): ObjectInteractionCommitResult {
+        val (liveBefore, attachedStrokes) = synchronized(stateLock) {
+            val live = objectsById[beforeObject.id] ?: objectsById[afterObject.id]
+            live to strokesById.values.filter { it.attachedObjectId == afterObject.id }
+        }
+        if (liveBefore == null) {
+            return ObjectInteractionCommitResult(null, null, emptyList())
+        }
+        val effectiveTransform = if (attachedStrokes.isEmpty()) {
+            null
+        } else {
+            attachedTransform ?: ObjectAttachmentGeometry.computeObjectInteractionAffine(
+                beforeObject = beforeObject,
+                afterObject = afterObject
+            )
+        }
+        val transformedStrokes = if (effectiveTransform != null) {
+            buildTransformedStrokeEntries(attachedStrokes, effectiveTransform)
+        } else {
+            emptyList()
+        }
+
+        synchronized(stateLock) {
+            val currentBefore = objectsById[afterObject.id]
+                ?: return ObjectInteractionCommitResult(null, null, emptyList())
+            val subActions = ArrayList<CanvasAction>(2)
+            subActions.add(CanvasAction.UpdatedObject(beforeObject = currentBefore, afterObject = afterObject))
+            if (transformedStrokes.isNotEmpty() && effectiveTransform != null) {
+                val liveBeforeStrokes = transformedStrokes.mapNotNull { strokesById[it.id] }
+                if (liveBeforeStrokes.size == transformedStrokes.size) {
+                    subActions.add(
+                        CanvasAction.TransformedStrokes(
+                            strokeIds = transformedStrokes.map { it.id },
+                            beforeStrokes = liveBeforeStrokes,
+                            afterStrokes = transformedStrokes,
+                            transform = effectiveTransform
+                        )
+                    )
+                }
+            }
+            val action = if (subActions.size == 1) {
+                subActions.first()
+            } else {
+                CanvasAction.CompositeAction(subActions, "Objektum és csatolt rajzok áthelyezése")
+            }
+            applyForwardLocked(action)
+            pushUndoActionLocked(action)
+            return ObjectInteractionCommitResult(
+                action = action,
+                affectedBounds = action.affectedBounds,
+                movedStrokeIds = transformedStrokes.map { it.id }
+            )
+        }
+    }
+
+    /**
+     * Atomically deletes [objectId] and any strokes attached to it in a single Undo/Redo step.
+     */
+    fun removePageObjectWithAttachedStrokes(objectId: String): ObjectDeleteCommitResult = synchronized(stateLock) {
+        val existingObj = objectsById.remove(objectId)
+            ?: return ObjectDeleteCommitResult(null, null, emptyList())
+        val attachedIds = strokesById.values
+            .filter { it.attachedObjectId == objectId }
+            .map { it.id }
+        val removedStrokes = if (attachedIds.isNotEmpty()) {
+            removeStrokesByIdLocked(attachedIds)
+        } else {
+            emptyList()
+        }
+        val subActions = ArrayList<CanvasAction>(2).apply {
+            if (removedStrokes.isNotEmpty()) {
+                add(CanvasAction.RemovedStrokes(removedStrokes))
+            }
+            add(CanvasAction.RemovedObject(existingObj))
+        }
+        val action = if (subActions.size == 1) {
+            subActions.first()
+        } else {
+            CanvasAction.CompositeAction(subActions, "Objektum és csatolt rajzok törlése")
+        }
+        pushUndoActionLocked(action)
+        ObjectDeleteCommitResult(
+            action = action,
+            affectedBounds = action.affectedBounds,
+            removedStrokeIds = removedStrokes.map { it.id }
+        )
+    }
+
     /**
      * Atomically replaces lasso-selected handwriting [strokeIds] with [pageObject] (e.g. a
      * validated [PageObject.LatexObject]) inside a single Undo-compatible [CanvasAction.CompositeAction]
@@ -729,6 +854,18 @@ class CanvasStateHolder(
         }
 
         val translate = AffineTransform2D.translation(offsetXPt, offsetYPt)
+        val copiedObjects = ArrayList<PageObject>(originalObjects.size)
+        val oldToNewObjectIds = HashMap<String, String>(originalObjects.size)
+        for (obj in originalObjects) {
+            val copyObj = obj.duplicateWith(
+                newId = uuidGenerator(),
+                newZOrder = allocateObjectZOrder(),
+                affine = translate
+            )
+            copiedObjects.add(copyObj)
+            oldToNewObjectIds[obj.id] = copyObj.id
+        }
+
         val copiedStrokes = ArrayList<IndexedDryStroke>(originalStrokes.size)
         val copiedShapeMetas = HashMap<String, ShapeMeta>()
         for (entry in originalStrokes) {
@@ -743,26 +880,22 @@ class CanvasStateHolder(
                 inputs = mapped.toStrokeInputBatch(extractToolType(entry.stroke))
             )
             val copyId = uuidGenerator()
+            val mappedAttachmentId = entry.attachedObjectId?.let { oldId ->
+                oldToNewObjectIds[oldId] ?: oldId
+            }
             copiedStrokes.add(
                 IndexedDryStroke(
                     id = copyId,
                     stroke = newStroke,
                     bounds = computeStrokeDocBounds(newStroke),
                     zIndex = allocateZIndex(entry.isHighlighter),
-                    isHighlighter = entry.isHighlighter
+                    isHighlighter = entry.isHighlighter,
+                    attachedObjectId = mappedAttachmentId
                 )
             )
             shapeMetaById[entry.id]?.let { meta ->
                 copiedShapeMetas[copyId] = meta.transform(translate)
             }
-        }
-
-        val copiedObjects = originalObjects.map { obj ->
-            obj.duplicateWith(
-                newId = uuidGenerator(),
-                newZOrder = allocateObjectZOrder(),
-                affine = translate
-            )
         }
 
         val subActions = ArrayList<CanvasAction>(1 + copiedObjects.size)
@@ -840,7 +973,8 @@ class CanvasStateHolder(
             stroke = snappedStroke,
             bounds = computeStrokeDocBounds(snappedStroke),
             zIndex = original.zIndex,
-            isHighlighter = original.isHighlighter
+            isHighlighter = original.isHighlighter,
+            attachedObjectId = original.attachedObjectId
         )
         shapeMetaById[snappedEntry.id] = shapeMeta
 
@@ -1026,7 +1160,8 @@ class CanvasStateHolder(
                         stroke = newStroke,
                         bounds = computeStrokeDocBounds(newStroke),
                         zIndex = original.zIndex,
-                        isHighlighter = original.isHighlighter
+                        isHighlighter = original.isHighlighter,
+                        attachedObjectId = original.attachedObjectId
                     )
                 }
             }
@@ -1117,8 +1252,64 @@ class CanvasStateHolder(
             return SelectionTransformResult(null, emptyList())
         }
 
+        val transformedStrokes = buildTransformedStrokeEntries(originalStrokes, transform)
+
+        val updatedObjects = originalObjects.map { obj -> obj to obj.transform(transform) }
+
+        synchronized(stateLock) {
+            return buildTransformOutcomeLocked(transformedStrokes, updatedObjects, transform)
+        }
+    }
+
+    private fun buildTransformOutcomeLocked(
+        transformedStrokes: List<IndexedDryStroke>,
+        updatedObjects: List<Pair<PageObject, PageObject>>,
+        transform: AffineTransform2D
+    ): SelectionTransformResult {
+        val subActions = ArrayList<CanvasAction>(1 + updatedObjects.size)
+        val liveBeforeStrokes = transformedStrokes.mapNotNull { strokesById[it.id] }
+        if (liveBeforeStrokes.size == transformedStrokes.size && transformedStrokes.isNotEmpty()) {
+            removeStrokesByIdLocked(liveBeforeStrokes.map { it.id })
+            insertStrokesLocked(transformedStrokes)
+            for (item in transformedStrokes) {
+                shapeMetaById[item.id]?.let { existingMeta ->
+                    shapeMetaById[item.id] = existingMeta.transform(transform)
+                }
+            }
+            subActions.add(
+                CanvasAction.TransformedStrokes(
+                    strokeIds = transformedStrokes.map { it.id },
+                    beforeStrokes = liveBeforeStrokes,
+                    afterStrokes = transformedStrokes,
+                    transform = transform
+                )
+            )
+        }
+
+        val appliedUpdatedObjects = ArrayList<PageObject>(updatedObjects.size)
+        for ((beforeObj, afterObj) in updatedObjects) {
+            val liveObj = objectsById[beforeObj.id] ?: continue
+            objectsById[afterObj.id] = afterObj
+            appliedUpdatedObjects.add(afterObj)
+            subActions.add(CanvasAction.UpdatedObject(beforeObject = liveObj, afterObject = afterObj))
+        }
+
+        if (subActions.isEmpty()) return SelectionTransformResult(null, emptyList())
+        val undoAction = if (subActions.size == 1) {
+            subActions.first()
+        } else {
+            CanvasAction.CompositeAction(subActions, "Kijelölés átalakítása")
+        }
+        pushUndoActionLocked(undoAction)
+        return SelectionTransformResult(undoAction.affectedBounds, appliedUpdatedObjects)
+    }
+
+    private fun buildTransformedStrokeEntries(
+        originalStrokes: List<IndexedDryStroke>,
+        transform: AffineTransform2D
+    ): List<IndexedDryStroke> {
         val scaleMultiplier = transform.averageScaleFactor()
-        val transformedStrokes = ArrayList<IndexedDryStroke>(originalStrokes.size)
+        val result = ArrayList<IndexedDryStroke>(originalStrokes.size)
         for (i in 0 until originalStrokes.size) {
             val entry = originalStrokes[i]
             val pts = extractStylusPoints(entry.stroke)
@@ -1134,54 +1325,14 @@ class CanvasStateHolder(
                 brush = newBrush,
                 inputs = mappedPoints.toStrokeInputBatch(extractToolType(entry.stroke))
             )
-            transformedStrokes.add(
+            result.add(
                 entry.copy(
                     stroke = newStroke,
                     bounds = computeStrokeDocBounds(newStroke)
                 )
             )
         }
-
-        val updatedObjects = originalObjects.map { obj -> obj to obj.transform(transform) }
-
-        synchronized(stateLock) {
-            val subActions = ArrayList<CanvasAction>(1 + updatedObjects.size)
-            val liveBeforeStrokes = transformedStrokes.mapNotNull { strokesById[it.id] }
-            if (liveBeforeStrokes.size == transformedStrokes.size && transformedStrokes.isNotEmpty()) {
-                removeStrokesByIdLocked(liveBeforeStrokes.map { it.id })
-                insertStrokesLocked(transformedStrokes)
-                for (item in transformedStrokes) {
-                    shapeMetaById[item.id]?.let { existingMeta ->
-                        shapeMetaById[item.id] = existingMeta.transform(transform)
-                    }
-                }
-                subActions.add(
-                    CanvasAction.TransformedStrokes(
-                        strokeIds = transformedStrokes.map { it.id },
-                        beforeStrokes = liveBeforeStrokes,
-                        afterStrokes = transformedStrokes,
-                        transform = transform
-                    )
-                )
-            }
-
-            val appliedUpdatedObjects = ArrayList<PageObject>(updatedObjects.size)
-            for ((beforeObj, afterObj) in updatedObjects) {
-                val liveObj = objectsById[beforeObj.id] ?: continue
-                objectsById[afterObj.id] = afterObj
-                appliedUpdatedObjects.add(afterObj)
-                subActions.add(CanvasAction.UpdatedObject(beforeObject = liveObj, afterObject = afterObj))
-            }
-
-            if (subActions.isEmpty()) return SelectionTransformResult(null, emptyList())
-            val undoAction = if (subActions.size == 1) {
-                subActions.first()
-            } else {
-                CanvasAction.CompositeAction(subActions, "Kijelölés átalakítása")
-            }
-            pushUndoActionLocked(undoAction)
-            return SelectionTransformResult(undoAction.affectedBounds, appliedUpdatedObjects)
-        }
+        return result
     }
 
     /**

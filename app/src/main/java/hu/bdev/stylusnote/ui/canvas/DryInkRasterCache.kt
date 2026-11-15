@@ -32,7 +32,8 @@ data class IndexedDryStroke(
     val stroke: Stroke,
     val bounds: DocRect,
     val zIndex: Long,
-    val isHighlighter: Boolean = false
+    val isHighlighter: Boolean = false,
+    val attachedObjectId: String? = null
 )
 
 /**

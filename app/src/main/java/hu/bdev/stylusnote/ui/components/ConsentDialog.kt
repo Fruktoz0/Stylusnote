@@ -69,7 +69,9 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import hu.bdev.stylusnote.core.ai.AiConsentState
 import hu.bdev.stylusnote.core.ai.AiConsentStore
+import hu.bdev.stylusnote.core.ai.GeminiApiSupport
 import hu.bdev.stylusnote.core.ai.GeminiModelInfo
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 /**
@@ -158,10 +160,8 @@ fun ConsentDialog(
                 shadowElevation = 16.dp
             ) {
                 Column(
-                    modifier = Modifier
-                        .padding(24.dp)
-                        .verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                    modifier = Modifier.padding(24.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -190,6 +190,13 @@ fun ConsentDialog(
                             )
                         }
                     }
+
+                    Column(
+                        modifier = Modifier
+                            .weight(1f, fill = false)
+                            .verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                    ) {
 
                     // Mandatory Section 9.5 privacy disclosure (EEA/UK/CH vs. outside Free Tier)
                     Column(
@@ -436,8 +443,17 @@ fun ConsentDialog(
                                         scope.launch {
                                             isBusy = true
                                             feedbackMessage = null
-                                            val refreshKey = apiKeyInput.trim().ifEmpty { null }
-                                            onRefreshModels(refreshKey)
+                                            val refreshKey = GeminiApiSupport
+                                                .sanitizeApiKey(apiKeyInput)
+                                                .ifEmpty { null }
+                                            val result = try {
+                                                onRefreshModels(refreshKey)
+                                            } catch (ce: CancellationException) {
+                                                throw ce
+                                            } catch (t: Throwable) {
+                                                Result.failure(t)
+                                            }
+                                            result
                                                 .onSuccess { list ->
                                                     discoveredModels = list
                                                     isErrorFeedback = false
@@ -485,24 +501,39 @@ fun ConsentDialog(
                                 }
                             }
                         }
+
+                        }
+
+                        Text(
+                            text = "Használati számláló: ${currentState.totalRequestsCount} kérés · ~${currentState.totalPromptTokensEstimate} bemeneti token",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
 
-                    Text(
-                        text = "Használati számláló: ${currentState.totalRequestsCount} kérés · ~${currentState.totalPromptTokensEstimate} bemeneti token",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                    HorizontalDivider()
 
                     feedbackMessage?.let { msg ->
-                        Text(
-                            text = msg,
-                            style = MaterialTheme.typography.bodySmall,
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp),
                             color = if (isErrorFeedback) {
-                                MaterialTheme.colorScheme.error
+                                MaterialTheme.colorScheme.errorContainer
                             } else {
-                                MaterialTheme.colorScheme.primary
+                                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.65f)
                             }
-                        )
+                        ) {
+                            Text(
+                                text = msg,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (isErrorFeedback) {
+                                    MaterialTheme.colorScheme.onErrorContainer
+                                } else {
+                                    MaterialTheme.colorScheme.onPrimaryContainer
+                                }
+                            )
+                        }
                     }
 
                     Row(
@@ -550,7 +581,9 @@ fun ConsentDialog(
                                     scope.launch {
                                         isBusy = true
                                         feedbackMessage = null
-                                        val trimmedKey = apiKeyInput.trim().ifEmpty { null }
+                                        val trimmedKey = GeminiApiSupport
+                                            .sanitizeApiKey(apiKeyInput)
+                                            .ifEmpty { null }
                                         val trimmedOverride = modelOverrideInput.trim().ifEmpty { null }
                                         val effectiveAiEnabled = consentChecked && aiEnabledDraft
                                         runCatching {
@@ -581,8 +614,6 @@ fun ConsentDialog(
                             }
                         }
                     }
-
-                    Spacer(modifier = Modifier.height(2.dp))
                 }
             }
         }
