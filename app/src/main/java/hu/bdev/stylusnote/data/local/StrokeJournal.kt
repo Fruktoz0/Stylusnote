@@ -339,6 +339,10 @@ class StrokeJournal(
         }
     }
 
+    override fun onCanvasActionApplied(action: CanvasAction) {
+        enqueueCanvasActionForward(action)
+    }
+
     /**
      * Asynchronously mirrors an Undo (`applyInverse`) delta from [CanvasStateHolder] onto disk
      * sequentially on [writerDispatcher], guaranteed to complete before [closeBlocking] compacts.
@@ -574,28 +578,32 @@ class StrokeJournal(
         }
     }
 
-    fun closeBlocking(compactBeforeClose: Boolean = false) {
-        runBlocking {
-            for (job in snapshotPendingMutationJobs()) {
-                job.join()
-            }
-            withContext(writerDispatcher) {
-                ioMutex.withLock {
-                    pendingFsyncJob?.cancel()
-                    pendingFsyncJob = null
-                    if (!isReadOnly) {
-                        if (compactBeforeClose && journalRecordCount > 0) {
-                            compactLocked()
-                        } else if (journalUnsynced) {
-                            journalChannel?.force(false)
-                            journalUnsynced = false
-                        }
+    suspend fun close(compactBeforeClose: Boolean = false) {
+        for (job in snapshotPendingMutationJobs()) {
+            job.join()
+        }
+        withContext(writerDispatcher) {
+            ioMutex.withLock {
+                pendingFsyncJob?.cancel()
+                pendingFsyncJob = null
+                if (!isReadOnly) {
+                    if (compactBeforeClose && journalRecordCount > 0) {
+                        compactLocked()
+                    } else if (journalUnsynced) {
+                        journalChannel?.force(false)
+                        journalUnsynced = false
                     }
-                    closeChannelLocked()
                 }
+                closeChannelLocked()
             }
         }
         scope.cancel()
+    }
+
+    fun closeBlocking(compactBeforeClose: Boolean = false) {
+        runBlocking {
+            close(compactBeforeClose = compactBeforeClose)
+        }
     }
 
     private suspend fun appendEncodedBatch(

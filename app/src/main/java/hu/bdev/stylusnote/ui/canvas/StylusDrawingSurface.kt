@@ -80,16 +80,19 @@ import hu.bdev.stylusnote.core.hardware.onTouchEvent
 import hu.bdev.stylusnote.core.hardware.toStrokeInputBatch
 import hu.bdev.stylusnote.core.math.CanvasTransformMatrix
 import hu.bdev.stylusnote.core.math.ColorLuminanceInverter
+import hu.bdev.stylusnote.core.math.ContinuousPageLayout
 import hu.bdev.stylusnote.core.math.DocPoint
 import hu.bdev.stylusnote.core.math.DocRect
 import hu.bdev.stylusnote.core.math.OledStrokeRenderCache
 import hu.bdev.stylusnote.core.math.OneEuroFilter
+import hu.bdev.stylusnote.core.math.PageLayoutSlot
 import hu.bdev.stylusnote.core.math.ShapeRecognizer
 import hu.bdev.stylusnote.core.math.SpatialIndex
 import hu.bdev.stylusnote.core.math.toDocRect
 import hu.bdev.stylusnote.domain.model.AffineTransform2D
 import hu.bdev.stylusnote.domain.model.BrushConfig
 import hu.bdev.stylusnote.domain.model.BrushToolType
+import hu.bdev.stylusnote.domain.model.CanvasAction
 import hu.bdev.stylusnote.domain.model.CanvasMode
 import hu.bdev.stylusnote.domain.model.PageObject
 import hu.bdev.stylusnote.domain.model.PagePaperConfig
@@ -136,6 +139,7 @@ interface JournalCommitSink {
     fun onObjectsAdded(objects: List<PageObject>) = Unit
     fun onObjectsUpdated(objects: List<PageObject>) = Unit
     fun onObjectsDeleted(objectIds: List<String>) = Unit
+    fun onCanvasActionApplied(action: CanvasAction) = Unit
 }
 
 object NoOpJournalCommitSink : JournalCommitSink {
@@ -174,7 +178,8 @@ private enum class ActiveGestureMode {
 private data class WetStrokeMeta(
     val isHighlighter: Boolean,
     val canonicalColorArgb: Int,
-    val holdToSnapEnabled: Boolean
+    val holdToSnapEnabled: Boolean,
+    val targetPageId: String? = null
 )
 
 private class LassoSelectionRuntime {
@@ -182,6 +187,9 @@ private class LassoSelectionRuntime {
     var selectedIds: Set<String> = emptySet()
     var selectedObjectIds: Set<String> = emptySet()
     var selectionBounds: DocRect? = null
+    var targetPageId: String? = null
+    var targetOriginXPt: Float = 0f
+    var targetOriginYPt: Float = 0f
     var isDraggingSelection: Boolean = false
     var dragOriginDoc: DocPoint? = null
     var liveDeltaXPt: Float = 0f
@@ -289,6 +297,25 @@ fun StylusDrawingSurface(
     totalPages: Int = 1,
     initialPagePaddingPx: Float = 48f,
     externalDrawVersionTick: Long = 0L,
+    multiPageSessionManager: MultiPageSessionManager? = null,
+    multiPageLayout: ContinuousPageLayout? = null,
+    initialPageId: String? = null,
+    hydrationVersionTick: Long = 0L,
+    scrollToPageRequestId: String? = null,
+    scrollToPageTargetLocalRect: DocRect? = null,
+    scrollToPageRequestTick: Long = 0L,
+    onActiveSlotChanged: (PageLayoutSlot) -> Unit = {},
+    onPageMutated: (pageId: String) -> Unit = { _ -> onCanvasStateMutated() },
+    onLassoSelectedObjectInPage: ((pageId: String?, objectId: String) -> Unit)? = null,
+    onAiAutoFormatLassoSelectionInPage: ((pageId: String?, selectedIds: Set<String>, onFormatted: (clearSelection: Boolean) -> Unit) -> Unit)? = null,
+    onLassoObjectPreviewChangedInPage: ((
+        pageId: String?,
+        selectedObjectIds: Set<String>,
+        deltaXPt: Float,
+        deltaYPt: Float,
+        rotationRadians: Float,
+        rotationCenter: DocPoint?
+    ) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val palette = LocalStylusSurfacePalette.current
@@ -346,56 +373,6 @@ fun StylusDrawingSurface(
     var inProgressViewRef by remember { mutableStateOf<InProgressStrokesView?>(null) }
     var dryCanvasViewRef by remember { mutableStateOf<DryCanvasView?>(null) }
 
-    val eraserCommandChannel = remember(dryStrokeStore) {
-        Channel<EraserWorkCommand>(Channel.UNLIMITED)
-    }
-    LaunchedEffect(dryStrokeStore, dryInkRasterCache) {
-        val stateHolder = dryStrokeStore as? CanvasStateHolder ?: return@LaunchedEffect
-        for (cmd in eraserCommandChannel) {
-            when (cmd) {
-                EraserWorkCommand.BeginSession -> stateHolder.beginEraserSession()
-                is EraserWorkCommand.CutAtPoints -> {
-                    val dirtyRect = withContext(Dispatchers.Default) {
-                        var combined: DocRect? = null
-                        for (i in 0 until cmd.pointsDocPt.size) {
-                            val pt = cmd.pointsDocPt[i]
-                            val rect = if (cmd.isVectorEraser) {
-                                stateHolder.eraseWholeStrokesAt(pt.xPt, pt.yPt, cmd.radiusPt)
-                            } else {
-                                stateHolder.erasePartialStrokesAt(pt.xPt, pt.yPt, cmd.radiusPt)
-                                    .invalidatedBounds
-                            }
-                            if (rect != null) {
-                                combined = combined?.let {
-                                    DocRect(
-                                        min(it.leftPt, rect.leftPt),
-                                        min(it.topPt, rect.topPt),
-                                        max(it.rightPt, rect.rightPt),
-                                        max(it.bottomPt, rect.bottomPt)
-                                    )
-                                } ?: rect
-                            }
-                        }
-                        combined
-                    }
-                    if (dirtyRect != null) {
-                        dryInkRasterCache.invalidateDocRect(dirtyRect)
-                        dryDrawTick.longValue++
-                    }
-                }
-                EraserWorkCommand.FinishSession -> {
-                    val action = withContext(Dispatchers.Default) {
-                        stateHolder.finishEraserSession()
-                    }
-                    if (action != null) {
-                        dryDrawTick.longValue++
-                        onCanvasStateMutated()
-                    }
-                }
-            }
-        }
-    }
-
     val routerConfigHolder = remember {
         object {
             var config: BrushConfig = brushConfig
@@ -409,15 +386,24 @@ fun StylusDrawingSurface(
             var latestPalette: StylusSurfacePalette = palette
             var latestCurrentPageOneBased: Int = currentPageIndexOneBased
             var latestTotalPages: Int = totalPages
+            var latestMultiPageSession: MultiPageSessionManager? = multiPageSessionManager
+            var latestMultiPageLayout: ContinuousPageLayout? = multiPageLayout
+            var latestInitialPageId: String? = initialPageId
+            var lastReportedActivePageId: String? = initialPageId
             var onTogglePenEraserCallback: () -> Unit = onTogglePenEraser
             var onMutatedCallback: () -> Unit = onCanvasStateMutated
+            var onPageMutatedCallback: (String) -> Unit = onPageMutated
+            var onActiveSlotChangedCallback: (PageLayoutSlot) -> Unit = onActiveSlotChanged
             var onViewportTransformChangedCallback: () -> Unit = onViewportTransformChanged
             var onLiveViewportTransformChangedCallback: () -> Unit = onLiveViewportTransformChanged
             var onCanvasTouchStartCallback: () -> Unit = onCanvasTouchStart
             var onNavigationGestureEndCallback: () -> Unit = onNavigationGestureEnd
             var onLassoSelectedObjectCallback: (String) -> Unit = onLassoSelectedObject
+            var onLassoSelectedObjectInPageCallback: ((String?, String) -> Unit)? = onLassoSelectedObjectInPage
             var onLassoObjectPreviewChangedCallback: (Set<String>, Float, Float, Float, DocPoint?) -> Unit =
                 onLassoObjectPreviewChanged
+            var onLassoObjectPreviewChangedInPageCallback: ((String?, Set<String>, Float, Float, Float, DocPoint?) -> Unit)? =
+                onLassoObjectPreviewChangedInPage
         }
     }.apply {
         config = brushConfig
@@ -431,12 +417,122 @@ fun StylusDrawingSurface(
         latestPalette = palette
         latestCurrentPageOneBased = currentPageIndexOneBased
         latestTotalPages = totalPages
+        latestMultiPageSession = multiPageSessionManager
+        latestMultiPageLayout = multiPageLayout
+        latestInitialPageId = initialPageId
         onTogglePenEraserCallback = onTogglePenEraser
         onMutatedCallback = onCanvasStateMutated
+        onPageMutatedCallback = onPageMutated
+        onActiveSlotChangedCallback = onActiveSlotChanged
         onViewportTransformChangedCallback = onViewportTransformChanged
         onLiveViewportTransformChangedCallback = onLiveViewportTransformChanged
         onCanvasTouchStartCallback = onCanvasTouchStart
         onNavigationGestureEndCallback = onNavigationGestureEnd
+        onLassoSelectedObjectCallback = onLassoSelectedObject
+        onLassoSelectedObjectInPageCallback = onLassoSelectedObjectInPage
+        onLassoObjectPreviewChangedCallback = onLassoObjectPreviewChanged
+        onLassoObjectPreviewChangedInPageCallback = onLassoObjectPreviewChangedInPage
+    }
+
+    val eraserCommandChannel = remember(dryStrokeStore, multiPageSessionManager) {
+        Channel<EraserWorkCommand>(Channel.UNLIMITED)
+    }
+    LaunchedEffect(dryStrokeStore, dryInkRasterCache, journalCommitSink, multiPageSessionManager) {
+        val multiDirtyRuntimes = LinkedHashMap<String, NotebookPageRuntime>()
+        val singleStateHolder = dryStrokeStore as? CanvasStateHolder
+        for (cmd in eraserCommandChannel) {
+            val session = routerConfigHolder.latestMultiPageSession
+            val layout = routerConfigHolder.latestMultiPageLayout
+            if (session != null && layout != null) {
+                when (cmd) {
+                    EraserWorkCommand.BeginSession -> multiDirtyRuntimes.clear()
+                    is EraserWorkCommand.CutAtPoints -> {
+                        val dirtyByPage = LinkedHashMap<String, DocRect>()
+                        withContext(Dispatchers.Default) {
+                            for (i in 0 until cmd.pointsDocPt.size) {
+                                val wsPt = cmd.pointsDocPt[i]
+                                val slot = layout.findSlotAtWorkspacePoint(wsPt.xPt, wsPt.yPt) ?: continue
+                                val runtime = session.getReadyRuntime(slot.pageId) ?: continue
+                                if (runtime.isReadOnly) continue
+                                if (multiDirtyRuntimes.putIfAbsent(slot.pageId, runtime) == null) {
+                                    runtime.canvasStateHolder.beginEraserSession()
+                                }
+                                val localPt = slot.workspaceToLocalPoint(wsPt.xPt, wsPt.yPt)
+                                val rect = erasePointsOnHolder(
+                                    holder = runtime.canvasStateHolder,
+                                    pt = localPt,
+                                    radiusPt = cmd.radiusPt,
+                                    isVectorEraser = cmd.isVectorEraser
+                                )
+                                if (rect != null) {
+                                    dirtyByPage[slot.pageId] = mergeDocRects(dirtyByPage[slot.pageId], rect)
+                                }
+                            }
+                        }
+                        if (dirtyByPage.isNotEmpty()) {
+                            for ((pageId, dirty) in dirtyByPage) {
+                                multiDirtyRuntimes[pageId]?.dryInkRasterCache?.invalidateDocRect(dirty)
+                            }
+                            dryDrawTick.longValue++
+                        }
+                    }
+                    EraserWorkCommand.FinishSession -> {
+                        if (multiDirtyRuntimes.isNotEmpty()) {
+                            val finishedPages = ArrayList<String>(multiDirtyRuntimes.size)
+                            withContext(Dispatchers.Default) {
+                                for ((pageId, runtime) in multiDirtyRuntimes) {
+                                    val action = runtime.canvasStateHolder.finishEraserSession()
+                                    if (action != null) {
+                                        runtime.strokeJournal.onCanvasActionApplied(action)
+                                        finishedPages.add(pageId)
+                                    }
+                                }
+                            }
+                            multiDirtyRuntimes.clear()
+                            if (finishedPages.isNotEmpty()) {
+                                dryDrawTick.longValue++
+                                finishedPages.forEach { routerConfigHolder.onPageMutatedCallback(it) }
+                            }
+                        }
+                    }
+                }
+            } else if (singleStateHolder != null) {
+                when (cmd) {
+                    EraserWorkCommand.BeginSession -> singleStateHolder.beginEraserSession()
+                    is EraserWorkCommand.CutAtPoints -> {
+                        val dirtyRect = withContext(Dispatchers.Default) {
+                            var combined: DocRect? = null
+                            for (i in 0 until cmd.pointsDocPt.size) {
+                                val rect = erasePointsOnHolder(
+                                    holder = singleStateHolder,
+                                    pt = cmd.pointsDocPt[i],
+                                    radiusPt = cmd.radiusPt,
+                                    isVectorEraser = cmd.isVectorEraser
+                                )
+                                if (rect != null) {
+                                    combined = mergeDocRects(combined, rect)
+                                }
+                            }
+                            combined
+                        }
+                        if (dirtyRect != null) {
+                            dryInkRasterCache.invalidateDocRect(dirtyRect)
+                            dryDrawTick.longValue++
+                        }
+                    }
+                    EraserWorkCommand.FinishSession -> {
+                        val action = withContext(Dispatchers.Default) {
+                            singleStateHolder.finishEraserSession()
+                        }
+                        if (action != null) {
+                            journalCommitSink.onCanvasActionApplied(action)
+                            dryDrawTick.longValue++
+                            routerConfigHolder.onMutatedCallback()
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fun emitLiveLassoObjectPreview() {
@@ -447,20 +543,52 @@ fun StylusDrawingSurface(
         } else {
             null
         }
-        routerConfigHolder.onLassoObjectPreviewChangedCallback(
-            objIds,
-            lassoRuntime.liveDeltaXPt,
-            lassoRuntime.liveDeltaYPt,
-            lassoRuntime.liveRotationRadians,
-            center
-        )
+        val pageCallback = routerConfigHolder.onLassoObjectPreviewChangedInPageCallback
+        if (pageCallback != null) {
+            pageCallback(
+                lassoRuntime.targetPageId,
+                objIds,
+                lassoRuntime.liveDeltaXPt,
+                lassoRuntime.liveDeltaYPt,
+                lassoRuntime.liveRotationRadians,
+                center
+            )
+        } else {
+            routerConfigHolder.onLassoObjectPreviewChangedCallback(
+                objIds,
+                lassoRuntime.liveDeltaXPt,
+                lassoRuntime.liveDeltaYPt,
+                lassoRuntime.liveRotationRadians,
+                center
+            )
+        }
     }
 
     fun clearLassoObjectPreview() {
-        routerConfigHolder.onLassoObjectPreviewChangedCallback(emptySet(), 0f, 0f, 0f, null)
+        val pageCallback = routerConfigHolder.onLassoObjectPreviewChangedInPageCallback
+        if (pageCallback != null) {
+            pageCallback(lassoRuntime.targetPageId, emptySet(), 0f, 0f, 0f, null)
+        } else {
+            routerConfigHolder.onLassoObjectPreviewChangedCallback(emptySet(), 0f, 0f, 0f, null)
+        }
     }
 
-    fun startLassoInteraction(firstPt: DocPoint) {
+    fun shiftDocPointToLassoLocal(wsPt: DocPoint): DocPoint = DocPoint(
+        xPt = wsPt.xPt - lassoRuntime.targetOriginXPt,
+        yPt = wsPt.yPt - lassoRuntime.targetOriginYPt
+    )
+
+    fun notifyLassoPageMutated() {
+        val pageId = lassoRuntime.targetPageId
+        if (pageId != null) {
+            routerConfigHolder.onPageMutatedCallback(pageId)
+        } else {
+            routerConfigHolder.onMutatedCallback()
+        }
+    }
+
+    fun startLassoInteraction(firstWorkspacePt: DocPoint) {
+        val firstPt = shiftDocPointToLassoLocal(firstWorkspacePt)
         val bounds = lassoRuntime.selectionBounds
         val hasSelection = lassoRuntime.selectedIds.isNotEmpty() || lassoRuntime.selectedObjectIds.isNotEmpty()
         val distToRotateHandlePx = if (bounds != null) {
@@ -501,16 +629,30 @@ fun StylusDrawingSurface(
             lassoRuntime.isRotatingSelection = false
             lassoRuntime.liveRotationRadians = 0f
             clearLassoObjectPreview()
-            lassoRuntime.activePolygon = ArrayList<DocPoint>(64).apply { add(firstPt) }
+
+            val session = routerConfigHolder.latestMultiPageSession
+            val layout = routerConfigHolder.latestMultiPageLayout
+            val targetSlot = if (session != null && layout != null) {
+                layout.findSlotAtWorkspacePoint(firstWorkspacePt.xPt, firstWorkspacePt.yPt)
+            } else {
+                null
+            }
+            lassoRuntime.targetPageId = targetSlot?.pageId
+            lassoRuntime.targetOriginXPt = targetSlot?.leftPt ?: 0f
+            lassoRuntime.targetOriginYPt = targetSlot?.topPt ?: 0f
+
+            val localStart = shiftDocPointToLassoLocal(firstWorkspacePt)
+            lassoRuntime.activePolygon = ArrayList<DocPoint>(64).apply { add(localStart) }
         }
         lassoSelectionVersion.longValue++
         lassoDrawTick.longValue++
     }
 
-    fun moveLassoInteraction(points: List<DocPoint>) {
-        if (points.isEmpty()) return
+    fun moveLassoInteraction(workspacePoints: List<DocPoint>) {
+        if (workspacePoints.isEmpty()) return
+        val localPoints = workspacePoints.map(::shiftDocPointToLassoLocal)
         if (lassoRuntime.isRotatingSelection) {
-            val last = points.last()
+            val last = localPoints.last()
             val currentAngle = atan2(
                 last.yPt - lassoRuntime.rotationCenterYPt,
                 last.xPt - lassoRuntime.rotationCenterXPt
@@ -520,22 +662,37 @@ fun StylusDrawingSurface(
             dryCanvasViewRef?.invalidate()
         } else if (lassoRuntime.isDraggingSelection) {
             val origin = lassoRuntime.dragOriginDoc ?: return
-            val last = points.last()
+            val last = localPoints.last()
             lassoRuntime.liveDeltaXPt = last.xPt - origin.xPt
             lassoRuntime.liveDeltaYPt = last.yPt - origin.yPt
             emitLiveLassoObjectPreview()
             dryCanvasViewRef?.invalidate()
         } else {
-            lassoRuntime.activePolygon.addAll(points)
+            lassoRuntime.activePolygon.addAll(localPoints)
         }
         lassoDrawTick.longValue++
     }
 
-    fun finishLassoInteraction(finalPoints: List<DocPoint>) {
-        val stateHolder = dryStrokeStore as? CanvasStateHolder
+    fun finishLassoInteraction(finalWorkspacePoints: List<DocPoint>) {
+        val localFinalPoints = finalWorkspacePoints.map(::shiftDocPointToLassoLocal)
+        val session = routerConfigHolder.latestMultiPageSession
+        val targetRuntime = if (session != null) {
+            lassoRuntime.targetPageId?.let { session.getReadyRuntime(it) }
+        } else {
+            null
+        }
+        val stateHolder = if (session != null) {
+            targetRuntime?.canvasStateHolder
+        } else {
+            dryStrokeStore as? CanvasStateHolder
+        }
+        val targetCache = targetRuntime?.dryInkRasterCache ?: dryInkRasterCache
+        val targetOled = targetRuntime?.oledStrokeCache ?: oledStrokeCache
+        val targetSink: JournalCommitSink = targetRuntime?.strokeJournal ?: journalCommitSink
+
         if (lassoRuntime.isRotatingSelection) {
-            if (finalPoints.isNotEmpty()) {
-                val endPt = finalPoints.last()
+            if (localFinalPoints.isNotEmpty()) {
+                val endPt = localFinalPoints.last()
                 val currentAngle = atan2(
                     endPt.yPt - lassoRuntime.rotationCenterYPt,
                     endPt.xPt - lassoRuntime.rotationCenterXPt
@@ -553,34 +710,36 @@ fun StylusDrawingSurface(
             lassoRuntime.liveRotationRadians = 0f
             clearLassoObjectPreview()
 
-            if (stateHolder != null && (selectedStrokes.isNotEmpty() || selectedObjects.isNotEmpty()) && abs(angleRad) > 0.005f) {
+            if (stateHolder != null && targetRuntime?.isReadOnly != true &&
+                (selectedStrokes.isNotEmpty() || selectedObjects.isNotEmpty()) && abs(angleRad) > 0.005f
+            ) {
                 val rotation = AffineTransform2D.rotationAround(angleRad, cx, cy)
                 val res = stateHolder.transformSelection(selectedStrokes, selectedObjects, rotation)
                 if (res.affectedBounds != null) {
                     for (id in selectedStrokes) {
-                        oledStrokeCache.invalidate(id)
+                        targetOled.invalidate(id)
                     }
-                    oldBounds?.let { dryInkRasterCache.invalidateDocRect(it) }
-                    dryInkRasterCache.invalidateDocRect(res.affectedBounds)
+                    oldBounds?.let { targetCache.invalidateDocRect(it) }
+                    targetCache.invalidateDocRect(res.affectedBounds)
                     lassoRuntime.selectionBounds = stateHolder.computeCombinedSelectionBounds(
                         selectedStrokes,
                         selectedObjects
                     )
                     if (selectedStrokes.isNotEmpty()) {
-                        journalCommitSink.onStrokesTransformed(selectedStrokes.toList(), rotation)
+                        targetSink.onStrokesTransformed(selectedStrokes.toList(), rotation)
                     }
                     if (res.updatedObjects.isNotEmpty()) {
-                        journalCommitSink.onObjectsUpdated(res.updatedObjects)
+                        targetSink.onObjectsUpdated(res.updatedObjects)
                     }
                     dryDrawTick.longValue++
-                    routerConfigHolder.onMutatedCallback()
+                    notifyLassoPageMutated()
                 }
             }
             dryCanvasViewRef?.invalidate()
         } else if (lassoRuntime.isDraggingSelection) {
             val origin = lassoRuntime.dragOriginDoc
-            if (origin != null && finalPoints.isNotEmpty()) {
-                val endPt = finalPoints.last()
+            if (origin != null && localFinalPoints.isNotEmpty()) {
+                val endPt = localFinalPoints.last()
                 lassoRuntime.liveDeltaXPt = endPt.xPt - origin.xPt
                 lassoRuntime.liveDeltaYPt = endPt.yPt - origin.yPt
             }
@@ -596,44 +755,49 @@ fun StylusDrawingSurface(
             clearLassoObjectPreview()
 
             // Rebuild immutable Stroke & PageObject instances ONLY on ACTION_UP if actually moved.
-            if (stateHolder != null && (selectedStrokes.isNotEmpty() || selectedObjects.isNotEmpty()) && hypot(dx, dy) > 0.5f) {
+            if (stateHolder != null && targetRuntime?.isReadOnly != true &&
+                (selectedStrokes.isNotEmpty() || selectedObjects.isNotEmpty()) && hypot(dx, dy) > 0.5f
+            ) {
                 val translation = AffineTransform2D.translation(dx, dy)
                 val res = stateHolder.transformSelection(selectedStrokes, selectedObjects, translation)
                 if (res.affectedBounds != null) {
                     for (id in selectedStrokes) {
-                        oledStrokeCache.invalidate(id)
+                        targetOled.invalidate(id)
                     }
-                    oldBounds?.let { dryInkRasterCache.invalidateDocRect(it) }
-                    dryInkRasterCache.invalidateDocRect(res.affectedBounds)
+                    oldBounds?.let { targetCache.invalidateDocRect(it) }
+                    targetCache.invalidateDocRect(res.affectedBounds)
                     lassoRuntime.selectionBounds = stateHolder.computeCombinedSelectionBounds(
                         selectedStrokes,
                         selectedObjects
                     )
                     if (selectedStrokes.isNotEmpty()) {
-                        journalCommitSink.onStrokesTransformed(selectedStrokes.toList(), translation)
+                        targetSink.onStrokesTransformed(selectedStrokes.toList(), translation)
                     }
                     if (res.updatedObjects.isNotEmpty()) {
-                        journalCommitSink.onObjectsUpdated(res.updatedObjects)
+                        targetSink.onObjectsUpdated(res.updatedObjects)
                     }
                     dryDrawTick.longValue++
-                    routerConfigHolder.onMutatedCallback()
+                    notifyLassoPageMutated()
                 }
             }
             dryCanvasViewRef?.invalidate()
         } else {
-            lassoRuntime.activePolygon.addAll(finalPoints)
+            lassoRuntime.activePolygon.addAll(localFinalPoints)
             val poly = lassoRuntime.activePolygon
             if (stateHolder != null && poly.size >= 3) {
                 val strokeHits = stateHolder.selectStrokesByLasso(poly)
                 val objectHits = stateHolder.selectPageObjectsByLasso(poly)
                 if (strokeHits.isEmpty() && objectHits.size == 1) {
                     // Single selected object activates full corner resize/rotate + restore controls immediately.
+                    val matchedPageId = lassoRuntime.targetPageId
                     lassoRuntime.selectedIds = emptySet()
                     lassoRuntime.selectedObjectIds = emptySet()
                     lassoRuntime.selectionBounds = null
                     lassoRuntime.activePolygon = ArrayList()
                     clearLassoObjectPreview()
-                    routerConfigHolder.onLassoSelectedObjectCallback(objectHits.first().id)
+                    routerConfigHolder.onLassoSelectedObjectInPageCallback
+                        ?.invoke(matchedPageId, objectHits.first().id)
+                        ?: routerConfigHolder.onLassoSelectedObjectCallback(objectHits.first().id)
                     lassoSelectionVersion.longValue++
                     lassoDrawTick.longValue++
                     return
@@ -678,6 +842,9 @@ fun StylusDrawingSurface(
             private var activeMode: ActiveGestureMode = ActiveGestureMode.DRAW_INK
             private var activeToolType: BrushToolType = BrushToolType.FOUNTAIN_PEN
             private var activeStrokeId: InProgressStrokeId? = null
+            private var activeStrokeRejected: Boolean = false
+            private var activeBatchOriginXPt: Float = 0f
+            private var activeBatchOriginYPt: Float = 0f
             private var lastBatchSample: StylusPointSample? = null
             private val screenToDocMatrix = Matrix()
             private val docToScreenMatrix = Matrix()
@@ -726,11 +893,19 @@ fun StylusDrawingSurface(
                 return pts
             }
 
+            private fun shiftSamples(samples: List<StylusPointSample>): List<StylusPointSample> {
+                val ox = activeBatchOriginXPt
+                val oy = activeBatchOriginYPt
+                if (ox == 0f && oy == 0f) return samples
+                return samples.map { it.copy(xPt = it.xPt - ox, yPt = it.yPt - oy) }
+            }
+
             override fun onStartRawStroke(
                 event: MotionEvent,
                 pointerId: Int,
                 isEraserTool: Boolean
             ) {
+                activeStrokeRejected = false
                 activeToolType = resolveToolForGesture(isEraserTool)
                 activeMode = modeForTool(activeToolType)
 
@@ -738,6 +913,31 @@ fun StylusDrawingSurface(
                     ActiveGestureMode.DRAW_INK -> {
                         val view = inProgressViewRef ?: return
                         transformMatrix.populateScreenToDocMatrix(screenToDocMatrix)
+                        var targetPageId: String? = null
+                        val session = routerConfigHolder.latestMultiPageSession
+                        val layout = routerConfigHolder.latestMultiPageLayout
+                        if (session != null && layout != null) {
+                            val pointerIdx = event.findPointerIndex(pointerId)
+                            if (pointerIdx < 0) {
+                                activeStrokeRejected = true
+                                return
+                            }
+                            val wsDoc = transformMatrix.screenToDoc(
+                                event.getX(pointerIdx),
+                                event.getY(pointerIdx)
+                            )
+                            val slot = layout.findSlotAtWorkspacePoint(wsDoc.xPt, wsDoc.yPt)
+                            val runtime = slot?.let { session.getReadyRuntime(it.pageId) }
+                            if (slot == null || runtime == null || runtime.isReadOnly) {
+                                activeStrokeRejected = true
+                                return
+                            }
+                            targetPageId = slot.pageId
+                            if (slot.leftPt != 0f || slot.topPt != 0f) {
+                                screenToDocMatrix.postTranslate(-slot.leftPt, -slot.topPt)
+                            }
+                        }
+
                         val strokeId = view.startStroke(
                             event = event,
                             pointerId = pointerId,
@@ -749,7 +949,8 @@ fun StylusDrawingSurface(
                         wetStrokeMetaMap[strokeId] = WetStrokeMeta(
                             isHighlighter = activeToolType.isHighlighter,
                             canonicalColorArgb = routerConfigHolder.canonicalBrushColorArgb,
-                            holdToSnapEnabled = routerConfigHolder.config.holdToSnapEnabled
+                            holdToSnapEnabled = routerConfigHolder.config.holdToSnapEnabled,
+                            targetPageId = targetPageId
                         )
                     }
                     ActiveGestureMode.ERASER -> {
@@ -784,6 +985,7 @@ fun StylusDrawingSurface(
             ) {
                 when (activeMode) {
                     ActiveGestureMode.DRAW_INK -> {
+                        if (activeStrokeRejected) return
                         val view = inProgressViewRef ?: return
                         val strokeId = activeStrokeId ?: return
                         view.addToStroke(
@@ -814,6 +1016,11 @@ fun StylusDrawingSurface(
             override fun onFinishRawStroke(event: MotionEvent, pointerId: Int) {
                 when (activeMode) {
                     ActiveGestureMode.DRAW_INK -> {
+                        if (activeStrokeRejected) {
+                            activeStrokeRejected = false
+                            activeStrokeId = null
+                            return
+                        }
                         val view = inProgressViewRef ?: return
                         val strokeId = activeStrokeId ?: return
                         view.finishStroke(event = event, pointerId = pointerId, strokeId = strokeId)
@@ -842,6 +1049,9 @@ fun StylusDrawingSurface(
                 firstSample: StylusPointSample,
                 toolType: InputToolType
             ) {
+                activeStrokeRejected = false
+                activeBatchOriginXPt = 0f
+                activeBatchOriginYPt = 0f
                 activeToolType = resolveToolForGesture(firstSample.isEraserTool)
                 activeMode = modeForTool(activeToolType)
 
@@ -849,8 +1059,31 @@ fun StylusDrawingSurface(
                     ActiveGestureMode.DRAW_INK -> {
                         val view = inProgressViewRef ?: return
                         transformMatrix.populateDocToScreenMatrix(docToScreenMatrix)
-                        lastBatchSample = firstSample
-                        val input = firstSample.toSingleStrokeInput(toolType)
+                        var targetPageId: String? = null
+                        val session = routerConfigHolder.latestMultiPageSession
+                        val layout = routerConfigHolder.latestMultiPageLayout
+                        val localFirstSample = if (session != null && layout != null) {
+                            val slot = layout.findSlotAtWorkspacePoint(firstSample.xPt, firstSample.yPt)
+                            val runtime = slot?.let { session.getReadyRuntime(it.pageId) }
+                            if (slot == null || runtime == null || runtime.isReadOnly) {
+                                activeStrokeRejected = true
+                                return
+                            }
+                            targetPageId = slot.pageId
+                            activeBatchOriginXPt = slot.leftPt
+                            activeBatchOriginYPt = slot.topPt
+                            if (slot.leftPt != 0f || slot.topPt != 0f) {
+                                docToScreenMatrix.preTranslate(slot.leftPt, slot.topPt)
+                            }
+                            firstSample.copy(
+                                xPt = firstSample.xPt - slot.leftPt,
+                                yPt = firstSample.yPt - slot.topPt
+                            )
+                        } else {
+                            firstSample
+                        }
+                        lastBatchSample = localFirstSample
+                        val input = localFirstSample.toSingleStrokeInput(toolType)
                         val strokeId = view.startStroke(
                             input = input,
                             brush = routerConfigHolder.wetBrush,
@@ -860,7 +1093,8 @@ fun StylusDrawingSurface(
                         wetStrokeMetaMap[strokeId] = WetStrokeMeta(
                             isHighlighter = activeToolType.isHighlighter,
                             canonicalColorArgb = routerConfigHolder.canonicalBrushColorArgb,
-                            holdToSnapEnabled = routerConfigHolder.config.holdToSnapEnabled
+                            holdToSnapEnabled = routerConfigHolder.config.holdToSnapEnabled,
+                            targetPageId = targetPageId
                         )
                     }
                     ActiveGestureMode.ERASER -> {
@@ -886,18 +1120,21 @@ fun StylusDrawingSurface(
             ) {
                 when (activeMode) {
                     ActiveGestureMode.DRAW_INK -> {
+                        if (activeStrokeRejected) return
                         val view = inProgressViewRef ?: return
                         val strokeId = activeStrokeId ?: return
                         if (realSamples.isEmpty() && predictedSamples.isEmpty()) return
 
-                        if (realSamples.isNotEmpty()) {
-                            lastBatchSample = realSamples.last()
+                        val shiftedReal = shiftSamples(realSamples)
+                        val shiftedPred = shiftSamples(predictedSamples)
+                        if (shiftedReal.isNotEmpty()) {
+                            lastBatchSample = shiftedReal.last()
                         }
-                        val realBatch = realSamples.toStrokeInputBatch(toolType)
-                        val predBatch = if (predictedSamples.isEmpty()) {
+                        val realBatch = shiftedReal.toStrokeInputBatch(toolType)
+                        val predBatch = if (shiftedPred.isEmpty()) {
                             ImmutableStrokeInputBatch.EMPTY
                         } else {
-                            predictedSamples.toStrokeInputBatch(toolType)
+                            shiftedPred.toStrokeInputBatch(toolType)
                         }
                         view.addToStroke(
                             inputs = realBatch,
@@ -928,18 +1165,27 @@ fun StylusDrawingSurface(
             ) {
                 when (activeMode) {
                     ActiveGestureMode.DRAW_INK -> {
+                        if (activeStrokeRejected) {
+                            activeStrokeRejected = false
+                            activeBatchOriginXPt = 0f
+                            activeBatchOriginYPt = 0f
+                            activeStrokeId = null
+                            lastBatchSample = null
+                            return
+                        }
                         val view = inProgressViewRef ?: return
                         val strokeId = activeStrokeId ?: return
 
-                        if (finalSamples.size > 1) {
-                            val intermediateBatch = finalSamples.dropLast(1).toStrokeInputBatch(toolType)
+                        val shiftedFinal = shiftSamples(finalSamples)
+                        if (shiftedFinal.size > 1) {
+                            val intermediateBatch = shiftedFinal.dropLast(1).toStrokeInputBatch(toolType)
                             view.addToStroke(
                                 inputs = intermediateBatch,
                                 strokeId = strokeId,
                                 prediction = ImmutableStrokeInputBatch.EMPTY
                             )
                         }
-                        val terminalSample = finalSamples.lastOrNull() ?: lastBatchSample
+                        val terminalSample = shiftedFinal.lastOrNull() ?: lastBatchSample
                         if (terminalSample != null) {
                             view.finishStroke(
                                 input = terminalSample.toSingleStrokeInput(toolType),
@@ -951,6 +1197,8 @@ fun StylusDrawingSurface(
                         }
                         activeStrokeId = null
                         lastBatchSample = null
+                        activeBatchOriginXPt = 0f
+                        activeBatchOriginYPt = 0f
                     }
                     ActiveGestureMode.ERASER -> {
                         if (finalSamples.isNotEmpty()) {
@@ -1006,45 +1254,84 @@ fun StylusDrawingSurface(
     LaunchedEffect(allowFingerDrawing) {
         inputRouter?.allowFingerDrawing = allowFingerDrawing
     }
-    LaunchedEffect(brushConfig.toolType) {
-        if (brushConfig.toolType != BrushToolType.LASSO &&
-            (lassoRuntime.selectedIds.isNotEmpty() || lassoRuntime.selectedObjectIds.isNotEmpty())
-        ) {
-            lassoRuntime.selectedIds = emptySet()
-            lassoRuntime.selectedObjectIds = emptySet()
-            lassoRuntime.selectionBounds = null
-            onLassoObjectPreviewChanged(emptySet(), 0f, 0f, 0f, null)
-            lassoSelectionVersion.longValue++
-            lassoDrawTick.longValue++
+    suspend fun prewarmContinuousVisibleSlots(
+        vpWidth: Int,
+        vpHeight: Int,
+        layout: ContinuousPageLayout,
+        session: MultiPageSessionManager,
+        paletteSnap: StylusSurfacePalette
+    ) {
+        if (vpWidth <= 0 || vpHeight <= 0) return
+        val visibleWs = transformMatrix.screenRectToDocRect(0f, 0f, vpWidth.toFloat(), vpHeight.toFloat())
+        val slots = layout.resolveVisibleSlots(visibleWs, paddingPt = 160f)
+        val isOled = paletteSnap.isOledDeepBlack
+        for (i in 0 until slots.size) {
+            val slot = slots[i]
+            val runtime = session.getReadyRuntime(slot.pageId) ?: continue
+            withContext(Dispatchers.Default) {
+                runtime.dryInkRasterCache.prewarmVisibleTiles(
+                    viewportWidthPx = vpWidth,
+                    viewportHeightPx = vpHeight,
+                    transformMatrix = transformMatrix,
+                    spatialIndex = runtime.canvasStateHolder.spatialIndex,
+                    isOledMode = isOled,
+                    pageWidthPt = slot.widthPt,
+                    pageHeightPt = slot.heightPt,
+                    paperConfig = slot.config,
+                    palette = paletteSnap,
+                    pageOriginXPt = slot.leftPt,
+                    pageOriginYPt = slot.topPt,
+                    strokeAdapter = { entry -> runtime.oledStrokeCache.adaptStroke(entry, isOled) }
+                )
+            }
         }
     }
-    LaunchedEffect(palette.isOledDeepBlack) {
-        oledStrokeCache.clear()
-        dryInkRasterCache.clearAll()
-        dryDrawTick.longValue++
-    }
-    LaunchedEffect(paperConfig) {
-        dryDrawTick.longValue++
-    }
-    LaunchedEffect(transformMatrix, paperConfig.pageDimensions, viewportSize) {
-        val vp = viewportSize
-        if (!hasInitializedViewport && vp.width > 0 && vp.height > 0) {
+
+    suspend fun initializeViewportCameraAndCaches(size: IntSize) {
+        if (hasInitializedViewport || size.width <= 0 || size.height <= 0) return
+        val session = routerConfigHolder.latestMultiPageSession
+        val layout = routerConfigHolder.latestMultiPageLayout
+        val initPaperConfig = routerConfigHolder.latestPaperConfig
+        val initPalette = routerConfigHolder.latestPalette
+        val isOled = initPalette.isOledDeepBlack
+
+        if (session != null && layout != null && !layout.isEmpty) {
+            val startSlot = routerConfigHolder.latestInitialPageId?.let { layout.slotForPageId(it) }
+                ?: layout.slotAt(0)!!
             transformMatrix.fitPageToViewport(
-                pageWidthPt = paperConfig.pageDimensions.widthPt,
-                pageHeightPt = paperConfig.pageDimensions.heightPt,
-                viewportWidthPx = vp.width.toFloat(),
-                viewportHeightPx = vp.height.toFloat(),
+                pageWidthPt = startSlot.widthPt,
+                pageHeightPt = startSlot.heightPt,
+                viewportWidthPx = size.width.toFloat(),
+                viewportHeightPx = size.height.toFloat(),
+                paddingPx = initialPagePaddingPx
+            )
+            val (panX, panY) = layout.computeCameraPanForSlot(
+                slot = startSlot,
+                scale = transformMatrix.scale,
+                viewportWidthPx = size.width.toFloat(),
+                viewportHeightPx = size.height.toFloat(),
+                verticalPaddingPx = initialPagePaddingPx
+            )
+            transformMatrix.setTransform(scale = transformMatrix.scale, panXPx = panX, panYPx = panY)
+            session.updateActiveFocus(startSlot.pageIndex)
+            routerConfigHolder.lastReportedActivePageId = startSlot.pageId
+            hasInitializedViewport = true
+            prewarmContinuousVisibleSlots(size.width, size.height, layout, session, initPalette)
+        } else {
+            transformMatrix.fitPageToViewport(
+                pageWidthPt = initPaperConfig.pageDimensions.widthPt,
+                pageHeightPt = initPaperConfig.pageDimensions.heightPt,
+                viewportWidthPx = size.width.toFloat(),
+                viewportHeightPx = size.height.toFloat(),
                 paddingPx = initialPagePaddingPx
             )
             dryInkRasterCache.syncInitialScale(transformMatrix.scale)
-            val initPaperConfig = routerConfigHolder.latestPaperConfig
-            val initPalette = routerConfigHolder.latestPalette
-            val isOled = initPalette.isOledDeepBlack
+            hasInitializedViewport = true
             if (dryStrokeStore.spatialIndex.size > 0 || initPaperConfig.canvasMode == CanvasMode.FIXED_PAGE) {
                 withContext(Dispatchers.Default) {
                     dryInkRasterCache.prewarmVisibleTiles(
-                        viewportWidthPx = vp.width,
-                        viewportHeightPx = vp.height,
+                        viewportWidthPx = size.width,
+                        viewportHeightPx = size.height,
                         transformMatrix = transformMatrix,
                         spatialIndex = dryStrokeStore.spatialIndex,
                         isOledMode = isOled,
@@ -1056,39 +1343,139 @@ fun StylusDrawingSurface(
                     )
                 }
             }
-            hasInitializedViewport = true
-            dryDrawTick.longValue++
-            dryCanvasViewRef?.invalidate()
-            routerConfigHolder.onViewportTransformChangedCallback()
+        }
+        dryDrawTick.longValue++
+        dryCanvasViewRef?.invalidate()
+        routerConfigHolder.onViewportTransformChangedCallback()
+    }
+
+    LaunchedEffect(brushConfig.toolType) {
+        if (brushConfig.toolType != BrushToolType.LASSO &&
+            (lassoRuntime.selectedIds.isNotEmpty() || lassoRuntime.selectedObjectIds.isNotEmpty())
+        ) {
+            lassoRuntime.selectedIds = emptySet()
+            lassoRuntime.selectedObjectIds = emptySet()
+            lassoRuntime.selectionBounds = null
+            clearLassoObjectPreview()
+            lassoSelectionVersion.longValue++
+            lassoDrawTick.longValue++
         }
     }
-    LaunchedEffect(dryDrawTick.longValue, externalDrawVersionTick, paperConfig, palette.isOledDeepBlack) {
+    LaunchedEffect(palette.isOledDeepBlack) {
+        oledStrokeCache.clear()
+        dryInkRasterCache.clearAll()
+        multiPageSessionManager?.activePageIdsSnapshot()?.forEach { pageId ->
+            multiPageSessionManager.getRuntime(pageId)?.let { rt ->
+                rt.oledStrokeCache.clear()
+                rt.dryInkRasterCache.clearAll()
+            }
+        }
+        val vp = viewportSize
+        val layout = routerConfigHolder.latestMultiPageLayout
+        val session = routerConfigHolder.latestMultiPageSession
+        if (vp.width > 0 && vp.height > 0 && session != null && layout != null) {
+            prewarmContinuousVisibleSlots(vp.width, vp.height, layout, session, palette)
+        }
+        dryDrawTick.longValue++
         dryCanvasViewRef?.invalidate()
+    }
+    LaunchedEffect(paperConfig) {
+        dryDrawTick.longValue++
+    }
+    LaunchedEffect(transformMatrix, paperConfig.pageDimensions, multiPageLayout, viewportSize) {
+        if (!hasInitializedViewport && viewportSize.width > 0 && viewportSize.height > 0) {
+            initializeViewportCameraAndCaches(viewportSize)
+        }
+    }
+    LaunchedEffect(scrollToPageRequestTick) {
+        if (scrollToPageRequestTick <= 0L) return@LaunchedEffect
+        val vp = viewportSize
+        val session = routerConfigHolder.latestMultiPageSession ?: return@LaunchedEffect
+        val layout = routerConfigHolder.latestMultiPageLayout ?: return@LaunchedEffect
+        val targetId = scrollToPageRequestId ?: return@LaunchedEffect
+        val slot = layout.slotForPageId(targetId) ?: return@LaunchedEffect
+        if (vp.width <= 0 || vp.height <= 0) return@LaunchedEffect
+
+        val localTarget = scrollToPageTargetLocalRect
+        if (localTarget != null) {
+            val wsRect = slot.localRectToWorkspaceRect(localTarget)
+            transformMatrix.centerOnDocRectIfNeeded(
+                targetRect = wsRect,
+                viewportWidthPx = vp.width.toFloat(),
+                viewportHeightPx = vp.height.toFloat(),
+                forceCenter = true
+            )
+        } else {
+            val curScale = transformMatrix.scale
+            val targetScale = if (curScale < transformMatrix.baseFitScale * 0.85f) {
+                transformMatrix.baseFitScale
+            } else {
+                curScale
+            }
+            val (panX, panY) = layout.computeCameraPanForSlot(
+                slot = slot,
+                scale = targetScale,
+                viewportWidthPx = vp.width.toFloat(),
+                viewportHeightPx = vp.height.toFloat(),
+                verticalPaddingPx = initialPagePaddingPx
+            )
+            transformMatrix.setTransform(scale = targetScale, panXPx = panX, panYPx = panY)
+        }
+        session.updateActiveFocus(slot.pageIndex)
+        routerConfigHolder.lastReportedActivePageId = slot.pageId
+        prewarmContinuousVisibleSlots(vp.width, vp.height, layout, session, routerConfigHolder.latestPalette)
+        dryDrawTick.longValue++
+        dryCanvasViewRef?.invalidate()
+        routerConfigHolder.onViewportTransformChangedCallback()
+        routerConfigHolder.onLiveViewportTransformChangedCallback()
+    }
+    LaunchedEffect(dryDrawTick.longValue, externalDrawVersionTick, hydrationVersionTick, paperConfig, palette.isOledDeepBlack) {
+        dryCanvasViewRef?.invalidate()
+    }
+    LaunchedEffect(hydrationVersionTick) {
+        if (hydrationVersionTick > 0L) {
+            val vp = viewportSize
+            val session = routerConfigHolder.latestMultiPageSession
+            val layout = routerConfigHolder.latestMultiPageLayout
+            if (vp.width > 0 && vp.height > 0 && session != null && layout != null) {
+                prewarmContinuousVisibleSlots(vp.width, vp.height, layout, session, routerConfigHolder.latestPalette)
+                dryDrawTick.longValue++
+                dryCanvasViewRef?.invalidate()
+            }
+        }
     }
     LaunchedEffect(externalDrawVersionTick) {
         if (externalDrawVersionTick > 0L) {
-            dryInkRasterCache.onGestureSettled(transformMatrix.scale)
             val vpW = viewportSize.width
             val vpH = viewportSize.height
             val isOled = palette.isOledDeepBlack
-            if (dryInkRasterCache.cachedTileCount == 0 &&
-                vpW > 0 &&
-                vpH > 0 &&
-                (dryStrokeStore.spatialIndex.size > 0 || paperConfig.canvasMode == CanvasMode.FIXED_PAGE)
-            ) {
-                withContext(Dispatchers.Default) {
-                    dryInkRasterCache.prewarmVisibleTiles(
-                        viewportWidthPx = vpW,
-                        viewportHeightPx = vpH,
-                        transformMatrix = transformMatrix,
-                        spatialIndex = dryStrokeStore.spatialIndex,
-                        isOledMode = isOled,
-                        pageWidthPt = paperConfig.pageDimensions.widthPt,
-                        pageHeightPt = paperConfig.pageDimensions.heightPt,
-                        paperConfig = paperConfig,
-                        palette = palette,
-                        strokeAdapter = { entry -> oledStrokeCache.adaptStroke(entry, isOled) }
-                    )
+            val session = routerConfigHolder.latestMultiPageSession
+            val layout = routerConfigHolder.latestMultiPageLayout
+            if (session != null && layout != null) {
+                if (vpW > 0 && vpH > 0) {
+                    prewarmContinuousVisibleSlots(vpW, vpH, layout, session, palette)
+                }
+            } else {
+                dryInkRasterCache.onGestureSettled(transformMatrix.scale)
+                if (dryInkRasterCache.cachedTileCount == 0 &&
+                    vpW > 0 &&
+                    vpH > 0 &&
+                    (dryStrokeStore.spatialIndex.size > 0 || paperConfig.canvasMode == CanvasMode.FIXED_PAGE)
+                ) {
+                    withContext(Dispatchers.Default) {
+                        dryInkRasterCache.prewarmVisibleTiles(
+                            viewportWidthPx = vpW,
+                            viewportHeightPx = vpH,
+                            transformMatrix = transformMatrix,
+                            spatialIndex = dryStrokeStore.spatialIndex,
+                            isOledMode = isOled,
+                            pageWidthPt = paperConfig.pageDimensions.widthPt,
+                            pageHeightPt = paperConfig.pageDimensions.heightPt,
+                            paperConfig = paperConfig,
+                            palette = palette,
+                            strokeAdapter = { entry -> oledStrokeCache.adaptStroke(entry, isOled) }
+                        )
+                    }
                 }
             }
             dryDrawTick.longValue++
@@ -1096,81 +1483,132 @@ fun StylusDrawingSurface(
         }
     }
 
-    val finishedListener = remember(dryStrokeStore, dryInkRasterCache, journalCommitSink) {
+    fun commitFinishedStrokesToTarget(
+        strokes: List<Pair<InProgressStrokeId, Stroke>>,
+        holder: CanvasStateHolder?,
+        strokeStore: DryStrokeStore,
+        rasterCache: DryInkRasterCache,
+        commitSink: JournalCommitSink
+    ) {
+        val committed = ArrayList<IndexedDryStroke>(strokes.size)
+        val snapCandidates = ArrayList<Pair<IndexedDryStroke, WetStrokeMeta>>()
+
+        for ((strokeId, wetStroke) in strokes) {
+            val meta = wetStrokeMetaMap.remove(strokeId)
+                ?: WetStrokeMeta(
+                    isHighlighter = false,
+                    canonicalColorArgb = wetStroke.brush.colorIntArgb,
+                    holdToSnapEnabled = false
+                )
+
+            // Always persist canonical light-mode brush color even when wet stroke rendered inverted in OLED mode.
+            val canonicalStroke = if (wetStroke.brush.colorIntArgb != meta.canonicalColorArgb) {
+                wetStroke.copy(brush = wetStroke.brush.copyWithColorIntArgb(meta.canonicalColorArgb))
+            } else {
+                wetStroke
+            }
+
+            val zIndex = holder?.allocateZIndex(meta.isHighlighter)
+                ?: nextFallbackZ.getAndIncrement()
+            val docBounds = computeStrokeDocBounds(canonicalStroke)
+            val entry = IndexedDryStroke(
+                id = UUID.randomUUID().toString(),
+                stroke = canonicalStroke,
+                bounds = docBounds,
+                zIndex = zIndex,
+                isHighlighter = meta.isHighlighter
+            )
+            committed.add(entry)
+            rasterCache.invalidateDocRect(docBounds)
+            if (meta.holdToSnapEnabled && holder != null) {
+                snapCandidates.add(entry to meta)
+            }
+        }
+
+        strokeStore.addCommittedStrokes(committed)
+
+        val finalJournalEntries = ArrayList<IndexedDryStroke>(committed.size)
+        finalJournalEntries.addAll(committed)
+
+        // Hold-to-Snap runs after freehand commit so first Undo cleanly restores the freehand stroke.
+        for ((freehandEntry, meta) in snapCandidates) {
+            val samples = CanvasStateHolder.extractStylusPoints(freehandEntry.stroke)
+            val snapResult = ShapeRecognizer.recognize(
+                samples = samples,
+                requireHoldAtEnd = true,
+                lineOnly = meta.isHighlighter
+            ) ?: continue
+
+            val toolType = CanvasStateHolder.extractToolType(freehandEntry.stroke)
+            val snappedStroke = Stroke(
+                brush = freehandEntry.stroke.brush,
+                inputs = snapResult.snappedSamples.toStrokeInputBatch(toolType)
+            )
+            val snappedEntry = holder?.replaceStrokeWithSnappedShape(
+                freehandStrokeId = freehandEntry.id,
+                snappedStroke = snappedStroke,
+                shapeMeta = snapResult.shapeMeta
+            )
+            if (snappedEntry != null) {
+                rasterCache.invalidateDocRect(freehandEntry.bounds)
+                rasterCache.invalidateDocRect(snappedEntry.bounds)
+                finalJournalEntries.remove(freehandEntry)
+                finalJournalEntries.add(snappedEntry)
+            }
+        }
+
+        commitSink.onStrokesCommitted(finalJournalEntries)
+    }
+
+    val finishedListener = remember(dryStrokeStore, dryInkRasterCache, journalCommitSink, multiPageSessionManager) {
         object : InProgressStrokesFinishedListener {
             override fun onStrokesFinished(strokes: Map<InProgressStrokeId, Stroke>) {
                 if (strokes.isEmpty()) return
 
-                val holder = dryStrokeStore as? CanvasStateHolder
-                val committed = ArrayList<IndexedDryStroke>(strokes.size)
-                val snapCandidates = ArrayList<Pair<IndexedDryStroke, WetStrokeMeta>>()
-
-                for ((strokeId, wetStroke) in strokes) {
-                    val meta = wetStrokeMetaMap.remove(strokeId)
-                        ?: WetStrokeMeta(
-                            isHighlighter = false,
-                            canonicalColorArgb = wetStroke.brush.colorIntArgb,
-                            holdToSnapEnabled = false
+                val session = routerConfigHolder.latestMultiPageSession
+                if (session != null) {
+                    val entriesByPage = LinkedHashMap<String, MutableList<Pair<InProgressStrokeId, Stroke>>>()
+                    val orphanIds = ArrayList<InProgressStrokeId>()
+                    for ((strokeId, wetStroke) in strokes) {
+                        val targetId = wetStrokeMetaMap[strokeId]?.targetPageId
+                        if (targetId != null) {
+                            entriesByPage.getOrPut(targetId) { ArrayList() }.add(strokeId to wetStroke)
+                        } else {
+                            wetStrokeMetaMap.remove(strokeId)
+                            orphanIds.add(strokeId)
+                        }
+                    }
+                    val mutatedPages = LinkedHashSet<String>()
+                    for ((pageId, pageStrokes) in entriesByPage) {
+                        val runtime = session.getRuntime(pageId)
+                        if (runtime == null || runtime.isReadOnly) {
+                            pageStrokes.forEach { (id, _) -> wetStrokeMetaMap.remove(id) }
+                            continue
+                        }
+                        commitFinishedStrokesToTarget(
+                            strokes = pageStrokes,
+                            holder = runtime.canvasStateHolder,
+                            strokeStore = runtime.canvasStateHolder,
+                            rasterCache = runtime.dryInkRasterCache,
+                            commitSink = runtime.strokeJournal
                         )
-
-                    // Always persist canonical light-mode brush color even when wet stroke rendered inverted in OLED mode.
-                    val canonicalStroke = if (wetStroke.brush.colorIntArgb != meta.canonicalColorArgb) {
-                        wetStroke.copy(brush = wetStroke.brush.copyWithColorIntArgb(meta.canonicalColorArgb))
-                    } else {
-                        wetStroke
+                        mutatedPages.add(pageId)
                     }
-
-                    val zIndex = holder?.allocateZIndex(meta.isHighlighter)
-                        ?: nextFallbackZ.getAndIncrement()
-                    val docBounds = computeStrokeDocBounds(canonicalStroke)
-                    val entry = IndexedDryStroke(
-                        id = UUID.randomUUID().toString(),
-                        stroke = canonicalStroke,
-                        bounds = docBounds,
-                        zIndex = zIndex,
-                        isHighlighter = meta.isHighlighter
-                    )
-                    committed.add(entry)
-                    dryInkRasterCache.invalidateDocRect(docBounds)
-                    if (meta.holdToSnapEnabled && holder != null) {
-                        snapCandidates.add(entry to meta)
+                    pendingWetIdsToRemove.addAll(strokes.keys)
+                    dryDrawTick.longValue++
+                    for (pageId in mutatedPages) {
+                        routerConfigHolder.onPageMutatedCallback(pageId)
                     }
+                    return
                 }
 
-                dryStrokeStore.addCommittedStrokes(committed)
-
-                val finalJournalEntries = ArrayList<IndexedDryStroke>(committed.size)
-                finalJournalEntries.addAll(committed)
-
-                // Hold-to-Snap runs after freehand commit so first Undo cleanly restores the freehand stroke.
-                for ((freehandEntry, meta) in snapCandidates) {
-                    val samples = CanvasStateHolder.extractStylusPoints(freehandEntry.stroke)
-                    val snapResult = ShapeRecognizer.recognize(
-                        samples = samples,
-                        requireHoldAtEnd = true,
-                        lineOnly = meta.isHighlighter
-                    ) ?: continue
-
-                    val toolType = CanvasStateHolder.extractToolType(freehandEntry.stroke)
-                    val snappedStroke = Stroke(
-                        brush = freehandEntry.stroke.brush,
-                        inputs = snapResult.snappedSamples.toStrokeInputBatch(toolType)
-                    )
-                    val snappedEntry = holder?.replaceStrokeWithSnappedShape(
-                        freehandStrokeId = freehandEntry.id,
-                        snappedStroke = snappedStroke,
-                        shapeMeta = snapResult.shapeMeta
-                    )
-                    if (snappedEntry != null) {
-                        dryInkRasterCache.invalidateDocRect(freehandEntry.bounds)
-                        dryInkRasterCache.invalidateDocRect(snappedEntry.bounds)
-                        finalJournalEntries.remove(freehandEntry)
-                        finalJournalEntries.add(snappedEntry)
-                    }
-                }
-
-                journalCommitSink.onStrokesCommitted(finalJournalEntries)
-
+                commitFinishedStrokesToTarget(
+                    strokes = strokes.entries.map { it.key to it.value },
+                    holder = dryStrokeStore as? CanvasStateHolder,
+                    strokeStore = dryStrokeStore,
+                    rasterCache = dryInkRasterCache,
+                    commitSink = journalCommitSink
+                )
                 pendingWetIdsToRemove.addAll(strokes.keys)
                 dryDrawTick.longValue++
                 routerConfigHolder.onMutatedCallback()
@@ -1194,42 +1632,9 @@ fun StylusDrawingSurface(
                 viewportSize = size
                 onViewportSizeChanged(size)
                 if (!hasInitializedViewport && size.width > 0 && size.height > 0) {
-                    transformMatrix.fitPageToViewport(
-                        pageWidthPt = paperConfig.pageDimensions.widthPt,
-                        pageHeightPt = paperConfig.pageDimensions.heightPt,
-                        viewportWidthPx = size.width.toFloat(),
-                        viewportHeightPx = size.height.toFloat(),
-                        paddingPx = initialPagePaddingPx
-                    )
-                    dryInkRasterCache.syncInitialScale(transformMatrix.scale)
-                    val initPaperConfig = routerConfigHolder.latestPaperConfig
-                    val initPalette = routerConfigHolder.latestPalette
-                    val isOled = initPalette.isOledDeepBlack
-                    if (dryStrokeStore.spatialIndex.size > 0 || initPaperConfig.canvasMode == CanvasMode.FIXED_PAGE) {
-                        coroutineScope.launch {
-                            withContext(Dispatchers.Default) {
-                                dryInkRasterCache.prewarmVisibleTiles(
-                                    viewportWidthPx = size.width,
-                                    viewportHeightPx = size.height,
-                                    transformMatrix = transformMatrix,
-                                    spatialIndex = dryStrokeStore.spatialIndex,
-                                    isOledMode = isOled,
-                                    pageWidthPt = initPaperConfig.pageDimensions.widthPt,
-                                    pageHeightPt = initPaperConfig.pageDimensions.heightPt,
-                                    paperConfig = initPaperConfig,
-                                    palette = initPalette,
-                                    strokeAdapter = { entry -> oledStrokeCache.adaptStroke(entry, isOled) }
-                                )
-                            }
-                            dryDrawTick.longValue++
-                            dryCanvasViewRef?.invalidate()
-                        }
-                    } else {
-                        dryDrawTick.longValue++
-                        dryCanvasViewRef?.invalidate()
+                    coroutineScope.launch {
+                        initializeViewportCameraAndCaches(size)
                     }
-                    hasInitializedViewport = true
-                    routerConfigHolder.onViewportTransformChangedCallback()
                 }
             }
     ) {
@@ -1258,20 +1663,50 @@ fun StylusDrawingSurface(
                         val paperCfg = routerConfigHolder.latestPaperConfig
                         val pal = routerConfigHolder.latestPalette
                         val isOled = pal.isOledDeepBlack
+                        val session = routerConfigHolder.latestMultiPageSession
+                        val layout = routerConfigHolder.latestMultiPageLayout
                         activeRebakeJob?.cancel()
                         activeRebakeJob = coroutineScope.launch {
                             withContext(Dispatchers.Default) {
-                                dryInkRasterCache.rebakeSettledScale(
-                                    targetScale = currentScale,
-                                    viewportWidthPx = vpSize.width,
-                                    viewportHeightPx = vpSize.height,
-                                    transformMatrix = transformMatrix,
-                                    spatialIndex = dryStrokeStore.spatialIndex,
-                                    isOledMode = isOled,
-                                    paperConfig = paperCfg,
-                                    palette = pal,
-                                    strokeAdapter = { entry -> oledStrokeCache.adaptStroke(entry, isOled) }
-                                )
+                                if (session != null && layout != null && vpSize.width > 0 && vpSize.height > 0) {
+                                    val visWs = transformMatrix.screenRectToDocRect(
+                                        0f,
+                                        0f,
+                                        vpSize.width.toFloat(),
+                                        vpSize.height.toFloat()
+                                    )
+                                    val visibleSlots = layout.resolveVisibleSlots(visWs, paddingPt = 160f)
+                                    for (i in 0 until visibleSlots.size) {
+                                        val slot = visibleSlots[i]
+                                        val runtime = session.getReadyRuntime(slot.pageId) ?: continue
+                                        runtime.dryInkRasterCache.rebakeSettledScale(
+                                            targetScale = currentScale,
+                                            viewportWidthPx = vpSize.width,
+                                            viewportHeightPx = vpSize.height,
+                                            transformMatrix = transformMatrix,
+                                            spatialIndex = runtime.canvasStateHolder.spatialIndex,
+                                            isOledMode = isOled,
+                                            paperConfig = slot.config,
+                                            palette = pal,
+                                            pageOriginXPt = slot.leftPt,
+                                            pageOriginYPt = slot.topPt,
+                                            pageClipBoundsLocal = DocRect(0f, 0f, slot.widthPt, slot.heightPt),
+                                            strokeAdapter = { entry -> runtime.oledStrokeCache.adaptStroke(entry, isOled) }
+                                        )
+                                    }
+                                } else {
+                                    dryInkRasterCache.rebakeSettledScale(
+                                        targetScale = currentScale,
+                                        viewportWidthPx = vpSize.width,
+                                        viewportHeightPx = vpSize.height,
+                                        transformMatrix = transformMatrix,
+                                        spatialIndex = dryStrokeStore.spatialIndex,
+                                        isOledMode = isOled,
+                                        paperConfig = paperCfg,
+                                        palette = pal,
+                                        strokeAdapter = { entry -> oledStrokeCache.adaptStroke(entry, isOled) }
+                                    )
+                                }
                             }
                             dryCanvasView.invalidate()
                             routerConfigHolder.onViewportTransformChangedCallback()
@@ -1290,7 +1725,30 @@ fun StylusDrawingSurface(
                         wetStrokeSink = wetStrokeSink,
                         predictorBridge = predictorBridge,
                         onTransformChanged = {
-                            dryInkRasterCache.onGestureTransformChanged()
+                            val session = routerConfigHolder.latestMultiPageSession
+                            val layout = routerConfigHolder.latestMultiPageLayout
+                            if (session != null && layout != null) {
+                                session.activePageIdsSnapshot().forEach { id ->
+                                    session.getRuntime(id)?.dryInkRasterCache?.onGestureTransformChanged()
+                                }
+                                val vpSize = routerConfigHolder.latestViewportSize
+                                if (vpSize.width > 0 && vpSize.height > 0) {
+                                    val centerDoc = transformMatrix.screenToDoc(
+                                        vpSize.width * 0.5f,
+                                        vpSize.height * 0.5f
+                                    )
+                                    val activeSlot = layout.findNearestSlotForViewportCenter(centerDoc.yPt)
+                                    if (activeSlot != null) {
+                                        session.updateActiveFocus(activeSlot.pageIndex)
+                                        if (activeSlot.pageId != routerConfigHolder.lastReportedActivePageId) {
+                                            routerConfigHolder.lastReportedActivePageId = activeSlot.pageId
+                                            routerConfigHolder.onActiveSlotChangedCallback(activeSlot)
+                                        }
+                                    }
+                                }
+                            } else {
+                                dryInkRasterCache.onGestureTransformChanged()
+                            }
                             dryCanvasView.invalidate()
                             routerConfigHolder.onLiveViewportTransformChangedCallback()
                             if (lassoRuntime.selectedIds.isNotEmpty() || lassoRuntime.activePolygon.isNotEmpty()) {
@@ -1347,65 +1805,145 @@ fun StylusDrawingSurface(
                     val vpW = dryCanvasView.width
                     val vpH = dryCanvasView.height
                     if (vpW > 0 && vpH > 0) {
-                        val usedComposite = !lassoRuntime.isInteractingWithSelection &&
-                            dryInkRasterCache.drawCompositePageIfAvailable(
-                                canvas = canvas,
-                                transformMatrix = transformMatrix,
-                                paperConfig = paperCfg,
-                                isOledMode = isOled
-                            )
-                        val hasDeferredTiles = if (usedComposite) {
-                            false
-                        } else {
-                            PaperBackgroundRenderer.drawPaperLayer(
-                                canvas = canvas,
-                                viewportWidthPx = vpW,
-                                viewportHeightPx = vpH,
-                                transformMatrix = transformMatrix,
-                                paperConfig = paperCfg,
-                                palette = pal
-                            )
-                            dryInkRasterCache.drawVisibleTiles(
-                                canvas = canvas,
-                                viewportWidthPx = vpW,
-                                viewportHeightPx = vpH,
-                                transformMatrix = transformMatrix,
-                                spatialIndex = dryStrokeStore.spatialIndex,
-                                isOledMode = isOled,
-                                strokeAdapter = { entry -> oledStrokeCache.adaptStroke(entry, isOled) },
-                                excludedStrokeIds = if (lassoRuntime.isInteractingWithSelection) {
-                                    lassoRuntime.selectedIds
-                                } else {
-                                    emptySet()
-                                },
-                                excludedBounds = if (lassoRuntime.isInteractingWithSelection) {
-                                    lassoRuntime.selectionBounds
-                                } else {
-                                    null
+                        val session = routerConfigHolder.latestMultiPageSession
+                        val layout = routerConfigHolder.latestMultiPageLayout
+                        val hasDeferredTiles: Boolean = if (session != null && layout != null && !layout.isEmpty) {
+                            val visibleWs = transformMatrix.screenRectToDocRect(0f, 0f, vpW.toFloat(), vpH.toFloat())
+                            val visibleSlots = layout.resolveVisibleSlots(visibleWs)
+                            val lassoPageId = lassoRuntime.targetPageId
+                            var anyDeferred = false
+                            for (i in 0 until visibleSlots.size) {
+                                val slot = visibleSlots[i]
+                                val runtime = session.getReadyRuntime(slot.pageId)
+                                val lassoActiveOnSlot = lassoRuntime.isInteractingWithSelection &&
+                                    lassoRuntime.selectedIds.isNotEmpty() &&
+                                    lassoPageId == slot.pageId
+                                val usedComposite = runtime != null && !lassoActiveOnSlot &&
+                                    runtime.dryInkRasterCache.drawCompositePageIfAvailable(
+                                        canvas = canvas,
+                                        transformMatrix = transformMatrix,
+                                        paperConfig = slot.config,
+                                        isOledMode = isOled,
+                                        pageOriginXPt = slot.leftPt,
+                                        pageOriginYPt = slot.topPt
+                                    )
+                                if (!usedComposite) {
+                                    PaperBackgroundRenderer.drawContinuousSlotBackground(
+                                        canvas = canvas,
+                                        viewportWidthPx = vpW,
+                                        viewportHeightPx = vpH,
+                                        transformMatrix = transformMatrix,
+                                        slot = slot,
+                                        palette = pal
+                                    )
+                                    if (runtime != null) {
+                                        val deferred = runtime.dryInkRasterCache.drawVisibleTiles(
+                                            canvas = canvas,
+                                            viewportWidthPx = vpW,
+                                            viewportHeightPx = vpH,
+                                            transformMatrix = transformMatrix,
+                                            spatialIndex = runtime.canvasStateHolder.spatialIndex,
+                                            isOledMode = isOled,
+                                            strokeAdapter = { entry -> runtime.oledStrokeCache.adaptStroke(entry, isOled) },
+                                            excludedStrokeIds = if (lassoActiveOnSlot) lassoRuntime.selectedIds else emptySet(),
+                                            excludedBounds = if (lassoActiveOnSlot) lassoRuntime.selectionBounds else null,
+                                            pageOriginXPt = slot.leftPt,
+                                            pageOriginYPt = slot.topPt,
+                                            pageClipBoundsLocal = DocRect(0f, 0f, slot.widthPt, slot.heightPt)
+                                        )
+                                        if (deferred) anyDeferred = true
+                                    }
                                 }
-                            )
-                        }
-                        if (
-                            paperCfg.canvasMode == CanvasMode.FIXED_PAGE &&
-                            routerConfigHolder.latestTotalPages > 1
-                        ) {
-                            PaperBackgroundRenderer.drawAdjacentFixedPagesIfVisible(
-                                canvas = canvas,
-                                viewportWidthPx = vpW,
-                                viewportHeightPx = vpH,
-                                transformMatrix = transformMatrix,
-                                paperConfig = paperCfg,
-                                palette = pal,
-                                currentPageIndexOneBased = routerConfigHolder.latestCurrentPageOneBased,
-                                totalPages = routerConfigHolder.latestTotalPages
-                            )
+                                PaperBackgroundRenderer.drawContinuousPageGapLabel(
+                                    canvas = canvas,
+                                    viewportWidthPx = vpW,
+                                    viewportHeightPx = vpH,
+                                    transformMatrix = transformMatrix,
+                                    slot = slot,
+                                    totalPages = layout.pageCount,
+                                    gapPt = layout.gapPt,
+                                    palette = pal
+                                )
+                            }
+                            anyDeferred
+                        } else {
+                            val usedComposite = !lassoRuntime.isInteractingWithSelection &&
+                                dryInkRasterCache.drawCompositePageIfAvailable(
+                                    canvas = canvas,
+                                    transformMatrix = transformMatrix,
+                                    paperConfig = paperCfg,
+                                    isOledMode = isOled
+                                )
+                            val deferredSingle = if (usedComposite) {
+                                false
+                            } else {
+                                PaperBackgroundRenderer.drawPaperLayer(
+                                    canvas = canvas,
+                                    viewportWidthPx = vpW,
+                                    viewportHeightPx = vpH,
+                                    transformMatrix = transformMatrix,
+                                    paperConfig = paperCfg,
+                                    palette = pal
+                                )
+                                dryInkRasterCache.drawVisibleTiles(
+                                    canvas = canvas,
+                                    viewportWidthPx = vpW,
+                                    viewportHeightPx = vpH,
+                                    transformMatrix = transformMatrix,
+                                    spatialIndex = dryStrokeStore.spatialIndex,
+                                    isOledMode = isOled,
+                                    strokeAdapter = { entry -> oledStrokeCache.adaptStroke(entry, isOled) },
+                                    excludedStrokeIds = if (lassoRuntime.isInteractingWithSelection) {
+                                        lassoRuntime.selectedIds
+                                    } else {
+                                        emptySet()
+                                    },
+                                    excludedBounds = if (lassoRuntime.isInteractingWithSelection) {
+                                        lassoRuntime.selectionBounds
+                                    } else {
+                                        null
+                                    }
+                                )
+                            }
+                            if (
+                                paperCfg.canvasMode == CanvasMode.FIXED_PAGE &&
+                                routerConfigHolder.latestTotalPages > 1
+                            ) {
+                                PaperBackgroundRenderer.drawAdjacentFixedPagesIfVisible(
+                                    canvas = canvas,
+                                    viewportWidthPx = vpW,
+                                    viewportHeightPx = vpH,
+                                    transformMatrix = transformMatrix,
+                                    paperConfig = paperCfg,
+                                    palette = pal,
+                                    currentPageIndexOneBased = routerConfigHolder.latestCurrentPageOneBased,
+                                    totalPages = routerConfigHolder.latestTotalPages
+                                )
+                            }
+                            deferredSingle
                         }
 
                         // Live Lasso move/rotate preview rendered directly with transformed matrix without rebuilding Strokes.
                         if (lassoRuntime.isInteractingWithSelection && lassoRuntime.selectedIds.isNotEmpty()) {
-                            val holder = dryStrokeStore as? CanvasStateHolder
+                            val lassoRuntimeTarget = if (session != null) {
+                                lassoRuntime.targetPageId?.let { session.getReadyRuntime(it) }
+                            } else {
+                                null
+                            }
+                            val holder = if (session != null) {
+                                lassoRuntimeTarget?.canvasStateHolder
+                            } else {
+                                dryStrokeStore as? CanvasStateHolder
+                            }
+                            val previewOled = lassoRuntimeTarget?.oledStrokeCache ?: oledStrokeCache
                             if (holder != null) {
                                 transformMatrix.populateDocToScreenMatrix(livePreviewMatrix)
+                                if (lassoRuntime.targetOriginXPt != 0f || lassoRuntime.targetOriginYPt != 0f) {
+                                    livePreviewMatrix.preTranslate(
+                                        lassoRuntime.targetOriginXPt,
+                                        lassoRuntime.targetOriginYPt
+                                    )
+                                }
                                 if (lassoRuntime.isRotatingSelection) {
                                     val angleDeg = (lassoRuntime.liveRotationRadians * (180.0 / PI)).toFloat()
                                     livePreviewMatrix.preRotate(
@@ -1421,7 +1959,7 @@ fun StylusDrawingSurface(
                                 }
                                 for (id in lassoRuntime.selectedIds) {
                                     val entry = holder.getStroke(id) ?: continue
-                                    val renderStroke = oledStrokeCache.adaptStroke(entry, isOled)
+                                    val renderStroke = previewOled.adaptStroke(entry, isOled)
                                     canvas.withSave {
                                         // Hardware CanvasStrokeRenderer also requires transform pre-concatenated.
                                         concat(livePreviewMatrix)
@@ -1462,7 +2000,10 @@ fun StylusDrawingSurface(
 
         // Layer 6: Lasso trace & selection marquee
         lassoSelectionVersion.longValue
-        if (lassoRuntime.selectedIds.isNotEmpty() || lassoRuntime.activePolygon.isNotEmpty()) {
+        if (lassoRuntime.selectedIds.isNotEmpty() ||
+            lassoRuntime.selectedObjectIds.isNotEmpty() ||
+            lassoRuntime.activePolygon.isNotEmpty()
+        ) {
             LassoSelectionCanvasOverlay(
                 lassoRuntime = lassoRuntime,
                 lassoTick = lassoDrawTick,
@@ -1475,8 +2016,21 @@ fun StylusDrawingSurface(
         // Floating selection actions bar when Lasso has active strokes and/or objects selected
         lassoSelectionVersion.longValue
         val selectedCount = lassoRuntime.selectedIds.size + lassoRuntime.selectedObjectIds.size
-        val stateHolder = dryStrokeStore as? CanvasStateHolder
-        if (selectedCount > 0 && stateHolder != null && !lassoRuntime.isInteractingWithSelection) {
+        val lassoTargetRuntime = if (multiPageSessionManager != null) {
+            lassoRuntime.targetPageId?.let { multiPageSessionManager.getReadyRuntime(it) }
+        } else {
+            null
+        }
+        val stateHolder = if (multiPageSessionManager != null) {
+            lassoTargetRuntime?.canvasStateHolder
+        } else {
+            dryStrokeStore as? CanvasStateHolder
+        }
+        val targetCache = lassoTargetRuntime?.dryInkRasterCache ?: dryInkRasterCache
+        val targetOled = lassoTargetRuntime?.oledStrokeCache ?: oledStrokeCache
+        val targetSink: JournalCommitSink = lassoTargetRuntime?.strokeJournal ?: journalCommitSink
+        val targetIsReadOnly = lassoTargetRuntime?.isReadOnly == true
+        if (selectedCount > 0 && stateHolder != null && !targetIsReadOnly && !lassoRuntime.isInteractingWithSelection) {
             LassoSelectionActionBar(
                 selectedCount = selectedCount,
                 canAiAutoFormat = lassoRuntime.selectedIds.isNotEmpty(),
@@ -1484,20 +2038,34 @@ fun StylusDrawingSurface(
                     val activeSelectedIds = lassoRuntime.selectedIds.toSet()
                     if (activeSelectedIds.isEmpty()) return@LassoSelectionActionBar
                     val previousBounds = lassoRuntime.selectionBounds
-                    onAiAutoFormatLassoSelection(activeSelectedIds) { clearSelection ->
+                    val targetPageId = lassoRuntime.targetPageId
+                    val onFormattedHandler: (Boolean) -> Unit = { clearSelection ->
                         if (clearSelection) {
-                            for (id in activeSelectedIds) oledStrokeCache.invalidate(id)
-                            previousBounds?.let { dryInkRasterCache.invalidateDocRect(it) }
+                            for (id in activeSelectedIds) targetOled.invalidate(id)
+                            previousBounds?.let { targetCache.invalidateDocRect(it) }
                             lassoRuntime.selectedIds = emptySet()
                             lassoRuntime.selectedObjectIds = emptySet()
                             lassoRuntime.selectionBounds = null
+                            lassoRuntime.targetPageId = null
+                            lassoRuntime.targetOriginXPt = 0f
+                            lassoRuntime.targetOriginYPt = 0f
                             clearLassoObjectPreview()
                             dryCanvasViewRef?.invalidate()
                             dryDrawTick.longValue++
                             lassoSelectionVersion.longValue++
                             lassoDrawTick.longValue++
-                            onCanvasStateMutated()
+                            if (targetPageId != null) {
+                                routerConfigHolder.onPageMutatedCallback(targetPageId)
+                            } else {
+                                onCanvasStateMutated()
+                            }
                         }
+                    }
+                    val pageFormatter = onAiAutoFormatLassoSelectionInPage
+                    if (pageFormatter != null) {
+                        pageFormatter(targetPageId, activeSelectedIds, onFormattedHandler)
+                    } else {
+                        onAiAutoFormatLassoSelection(activeSelectedIds, onFormattedHandler)
                     }
                 },
                 onTransformSelection = { transform ->
@@ -1507,22 +2075,23 @@ fun StylusDrawingSurface(
                         transform = transform
                     )
                     if (res.affectedBounds != null) {
-                        for (id in lassoRuntime.selectedIds) oledStrokeCache.invalidate(id)
-                        dryInkRasterCache.invalidateDocRect(res.affectedBounds)
+                        for (id in lassoRuntime.selectedIds) targetOled.invalidate(id)
+                        targetCache.invalidateDocRect(res.affectedBounds)
                         lassoRuntime.selectionBounds = stateHolder.computeCombinedSelectionBounds(
                             lassoRuntime.selectedIds,
                             lassoRuntime.selectedObjectIds
                         )
                         if (lassoRuntime.selectedIds.isNotEmpty()) {
-                            journalCommitSink.onStrokesTransformed(lassoRuntime.selectedIds.toList(), transform)
+                            targetSink.onStrokesTransformed(lassoRuntime.selectedIds.toList(), transform)
                         }
                         if (res.updatedObjects.isNotEmpty()) {
-                            journalCommitSink.onObjectsUpdated(res.updatedObjects)
+                            targetSink.onObjectsUpdated(res.updatedObjects)
                         }
+                        dryCanvasViewRef?.invalidate()
                         dryDrawTick.longValue++
                         lassoSelectionVersion.longValue++
                         lassoDrawTick.longValue++
-                        onCanvasStateMutated()
+                        notifyLassoPageMutated()
                     }
                 },
                 onRecolorSelection = {
@@ -1533,16 +2102,17 @@ fun StylusDrawingSurface(
                         newColorArgb = targetColor
                     )
                     if (res.affectedBounds != null) {
-                        for (id in lassoRuntime.selectedIds) oledStrokeCache.invalidate(id)
-                        dryInkRasterCache.invalidateDocRect(res.affectedBounds)
+                        for (id in lassoRuntime.selectedIds) targetOled.invalidate(id)
+                        targetCache.invalidateDocRect(res.affectedBounds)
                         if (lassoRuntime.selectedIds.isNotEmpty()) {
-                            journalCommitSink.onStrokesRecolored(lassoRuntime.selectedIds.toList(), targetColor)
+                            targetSink.onStrokesRecolored(lassoRuntime.selectedIds.toList(), targetColor)
                         }
                         if (res.updatedObjects.isNotEmpty()) {
-                            journalCommitSink.onObjectsUpdated(res.updatedObjects)
+                            targetSink.onObjectsUpdated(res.updatedObjects)
                         }
+                        dryCanvasViewRef?.invalidate()
                         dryDrawTick.longValue++
-                        onCanvasStateMutated()
+                        notifyLassoPageMutated()
                     }
                 },
                 onDuplicateSelection = {
@@ -1551,12 +2121,12 @@ fun StylusDrawingSurface(
                         objectIds = lassoRuntime.selectedObjectIds
                     )
                     if (res.duplicatedStrokes.isNotEmpty() || res.duplicatedObjects.isNotEmpty()) {
-                        res.affectedBounds?.let { dryInkRasterCache.invalidateDocRect(it) }
+                        res.affectedBounds?.let { targetCache.invalidateDocRect(it) }
                         if (res.duplicatedStrokes.isNotEmpty()) {
-                            journalCommitSink.onStrokesCommitted(res.duplicatedStrokes)
+                            targetSink.onStrokesCommitted(res.duplicatedStrokes)
                         }
                         if (res.duplicatedObjects.isNotEmpty()) {
-                            journalCommitSink.onObjectsAdded(res.duplicatedObjects)
+                            targetSink.onObjectsAdded(res.duplicatedObjects)
                         }
                         lassoRuntime.selectedIds = res.duplicatedStrokes.map { it.id }.toSet()
                         lassoRuntime.selectedObjectIds = res.duplicatedObjects.map { it.id }.toSet()
@@ -1564,10 +2134,11 @@ fun StylusDrawingSurface(
                             lassoRuntime.selectedIds,
                             lassoRuntime.selectedObjectIds
                         )
+                        dryCanvasViewRef?.invalidate()
                         dryDrawTick.longValue++
                         lassoSelectionVersion.longValue++
                         lassoDrawTick.longValue++
-                        onCanvasStateMutated()
+                        notifyLassoPageMutated()
                     }
                 },
                 onDeleteSelection = {
@@ -1575,24 +2146,31 @@ fun StylusDrawingSurface(
                     val toDeleteObjects = lassoRuntime.selectedObjectIds.toList()
                     val dirty = stateHolder.deleteSelection(lassoRuntime.selectedIds, lassoRuntime.selectedObjectIds)
                     if (dirty != null) {
-                        for (id in toDeleteStrokes) oledStrokeCache.invalidate(id)
-                        dryInkRasterCache.invalidateDocRect(dirty)
-                        if (toDeleteStrokes.isNotEmpty()) journalCommitSink.onStrokesDeleted(toDeleteStrokes)
-                        if (toDeleteObjects.isNotEmpty()) journalCommitSink.onObjectsDeleted(toDeleteObjects)
+                        for (id in toDeleteStrokes) targetOled.invalidate(id)
+                        targetCache.invalidateDocRect(dirty)
+                        if (toDeleteStrokes.isNotEmpty()) targetSink.onStrokesDeleted(toDeleteStrokes)
+                        if (toDeleteObjects.isNotEmpty()) targetSink.onObjectsDeleted(toDeleteObjects)
                     }
+                    notifyLassoPageMutated()
                     lassoRuntime.selectedIds = emptySet()
                     lassoRuntime.selectedObjectIds = emptySet()
                     lassoRuntime.selectionBounds = null
+                    lassoRuntime.targetPageId = null
+                    lassoRuntime.targetOriginXPt = 0f
+                    lassoRuntime.targetOriginYPt = 0f
                     clearLassoObjectPreview()
+                    dryCanvasViewRef?.invalidate()
                     dryDrawTick.longValue++
                     lassoSelectionVersion.longValue++
                     lassoDrawTick.longValue++
-                    onCanvasStateMutated()
                 },
                 onClearSelection = {
                     lassoRuntime.selectedIds = emptySet()
                     lassoRuntime.selectedObjectIds = emptySet()
                     lassoRuntime.selectionBounds = null
+                    lassoRuntime.targetPageId = null
+                    lassoRuntime.targetOriginXPt = 0f
+                    lassoRuntime.targetOriginYPt = 0f
                     clearLassoObjectPreview()
                     lassoSelectionVersion.longValue++
                     lassoDrawTick.longValue++
@@ -1619,13 +2197,15 @@ private fun LassoSelectionCanvasOverlay(
     Canvas(modifier = Modifier.fillMaxSize()) {
         lassoTick.value
 
+        val originXPt = lassoRuntime.targetOriginXPt
+        val originYPt = lassoRuntime.targetOriginYPt
         val poly = lassoRuntime.activePolygon
         if (poly.size >= 2) {
             tracePath.reset()
-            val first = transformMatrix.docToScreen(poly[0].xPt, poly[0].yPt)
+            val first = transformMatrix.docToScreen(poly[0].xPt + originXPt, poly[0].yPt + originYPt)
             tracePath.moveTo(first.xPx, first.yPx)
             for (i in 1 until poly.size) {
-                val p = transformMatrix.docToScreen(poly[i].xPt, poly[i].yPt)
+                val p = transformMatrix.docToScreen(poly[i].xPt + originXPt, poly[i].yPt + originYPt)
                 tracePath.lineTo(p.xPx, p.yPx)
             }
             drawPath(
@@ -1637,8 +2217,8 @@ private fun LassoSelectionCanvasOverlay(
 
         val bounds = lassoRuntime.selectionBounds
         if (bounds != null && (lassoRuntime.selectedIds.isNotEmpty() || lassoRuntime.selectedObjectIds.isNotEmpty())) {
-            val dx = if (lassoRuntime.isDraggingSelection) lassoRuntime.liveDeltaXPt else 0f
-            val dy = if (lassoRuntime.isDraggingSelection) lassoRuntime.liveDeltaYPt else 0f
+            val dx = (if (lassoRuntime.isDraggingSelection) lassoRuntime.liveDeltaXPt else 0f) + originXPt
+            val dy = (if (lassoRuntime.isDraggingSelection) lassoRuntime.liveDeltaYPt else 0f) + originYPt
             val shifted = DocRect(
                 leftPt = bounds.leftPt + dx,
                 topPt = bounds.topPt + dy,
@@ -1831,4 +2411,34 @@ private fun StylusPointSample.toSingleStrokeInput(toolType: InputToolType): Stro
             orientationRadians = safeOrient
         )
     }
+}
+
+private fun erasePointsOnHolder(
+    holder: CanvasStateHolder,
+    pt: DocPoint,
+    radiusPt: Float,
+    isVectorEraser: Boolean
+): DocRect? = if (isVectorEraser) {
+    holder.eraseWholeStrokesAt(
+        centerXPt = pt.xPt,
+        centerYPt = pt.yPt,
+        radiusPt = radiusPt
+    )
+} else {
+    holder.erasePartialStrokesAt(
+        centerXPt = pt.xPt,
+        centerYPt = pt.yPt,
+        radiusPt = radiusPt
+    ).invalidatedBounds
+}
+
+private fun mergeDocRects(a: DocRect?, b: DocRect): DocRect = if (a == null) {
+    b
+} else {
+    DocRect(
+        leftPt = min(a.leftPt, b.leftPt),
+        topPt = min(a.topPt, b.topPt),
+        rightPt = max(a.rightPt, b.rightPt),
+        bottomPt = max(a.bottomPt, b.bottomPt)
+    )
 }

@@ -380,6 +380,9 @@ class CanvasStateHolder(
     private val redoStack = ArrayDeque<CanvasAction>()
     private var totalUndoPointCost: Int = 0
 
+    @Volatile
+    var onUndoActionPushed: ((CanvasAction) -> Unit)? = null
+
     // Separate z-order bands ensure Layer 3 (Highlighters) always renders underneath Layer 4 (Ink).
     private val nextHighlighterZ = AtomicLong(1L)
     private val nextInkZ = AtomicLong(INK_Z_ORDER_BASE)
@@ -1315,11 +1318,29 @@ class CanvasStateHolder(
         }
     }
 
+    /**
+     * Applies [action] forward without modifying this holder's local Undo/Redo stacks.
+     * Used by notebook-wide [NotebookUndoCoordinator] to keep chronological cross-page ordering.
+     */
+    fun applyExternalActionForward(action: CanvasAction): DocRect? = synchronized(stateLock) {
+        applyForwardLocked(action)
+        action.affectedBounds
+    }
+
+    /**
+     * Reverts [action] in memory without modifying this holder's local Undo/Redo stacks.
+     */
+    fun applyExternalActionInverse(action: CanvasAction): DocRect? = synchronized(stateLock) {
+        applyInverseLocked(action)
+        action.affectedBounds
+    }
+
     private fun pushUndoActionLocked(action: CanvasAction) {
         redoStack.clear()
         undoStack.addLast(action)
         totalUndoPointCost += action.estimatedPointCost
         enforceUndoBudgetLocked()
+        onUndoActionPushed?.invoke(action)
     }
 
     private fun enforceUndoBudgetLocked() {

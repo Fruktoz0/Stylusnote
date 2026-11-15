@@ -155,3 +155,19 @@ flowchart LR
     SJ --> RE["Újranyitás → eredeti színes tintavonások megmaradnak"]
 ```
 
+---
+
+## 10. Folytonos Többoldalas Dokumentumtér, Sliding-Window Oldalpool & Valódi FrameMetrics Telemetria
+
+```mermaid
+flowchart LR
+    U1["9+ oldalas füzet megnyitása"] --> K1["1 db perzisztens AndroidView per notebookId (nincs View újragyártás lapváltáskor)"]
+    K1 --> L1["ContinuousPageLayout: vegyes oldalméretek közös PDF pt térben + láthatósági vágás"]
+    U1 --> M1["MultiPageSessionManager + SlidingWindowPagePool"]
+    M1 --> W1["Aktív ± 1 oldal: előmelegítés háttérben, közös 192 MB tile keret"]
+    M1 --> E1["Aktív ± 2 felett: aszinkron Dispatchers.IO journal lezárás és RAM felszabadítás"]
+    S1["1 ujjas görgetés vagy stylus rajz bármelyik lapra"] --> H1["findSlotAtWorkspacePoint → lokális oldal-koordináták & StrokeJournal"]
+    H1 --> UN["NotebookUndoCoordinator → lapok közötti pontos Undo/Redo (szükség esetén lemezes visszatöltés)"]
+    K1 --> FM["MainActivity FrameMetrics + Choreographer → szétválasztott VSYNC p95 vs Render p95 HUD"]
+```
+

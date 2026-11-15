@@ -266,6 +266,11 @@ class DryInkRasterCache(
             emptyTileKeys.clear()
             stableBakedScaleMilli = null
         }
+        synchronized(bgLock) {
+            stagingCompositeBitmap = null
+            stagingCompositeW = 0
+            stagingCompositeH = 0
+        }
     }
 
     /**
@@ -276,7 +281,9 @@ class DryInkRasterCache(
         canvas: Canvas,
         transformMatrix: CanvasTransformMatrix,
         paperConfig: PagePaperConfig,
-        isOledMode: Boolean
+        isOledMode: Boolean,
+        pageOriginXPt: Float = 0f,
+        pageOriginYPt: Float = 0f
     ): Boolean {
         if (paperConfig.canvasMode != CanvasMode.FIXED_PAGE) return false
         val snap = compositeSnapshot ?: return false
@@ -295,6 +302,9 @@ class DryInkRasterCache(
             return false
         }
         transformMatrix.populateDocToScreenMatrix(compositeDrawMatrix)
+        if (pageOriginXPt != 0f || pageOriginYPt != 0f) {
+            compositeDrawMatrix.preTranslate(pageOriginXPt, pageOriginYPt)
+        }
         val invScale = 1f / snap.bakedScale
         compositeDrawMatrix.preScale(invScale, invScale)
         canvas.drawBitmap(snap.bitmap, compositeDrawMatrix, tileBlitPaint)
@@ -315,6 +325,8 @@ class DryInkRasterCache(
         pageHeightPt: Float = 842f,
         paperConfig: PagePaperConfig? = null,
         palette: StylusSurfacePalette? = null,
+        pageOriginXPt: Float = 0f,
+        pageOriginYPt: Float = 0f,
         strokeAdapter: (IndexedDryStroke) -> Stroke = { it.stroke }
     ) {
         if (viewportWidthPx <= 0 || viewportHeightPx <= 0) return
@@ -326,12 +338,13 @@ class DryInkRasterCache(
         val effectiveScale = quantizedMilli / 1000f
 
         if (spatialIndex.size > 0) {
-            val visibleDocRect = transformMatrix.screenRectToDocRect(
+            val rawVisible = transformMatrix.screenRectToDocRect(
                 leftPx = 0f,
                 topPx = 0f,
                 rightPx = viewportWidthPx.toFloat(),
                 bottomPx = viewportHeightPx.toFloat()
             )
+            val visibleDocRect = shiftWorkspaceRectToLocal(rawVisible, pageOriginXPt, pageOriginYPt)
             val visibleRange = computeOverlappingTileRange(visibleDocRect, effectiveScale)
             val pageRange = computeOverlappingTileRange(
                 docRect = DocRect(0f, 0f, pageWidthPt.coerceAtLeast(1f), pageHeightPt.coerceAtLeast(1f)),
@@ -388,6 +401,9 @@ class DryInkRasterCache(
         isOledMode: Boolean,
         paperConfig: PagePaperConfig? = null,
         palette: StylusSurfacePalette? = null,
+        pageOriginXPt: Float = 0f,
+        pageOriginYPt: Float = 0f,
+        pageClipBoundsLocal: DocRect? = null,
         strokeAdapter: (IndexedDryStroke) -> Stroke = { it.stroke }
     ) {
         if (viewportWidthPx <= 0 || viewportHeightPx <= 0) {
@@ -401,26 +417,32 @@ class DryInkRasterCache(
         val effectiveScale = targetMilli / 1000f
 
         if (spatialIndex.size > 0) {
-            val visibleDocRect = transformMatrix.screenRectToDocRect(
+            val rawVisible = transformMatrix.screenRectToDocRect(
                 leftPx = 0f,
                 topPx = 0f,
                 rightPx = viewportWidthPx.toFloat(),
                 bottomPx = viewportHeightPx.toFloat()
             )
-            val range = computeOverlappingTileRange(visibleDocRect, effectiveScale)
+            var visibleDocRect = shiftWorkspaceRectToLocal(rawVisible, pageOriginXPt, pageOriginYPt)
+            if (pageClipBoundsLocal != null) {
+                visibleDocRect = intersectRects(visibleDocRect, pageClipBoundsLocal)
+            }
+            if (!visibleDocRect.isEmpty) {
+                val range = computeOverlappingTileRange(visibleDocRect, effectiveScale)
 
-            rasterizeTileRangeInBackground(
-                expectedGen = gen,
-                quantizedMilli = targetMilli,
-                effectiveScale = effectiveScale,
-                minTx = range.minTileX - 1,
-                maxTx = range.maxTileX + 1,
-                minTy = range.minTileY - 1,
-                maxTy = range.maxTileY + 1,
-                spatialIndex = spatialIndex,
-                isOledMode = isOledMode,
-                strokeAdapter = strokeAdapter
-            )
+                rasterizeTileRangeInBackground(
+                    expectedGen = gen,
+                    quantizedMilli = targetMilli,
+                    effectiveScale = effectiveScale,
+                    minTx = range.minTileX - 1,
+                    maxTx = range.maxTileX + 1,
+                    minTy = range.minTileY - 1,
+                    maxTy = range.maxTileY + 1,
+                    spatialIndex = spatialIndex,
+                    isOledMode = isOledMode,
+                    strokeAdapter = strokeAdapter
+                )
+            }
         }
 
         if (paperConfig != null && palette != null) {
@@ -618,12 +640,17 @@ class DryInkRasterCache(
         isOledMode: Boolean,
         strokeAdapter: (IndexedDryStroke) -> Stroke = { it.stroke },
         excludedStrokeIds: Set<String> = emptySet(),
-        excludedBounds: DocRect? = null
+        excludedBounds: DocRect? = null,
+        pageOriginXPt: Float = 0f,
+        pageOriginYPt: Float = 0f,
+        pageClipBoundsLocal: DocRect? = null
     ): Boolean {
         if (viewportWidthPx <= 0 || viewportHeightPx <= 0) return false
         if (spatialIndex.size == 0) return false
 
         val snapshot = transformMatrix.snapshot()
+        val effectivePanXPx = snapshot.panXPx + pageOriginXPt * snapshot.scale
+        val effectivePanYPx = snapshot.panYPx + pageOriginYPt * snapshot.scale
         val activeBakedScale = if (isGestureInProgress) {
             bakedScale
         } else {
@@ -634,12 +661,17 @@ class DryInkRasterCache(
         val effectiveBakedScale = quantizedMilli / 1000f
         val fallbackMilli = stableBakedScaleMilli ?: quantizedMilli
 
-        val visibleDocRect = transformMatrix.screenRectToDocRect(
+        val rawVisible = transformMatrix.screenRectToDocRect(
             leftPx = 0f,
             topPx = 0f,
             rightPx = viewportWidthPx.toFloat(),
             bottomPx = viewportHeightPx.toFloat()
         )
+        var visibleDocRect = shiftWorkspaceRectToLocal(rawVisible, pageOriginXPt, pageOriginYPt)
+        if (pageClipBoundsLocal != null) {
+            visibleDocRect = intersectRects(visibleDocRect, pageClipBoundsLocal)
+            if (visibleDocRect.isEmpty) return false
+        }
         val range = computeOverlappingTileRange(visibleDocRect, effectiveBakedScale)
         val tileDocSize = TILE_SIZE_PX / effectiveBakedScale
         val relScale = snapshot.scale / effectiveBakedScale
@@ -653,144 +685,166 @@ class DryInkRasterCache(
         var rasterizedThisFrame = 0
         var hasDeferredTiles = false
 
-        for (ty in range.minTileY..range.maxTileY) {
-            val tileTopPt = ty * tileDocSize
-            val screenY = tileTopPt * snapshot.scale + snapshot.panYPx
-            for (tx in range.minTileX..range.maxTileX) {
-                val tileLeftPt = tx * tileDocSize
-                val tileOverlapsExcluded = excludedStrokeIds.isNotEmpty() &&
-                    (paddedExcluded == null || DocRect(
-                        leftPt = tileLeftPt,
-                        topPt = tileTopPt,
-                        rightPt = tileLeftPt + tileDocSize,
-                        bottomPt = tileTopPt + tileDocSize
-                    ).intersects(paddedExcluded))
-                if (tileOverlapsExcluded) {
-                    val tileDocRect = DocRect(
-                        leftPt = tileLeftPt,
-                        topPt = tileTopPt,
-                        rightPt = tileLeftPt + tileDocSize,
-                        bottomPt = tileTopPt + tileDocSize
-                    )
-                    val strokesInTile = spatialIndex.queryRect(tileDocRect)
-                    if (strokesInTile.isNotEmpty()) {
-                        reusableEntriesScratch.clear()
-                        for (i in 0 until strokesInTile.size) {
-                            val entry = strokesInTile[i].payload
-                            if (!excludedStrokeIds.contains(entry.id)) {
-                                reusableEntriesScratch.add(entry)
-                            }
-                        }
-                        if (reusableEntriesScratch.isNotEmpty()) {
-                            if (reusableEntriesScratch.size > 1) {
-                                reusableEntriesScratch.sortWith { a, b -> a.zIndex.compareTo(b.zIndex) }
-                            }
-                            val screenX = tileLeftPt * snapshot.scale + snapshot.panXPx
-                            val tileScreenSize = TILE_SIZE_PX * relScale
-                            // Skip cached tile bitmap only for tiles intersecting moved lasso selection so original strokes never ghost underneath.
-                            transformMatrix.populateDocToScreenMatrix(tileStrokeMatrix)
-                            canvas.withSave {
-                                clipRect(
-                                    screenX,
-                                    screenY,
-                                    screenX + tileScreenSize + 0.5f,
-                                    screenY + tileScreenSize + 0.5f
-                                )
-                                for (i in 0 until reusableEntriesScratch.size) {
-                                    val renderStroke = strokeAdapter(reusableEntriesScratch[i])
-                                    withSave {
-                                        concat(tileStrokeMatrix)
-                                        strokeRenderer.draw(
-                                            canvas = this,
-                                            stroke = renderStroke,
-                                            strokeToScreenTransform = tileStrokeMatrix
-                                        )
-                                    }
+        val clipSaveCount = if (pageClipBoundsLocal != null) {
+            canvas.save().also {
+                canvas.clipRect(
+                    pageClipBoundsLocal.leftPt * snapshot.scale + effectivePanXPx,
+                    pageClipBoundsLocal.topPt * snapshot.scale + effectivePanYPx,
+                    pageClipBoundsLocal.rightPt * snapshot.scale + effectivePanXPx,
+                    pageClipBoundsLocal.bottomPt * snapshot.scale + effectivePanYPx
+                )
+            }
+        } else {
+            -1
+        }
+
+        try {
+            for (ty in range.minTileY..range.maxTileY) {
+                val tileTopPt = ty * tileDocSize
+                val screenY = tileTopPt * snapshot.scale + effectivePanYPx
+                for (tx in range.minTileX..range.maxTileX) {
+                    val tileLeftPt = tx * tileDocSize
+                    val tileOverlapsExcluded = excludedStrokeIds.isNotEmpty() &&
+                        (paddedExcluded == null || DocRect(
+                            leftPt = tileLeftPt,
+                            topPt = tileTopPt,
+                            rightPt = tileLeftPt + tileDocSize,
+                            bottomPt = tileTopPt + tileDocSize
+                        ).intersects(paddedExcluded))
+                    if (tileOverlapsExcluded) {
+                        val tileDocRect = DocRect(
+                            leftPt = tileLeftPt,
+                            topPt = tileTopPt,
+                            rightPt = tileLeftPt + tileDocSize,
+                            bottomPt = tileTopPt + tileDocSize
+                        )
+                        val strokesInTile = spatialIndex.queryRect(tileDocRect)
+                        if (strokesInTile.isNotEmpty()) {
+                            reusableEntriesScratch.clear()
+                            for (i in 0 until strokesInTile.size) {
+                                val entry = strokesInTile[i].payload
+                                if (!excludedStrokeIds.contains(entry.id)) {
+                                    reusableEntriesScratch.add(entry)
                                 }
                             }
-                            reusableEntriesScratch.clear()
+                            if (reusableEntriesScratch.isNotEmpty()) {
+                                if (reusableEntriesScratch.size > 1) {
+                                    reusableEntriesScratch.sortWith { a, b -> a.zIndex.compareTo(b.zIndex) }
+                                }
+                                val screenX = tileLeftPt * snapshot.scale + effectivePanXPx
+                                val tileScreenSize = TILE_SIZE_PX * relScale
+                                // Skip cached tile bitmap only for tiles intersecting moved lasso selection so original strokes never ghost underneath.
+                                transformMatrix.populateDocToScreenMatrix(tileStrokeMatrix)
+                                if (pageOriginXPt != 0f || pageOriginYPt != 0f) {
+                                    tileStrokeMatrix.preTranslate(pageOriginXPt, pageOriginYPt)
+                                }
+                                canvas.withSave {
+                                    clipRect(
+                                        screenX,
+                                        screenY,
+                                        screenX + tileScreenSize + 0.5f,
+                                        screenY + tileScreenSize + 0.5f
+                                    )
+                                    for (i in 0 until reusableEntriesScratch.size) {
+                                        val renderStroke = strokeAdapter(reusableEntriesScratch[i])
+                                        withSave {
+                                            concat(tileStrokeMatrix)
+                                            strokeRenderer.draw(
+                                                canvas = this,
+                                                stroke = renderStroke,
+                                                strokeToScreenTransform = tileStrokeMatrix
+                                            )
+                                        }
+                                    }
+                                }
+                                reusableEntriesScratch.clear()
+                            }
                         }
+                        continue
                     }
-                    continue
-                }
 
-                val key = TileKey(
-                    quantizedScaleMilli = quantizedMilli,
-                    tileX = tx,
-                    tileY = ty,
-                    isOledMode = isOledMode
-                )
-                // O(1) fast path: skip known empty tiles and draw cached bitmaps without R-tree queries.
-                var isKnownEmpty: Boolean
-                var tileBitmap: Bitmap?
-                synchronized(cacheLock) {
-                    isKnownEmpty = emptyTileKeys.contains(key)
-                    tileBitmap = if (isKnownEmpty) null else tileLru.get(key)
-                }
-                if (isKnownEmpty) continue
+                    val key = TileKey(
+                        quantizedScaleMilli = quantizedMilli,
+                        tileX = tx,
+                        tileY = ty,
+                        isOledMode = isOledMode
+                    )
+                    // O(1) fast path: skip known empty tiles and draw cached bitmaps without R-tree queries.
+                    var isKnownEmpty: Boolean
+                    var tileBitmap: Bitmap?
+                    synchronized(cacheLock) {
+                        isKnownEmpty = emptyTileKeys.contains(key)
+                        tileBitmap = if (isKnownEmpty) null else tileLru.get(key)
+                    }
+                    if (isKnownEmpty) continue
 
-                if (tileBitmap == null) {
-                    val drewFallback = fallbackMilli != quantizedMilli &&
-                        drawFallbackTilesForRect(
-                            canvas = canvas,
-                            targetTileLeftPt = tileLeftPt,
-                            targetTileTopPt = tileTopPt,
-                            targetTileSizePt = tileDocSize,
-                            fallbackMilli = fallbackMilli,
-                            isOledMode = isOledMode,
-                            snapshotScale = snapshot.scale,
-                            snapshotPanXPx = snapshot.panXPx,
-                            snapshotPanYPx = snapshot.panYPx
-                        )
-                    // Never block active gesture frames with UI-thread rasterization; wait for background rebake.
-                    if (isGestureInProgress || drewFallback) {
-                        if (!isGestureInProgress) {
+                    if (tileBitmap == null) {
+                        val drewFallback = fallbackMilli != quantizedMilli &&
+                            drawFallbackTilesForRect(
+                                canvas = canvas,
+                                targetTileLeftPt = tileLeftPt,
+                                targetTileTopPt = tileTopPt,
+                                targetTileSizePt = tileDocSize,
+                                fallbackMilli = fallbackMilli,
+                                isOledMode = isOledMode,
+                                snapshotScale = snapshot.scale,
+                                snapshotPanXPx = effectivePanXPx,
+                                snapshotPanYPx = effectivePanYPx
+                            )
+                        // Never block active gesture frames with UI-thread rasterization; wait for background rebake.
+                        if (isGestureInProgress || drewFallback) {
+                            if (!isGestureInProgress) {
+                                hasDeferredTiles = true
+                            }
+                            continue
+                        }
+
+                        val withinFrameBudget = rasterizedThisFrame == 0 ||
+                            (System.nanoTime() - frameStartNanos) < FRAME_RASTER_BUDGET_NANOS
+                        if (!withinFrameBudget) {
                             hasDeferredTiles = true
+                            continue
                         }
-                        continue
-                    }
 
-                    val withinFrameBudget = rasterizedThisFrame == 0 ||
-                        (System.nanoTime() - frameStartNanos) < FRAME_RASTER_BUDGET_NANOS
-                    if (!withinFrameBudget) {
-                        hasDeferredTiles = true
-                        continue
-                    }
-
-                    val tileDocRect = DocRect(
-                        leftPt = tileLeftPt,
-                        topPt = tileTopPt,
-                        rightPt = tileLeftPt + tileDocSize,
-                        bottomPt = tileTopPt + tileDocSize
-                    )
-                    val strokesInTile = spatialIndex.queryRect(tileDocRect)
-                    if (strokesInTile.isEmpty()) {
-                        synchronized(cacheLock) {
-                            recordEmptyTileKeyLocked(key)
+                        val tileDocRect = DocRect(
+                            leftPt = tileLeftPt,
+                            topPt = tileTopPt,
+                            rightPt = tileLeftPt + tileDocSize,
+                            bottomPt = tileTopPt + tileDocSize
+                        )
+                        val strokesInTile = spatialIndex.queryRect(tileDocRect)
+                        if (strokesInTile.isEmpty()) {
+                            synchronized(cacheLock) {
+                                recordEmptyTileKeyLocked(key)
+                            }
+                            continue
                         }
-                        continue
+                        tileBitmap = rasterizeTileInternal(
+                            key = key,
+                            tileDocRect = tileDocRect,
+                            effectiveBakedScale = effectiveBakedScale,
+                            spatialEntries = strokesInTile,
+                            strokeAdapter = strokeAdapter,
+                            useBackgroundRenderer = false
+                        )
+                        rasterizedThisFrame++
                     }
-                    tileBitmap = rasterizeTileInternal(
-                        key = key,
-                        tileDocRect = tileDocRect,
-                        effectiveBakedScale = effectiveBakedScale,
-                        spatialEntries = strokesInTile,
-                        strokeAdapter = strokeAdapter,
-                        useBackgroundRenderer = false
-                    )
-                    rasterizedThisFrame++
-                }
 
-                val screenX = (tx * tileDocSize) * snapshot.scale + snapshot.panXPx
-                canvas.withSave {
-                    translate(screenX, screenY)
-                    if (relScale != 1f) {
-                        scale(relScale, relScale)
+                    val screenX = (tx * tileDocSize) * snapshot.scale + effectivePanXPx
+                    canvas.withSave {
+                        translate(screenX, screenY)
+                        if (relScale != 1f) {
+                            scale(relScale, relScale)
+                        }
+                        // Paint with bilinear filtering only while temporarily scaled during pan/zoom.
+                        tileBlitPaint.isFilterBitmap = relScale != 1f
+                        drawBitmap(tileBitmap, 0f, 0f, tileBlitPaint)
                     }
-                    // Paint with bilinear filtering only while temporarily scaled during pan/zoom.
-                    tileBlitPaint.isFilterBitmap = relScale != 1f
-                    drawBitmap(tileBitmap, 0f, 0f, tileBlitPaint)
                 }
+            }
+        } finally {
+            if (clipSaveCount >= 0) {
+                canvas.restoreToCount(clipSaveCount)
             }
         }
 
@@ -798,6 +852,33 @@ class DryInkRasterCache(
             stableBakedScaleMilli = quantizedMilli
         }
         return hasDeferredTiles
+    }
+
+    private fun shiftWorkspaceRectToLocal(
+        workspaceRect: DocRect,
+        originXPt: Float,
+        originYPt: Float
+    ): DocRect = if (originXPt == 0f && originYPt == 0f) {
+        workspaceRect
+    } else {
+        DocRect(
+            leftPt = workspaceRect.leftPt - originXPt,
+            topPt = workspaceRect.topPt - originYPt,
+            rightPt = workspaceRect.rightPt - originXPt,
+            bottomPt = workspaceRect.bottomPt - originYPt
+        )
+    }
+
+    private fun intersectRects(a: DocRect, b: DocRect): DocRect {
+        val left = max(a.leftPt, b.leftPt)
+        val top = max(a.topPt, b.topPt)
+        val right = min(a.rightPt, b.rightPt)
+        val bottom = min(a.bottomPt, b.bottomPt)
+        return if (right <= left || bottom <= top) {
+            DocRect(0f, 0f, 0f, 0f)
+        } else {
+            DocRect(left, top, right, bottom)
+        }
     }
 
     private fun recordEmptyTileKeyLocked(key: TileKey) {

@@ -1190,6 +1190,8 @@ fun PageObjectsOverlayLayer(
     lassoPreviewRotationRadians: Float = 0f,
     lassoPreviewRotationCenter: DocPoint? = null,
     viewportTransformTick: Long = 0L,
+    pageOriginXPt: Float = 0f,
+    pageOriginYPt: Float = 0f,
     modifier: Modifier = Modifier
 ) {
     // Reading viewportTransformTick forces Compose to track pan/zoom changes on the paper so objects stick 1:1.
@@ -1231,7 +1233,10 @@ fun PageObjectsOverlayLayer(
                 rawObj
             }
 
-            val screenTopLeft = transformMatrix.docToScreen(obj.bounds.leftPt, obj.bounds.topPt)
+            val screenTopLeft = transformMatrix.docToScreen(
+                obj.bounds.leftPt + pageOriginXPt,
+                obj.bounds.topPt + pageOriginYPt
+            )
             val widthPx = (obj.bounds.widthPt * scale).coerceAtLeast(36f)
             val heightPx = (obj.bounds.heightPt * scale).coerceAtLeast(28f)
             val isSelected = (obj.id == selectedObjectId)
@@ -1333,6 +1338,8 @@ fun PageObjectsOverlayLayer(
                     bounds = obj.bounds,
                     rotationRadians = boxRotationRadians,
                     transformMatrix = transformMatrix,
+                    pageOriginXPt = pageOriginXPt,
+                    pageOriginYPt = pageOriginYPt,
                     widthPx = widthPx,
                     heightPx = heightPx,
                     overlayCoordsProvider = { overlayCoords },
@@ -2108,6 +2115,8 @@ private fun RotatableBoxInteractiveHandles(
     bounds: DocRect,
     rotationRadians: Float,
     transformMatrix: CanvasTransformMatrix,
+    pageOriginXPt: Float,
+    pageOriginYPt: Float,
     widthPx: Float,
     heightPx: Float,
     overlayCoordsProvider: () -> LayoutCoordinates?,
@@ -2122,8 +2131,8 @@ private fun RotatableBoxInteractiveHandles(
     val stemGapPx = with(density) { 28.dp.toPx() }
 
     val centerScreen = transformMatrix.docToScreen(
-        bounds.centerXPt,
-        bounds.centerYPt
+        bounds.centerXPt + pageOriginXPt,
+        bounds.centerYPt + pageOriginYPt
     )
     val c = cos(rotationRadians)
     val s = sin(rotationRadians)
@@ -2172,7 +2181,11 @@ private fun RotatableBoxInteractiveHandles(
                         val oppDocX = curBounds.centerXPt + oppLocalX * cosR - oppLocalY * sinR
                         val oppDocY = curBounds.centerYPt + oppLocalX * sinR + oppLocalY * cosR
 
-                        val fingerDoc = transformMatrix.screenToDoc(overlayPt.x, overlayPt.y)
+                        val rawFingerDoc = transformMatrix.screenToDoc(overlayPt.x, overlayPt.y)
+                        val fingerDoc = DocPoint(
+                            rawFingerDoc.xPt - pageOriginXPt,
+                            rawFingerDoc.yPt - pageOriginYPt
+                        )
                         val vx = fingerDoc.xPt - oppDocX
                         val vy = fingerDoc.yPt - oppDocY
                         val newW = ((vx * cosR + vy * sinR) * sx).coerceAtLeast(24f)
@@ -2237,8 +2250,8 @@ private fun RotatableBoxInteractiveHandles(
                     val overlayPt = oCoords.localPositionOf(hCoords, change.position)
                     val curBounds = latestBounds
                     val curCenter = transformMatrix.docToScreen(
-                        curBounds.centerXPt,
-                        curBounds.centerYPt
+                        curBounds.centerXPt + pageOriginXPt,
+                        curBounds.centerYPt + pageOriginYPt
                     )
                     val angle = atan2(
                         overlayPt.y - curCenter.yPx,

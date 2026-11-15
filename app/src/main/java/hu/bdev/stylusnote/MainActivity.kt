@@ -1,11 +1,18 @@
 package hu.bdev.stylusnote
 
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.Choreographer
 import android.view.Display
+import android.view.FrameMetrics
 import android.view.KeyEvent
 import android.view.View
+import android.view.Window
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -23,6 +30,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.ui.platform.LocalView
+import hu.bdev.stylusnote.core.telemetry.FrameTimingAccumulator
+import hu.bdev.stylusnote.core.telemetry.FrameTimingSnapshot
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -52,13 +62,11 @@ import java.io.File
 import java.util.UUID
 import kotlin.math.roundToInt
 
-private data class FrameTimingStats(
-    val fps: Float = 0f,
-    val lastFrameMs: Float = 0f,
-    val p95FrameMs: Float = 0f,
-    val displayRefreshHz: Float = 60f,
-    val lockedModeHz: Float = 60f
-)
+private tailrec fun findHostWindow(context: Context?): Window? = when (context) {
+    is Activity -> context.window
+    is ContextWrapper -> findHostWindow(context.baseContext)
+    else -> null
+}
 
 class MainActivity : ComponentActivity() {
 
@@ -308,8 +316,7 @@ private fun FrameDebugOverlay(
         reportedRefreshRateHz = reportedRefreshRateHz,
         currentDisplayHzProvider = currentDisplayHzProvider
     )
-    val budgetMet = stats.p95FrameMs <= 6.94f
-    val statusColor = if (budgetMet) {
+    val statusColor = if (stats.isRenderBudgetMet) {
         MaterialTheme.colorScheme.primary
     } else {
         MaterialTheme.colorScheme.error
@@ -326,17 +333,22 @@ private fun FrameDebugOverlay(
             verticalArrangement = Arrangement.spacedBy(2.dp)
         ) {
             Text(
-                text = "Display: ${stats.displayRefreshHz.roundToInt()} Hz (lock ${stats.lockedModeHz.roundToInt()} Hz)",
+                text = "Display: ${stats.displayRefreshHz.roundToInt()} Hz (lock ${stats.lockedModeHz.roundToInt()} Hz) | VSYNC: ${stats.vsyncFps.roundToInt()} FPS",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurface
             )
             Text(
-                text = "FPS: ${stats.fps.roundToInt()} | frame: ${"%.2f".format(stats.lastFrameMs)} ms",
+                text = "VSYNC p95: ${"%.2f".format(stats.vsyncP95Ms)} ms | frame: ${"%.2f".format(stats.lastRenderWorkMs)} ms",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurface
             )
+            val renderP95Text = if (stats.hasRenderWorkSamples) {
+                "${"%.2f".format(stats.renderWorkP95Ms)} ms"
+            } else {
+                "— ms"
+            }
             Text(
-                text = "p95: ${"%.2f".format(stats.p95FrameMs)} ms (cél ≤ 6.94 ms)",
+                text = "Render p95: $renderP95Text (cél ≤ ${"%.2f".format(stats.frameBudgetMs)} ms)",
                 style = MaterialTheme.typography.labelSmall,
                 color = statusColor
             )
@@ -350,57 +362,59 @@ private fun rememberFrameTimingStats(
     lockedRefreshRateHz: Float,
     reportedRefreshRateHz: Float,
     currentDisplayHzProvider: () -> Float
-): FrameTimingStats {
+): FrameTimingSnapshot {
     var stats by remember {
         mutableStateOf(
-            FrameTimingStats(
+            FrameTimingSnapshot(
                 displayRefreshHz = reportedRefreshRateHz,
                 lockedModeHz = lockedRefreshRateHz
             )
         )
     }
 
-    val windowSize = 120
-    val sortScratch = remember(windowSize) { FloatArray(windowSize) }
+    val hostWindow = findHostWindow(LocalView.current.context)
 
-    DisposableEffect(enabled, lockedRefreshRateHz, reportedRefreshRateHz) {
+    DisposableEffect(enabled, hostWindow, lockedRefreshRateHz, reportedRefreshRateHz) {
         if (!enabled) return@DisposableEffect onDispose {}
 
+        val accumulator = FrameTimingAccumulator()
         val choreographer = Choreographer.getInstance()
-        val frameDurationsMs = FloatArray(windowSize)
-        var filled = 0
-        var writeIdx = 0
-        var lastFrameNanos = 0L
+        val mainHandler = Handler(Looper.getMainLooper())
         var lastUiUpdateNanos = 0L
+
+        val metricsListener = Window.OnFrameMetricsAvailableListener { _, frameMetrics, _ ->
+            if (frameMetrics.getMetric(FrameMetrics.FIRST_DRAW_FRAME) == 1L) return@OnFrameMetricsAvailableListener
+            val totalDurationNs = frameMetrics.getMetric(FrameMetrics.TOTAL_DURATION)
+            if (totalDurationNs > 0L) {
+                accumulator.recordRenderWorkDurationNanos(totalDurationNs)
+            } else {
+                // Fallback when TOTAL_DURATION is unavailable on older drivers: sum active UI/RT stages.
+                val cpuStagesNs =
+                    frameMetrics.getMetric(FrameMetrics.INPUT_HANDLING_DURATION).coerceAtLeast(0L) +
+                        frameMetrics.getMetric(FrameMetrics.ANIMATION_DURATION).coerceAtLeast(0L) +
+                        frameMetrics.getMetric(FrameMetrics.LAYOUT_MEASURE_DURATION).coerceAtLeast(0L) +
+                        frameMetrics.getMetric(FrameMetrics.DRAW_DURATION).coerceAtLeast(0L) +
+                        frameMetrics.getMetric(FrameMetrics.SYNC_DURATION).coerceAtLeast(0L) +
+                        frameMetrics.getMetric(FrameMetrics.COMMAND_ISSUE_DURATION).coerceAtLeast(0L) +
+                        frameMetrics.getMetric(FrameMetrics.SWAP_BUFFERS_DURATION).coerceAtLeast(0L)
+                if (cpuStagesNs > 0L) {
+                    accumulator.recordRenderWorkDurationNanos(cpuStagesNs)
+                }
+            }
+        }
+
+        hostWindow?.addOnFrameMetricsAvailableListener(metricsListener, mainHandler)
 
         val callback = object : Choreographer.FrameCallback {
             override fun doFrame(frameTimeNanos: Long) {
-                if (lastFrameNanos != 0L) {
-                    val deltaMs = (frameTimeNanos - lastFrameNanos) / 1_000_000f
-                    frameDurationsMs[writeIdx] = deltaMs
-                    writeIdx = (writeIdx + 1) % windowSize
-                    if (filled < windowSize) filled++
-
-                    if (frameTimeNanos - lastUiUpdateNanos >= 250_000_000L && filled > 0) {
-                        lastUiUpdateNanos = frameTimeNanos
-                        System.arraycopy(frameDurationsMs, 0, sortScratch, 0, filled)
-                        sortScratch.sort(0, filled)
-                        val p95Index = ((filled - 1) * 0.95f).toInt().coerceIn(0, filled - 1)
-                        var sumMs = 0f
-                        for (i in 0 until filled) sumMs += sortScratch[i]
-                        val avgMs = sumMs / filled
-                        val fps = if (avgMs > 0f) 1000f / avgMs else 0f
-
-                        stats = FrameTimingStats(
-                            fps = fps,
-                            lastFrameMs = deltaMs,
-                            p95FrameMs = sortScratch[p95Index],
-                            displayRefreshHz = currentDisplayHzProvider(),
-                            lockedModeHz = lockedRefreshRateHz
-                        )
-                    }
+                accumulator.recordVsyncTimestampNanos(frameTimeNanos)
+                if (frameTimeNanos - lastUiUpdateNanos >= 250_000_000L) {
+                    lastUiUpdateNanos = frameTimeNanos
+                    stats = accumulator.snapshot(
+                        displayRefreshHz = currentDisplayHzProvider(),
+                        lockedModeHz = lockedRefreshRateHz
+                    )
                 }
-                lastFrameNanos = frameTimeNanos
                 choreographer.postFrameCallback(this)
             }
         }
@@ -408,6 +422,9 @@ private fun rememberFrameTimingStats(
         choreographer.postFrameCallback(callback)
         onDispose {
             choreographer.removeFrameCallback(callback)
+            hostWindow?.let { w ->
+                runCatching { w.removeOnFrameMetricsAvailableListener(metricsListener) }
+            }
         }
     }
 

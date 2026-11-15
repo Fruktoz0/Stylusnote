@@ -1,5 +1,7 @@
 package hu.bdev.stylusnote.ui.shelf
 
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
@@ -151,9 +153,11 @@ import hu.bdev.stylusnote.core.ai.SearchExecutionResult
 import hu.bdev.stylusnote.core.ai.SearchIndexState
 import hu.bdev.stylusnote.core.ai.SearchTextIndexer
 import hu.bdev.stylusnote.core.math.CanvasTransformMatrix
+import hu.bdev.stylusnote.core.math.ContinuousPageLayout
 import hu.bdev.stylusnote.core.math.DocPoint
 import hu.bdev.stylusnote.core.math.DocRect
 import hu.bdev.stylusnote.core.math.OledStrokeRenderCache
+import hu.bdev.stylusnote.core.math.PageLayoutSlot
 import hu.bdev.stylusnote.core.math.ShapeMeta
 import hu.bdev.stylusnote.core.math.ShapeRecognizer
 import hu.bdev.stylusnote.data.export.CloudSyncScheduler
@@ -190,6 +194,8 @@ import hu.bdev.stylusnote.ui.canvas.IndexedDryStroke
 import hu.bdev.stylusnote.ui.canvas.LassoAutoFormatResult
 import hu.bdev.stylusnote.ui.canvas.LeftPageDrawerOverlay
 import hu.bdev.stylusnote.ui.canvas.LeftPagePullTab
+import hu.bdev.stylusnote.ui.canvas.MultiPageSessionManager
+import hu.bdev.stylusnote.ui.canvas.NotebookPageRuntime
 import hu.bdev.stylusnote.ui.canvas.PageObjectsOverlayLayer
 import hu.bdev.stylusnote.ui.canvas.StylusDrawingSurface
 import hu.bdev.stylusnote.ui.canvas.computeStrokeDocBounds
@@ -208,12 +214,18 @@ import hu.bdev.stylusnote.ui.components.ShapePickerPopover
 import hu.bdev.stylusnote.ui.components.ToolDockPreferencesStore
 import hu.bdev.stylusnote.ui.components.ToolDockPrefs
 import hu.bdev.stylusnote.ui.theme.LocalStylusSurfacePalette
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
+import java.util.Collections
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
@@ -1977,10 +1989,12 @@ fun NotebookWorkspaceScreen(
         .observePagesForNotebook(target.notebookId)
         .collectAsState(initial = emptyList())
     var notebookOcrLanguage by remember(target.notebookId) { mutableStateOf(OcrLanguageTag.HUNGARIAN) }
+    var notebookDefaultCanvasMode by remember(target.notebookId) { mutableStateOf<CanvasMode?>(null) }
     LaunchedEffect(target.notebookId) {
         val nb = withContext(Dispatchers.IO) { database.notebookDao().getNotebookById(target.notebookId) }
         if (nb != null) {
             notebookOcrLanguage = nb.ocrLanguage
+            notebookDefaultCanvasMode = nb.defaultCanvasMode
         }
     }
 
@@ -2188,11 +2202,22 @@ fun NotebookWorkspaceScreen(
         }
     }
 
+    val activePageCanvasMode = notebookPages.firstOrNull { it.id == target.pageId }?.canvasMode
+        ?: notebookDefaultCanvasMode
+        ?: CanvasMode.FIXED_PAGE
+    val isContinuousMultiPage = benchmarkStrokeCount == 0 && activePageCanvasMode == CanvasMode.FIXED_PAGE
+    val paneKey: Any = if (isContinuousMultiPage) {
+        "continuous_${target.notebookId}"
+    } else {
+        "single_${target.notebookId}_${target.pageId}"
+    }
+
     Box(modifier = modifier.fillMaxSize()) {
-        key(target.notebookId, target.pageId) {
+        key(paneKey) {
             NotebookPagePane(
                 database = database,
                 target = target,
+                isContinuousMultiPage = isContinuousMultiPage,
                 cacheBudgetBytes = DryInkRasterCache.DEFAULT_MAX_CACHE_BYTES,
                 isDarkTheme = isDarkTheme,
                 showDebugOverlay = showDebugOverlay,
@@ -2295,10 +2320,22 @@ fun NotebookWorkspaceScreen(
     }
 }
 
+private data class ActivePageBinding(
+    val pageId: String,
+    val pageIndex: Int,
+    val originXPt: Float,
+    val originYPt: Float,
+    val canvasStateHolder: CanvasStateHolder,
+    val strokeJournal: StrokeJournal,
+    val dryInkRasterCache: DryInkRasterCache,
+    val isReadOnly: Boolean
+)
+
 @Composable
 private fun NotebookPagePane(
     database: AppDatabase,
     target: OpenedPageTarget,
+    isContinuousMultiPage: Boolean,
     cacheBudgetBytes: Long,
     isDarkTheme: Boolean,
     showDebugOverlay: Boolean,
@@ -2339,34 +2376,39 @@ private fun NotebookPagePane(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val coroutineScope = rememberCoroutineScope()
+    val mainHandler = remember { Handler(Looper.getMainLooper()) }
+    val sessionKey: Any = if (isContinuousMultiPage) target.notebookId else target
+    val historyMutex = remember(sessionKey) { Mutex() }
+    val latestTargetPageId by rememberUpdatedState(target.pageId)
 
-    val transformMatrix = remember(target) { CanvasTransformMatrix() }
-    val canvasStateHolder = remember(target) { CanvasStateHolder() }
-    val dryInkRasterCache = remember(target, cacheBudgetBytes) {
+    val transformMatrix = remember(sessionKey) { CanvasTransformMatrix() }
+    val canvasStateHolder = remember(sessionKey) { CanvasStateHolder() }
+    val dryInkRasterCache = remember(sessionKey, cacheBudgetBytes) {
         DryInkRasterCache(maxCacheBytes = cacheBudgetBytes)
     }
-    val oledStrokeCache = remember(target) { OledStrokeRenderCache() }
+    val oledStrokeCache = remember(sessionKey) { OledStrokeRenderCache() }
     val presetStore = remember(context) { BrushPresetStore(context.applicationContext) }
     val presets by presetStore.presetsFlow.collectAsState(initial = BrushPresetStore.defaultPresets)
 
-    var paperConfig by remember(target) { mutableStateOf(PagePaperConfig()) }
+    var paperConfig by remember(sessionKey) { mutableStateOf(PagePaperConfig()) }
     var dockBoundsPx by remember { mutableStateOf(Rect.Zero) }
-    var showBrushSettings by remember(target) { mutableStateOf(false) }
-    var showShapePicker by remember(target) { mutableStateOf(false) }
-    var showPaperSettings by remember(target) { mutableStateOf(false) }
-    var showAiCopilot by remember(target) { mutableStateOf(false) }
-    var showCloudBackupDialog by remember(target) { mutableStateOf(false) }
-    var selectedObjectId by remember(target) { mutableStateOf<String?>(null) }
-    var copilotNoticeBannerHu by remember(target) { mutableStateOf<String?>(null) }
+    var showBrushSettings by remember(sessionKey) { mutableStateOf(false) }
+    var showShapePicker by remember(sessionKey) { mutableStateOf(false) }
+    var showPaperSettings by remember(sessionKey) { mutableStateOf(false) }
+    var showAiCopilot by remember(sessionKey) { mutableStateOf(false) }
+    var showCloudBackupDialog by remember(sessionKey) { mutableStateOf(false) }
+    var selectedObjectId by remember(sessionKey) { mutableStateOf<String?>(null) }
+    var selectedObjectPageId by remember(sessionKey) { mutableStateOf<String?>(null) }
+    var copilotNoticeBannerHu by remember(sessionKey) { mutableStateOf<String?>(null) }
 
-    var notebookTitle by remember(target) { mutableStateOf("Jegyzetfüzet") }
-    var pageNumber by remember(target) { mutableIntStateOf(1) }
-    var currentPageEntity by remember(target) { mutableStateOf<PageEntity?>(null) }
+    var notebookTitle by remember(sessionKey) { mutableStateOf("Jegyzetfüzet") }
+    var pageNumber by remember(sessionKey) { mutableIntStateOf(1) }
+    var currentPageEntity by remember(sessionKey) { mutableStateOf<PageEntity?>(null) }
     var isCreatingPage by remember { mutableStateOf(false) }
     var topToolbarBoundsPx by remember { mutableStateOf(Rect.Zero) }
     var observedFullScreen by remember { mutableStateOf(isFullScreenCanvas) }
-    var isReadOnlyPage by remember(target) { mutableStateOf(false) }
-    var hasHydratedPageContent by remember(target) { mutableStateOf(false) }
+    var isReadOnlyPage by remember(sessionKey) { mutableStateOf(false) }
+    var hasHydratedPageContent by remember(sessionKey) { mutableStateOf(false) }
 
     val pdfTileRenderer = remember(context) { PdfTileRenderer(context.filesDir) }
     val pdfExportManager = remember(context, pdfTileRenderer) {
@@ -2375,29 +2417,154 @@ private fun NotebookPagePane(
 
     val palette = LocalStylusSurfacePalette.current
     var viewportSize by remember { mutableStateOf(IntSize.Zero) }
-    var currentZoomPercent by remember(target) { mutableIntStateOf(100) }
+    var currentZoomPercent by remember(sessionKey) { mutableIntStateOf(100) }
     var externalDrawTick by remember { mutableLongStateOf(0L) }
     var historyRevisionTick by remember { mutableLongStateOf(0L) }
+    var hydrationRevisionTick by remember { mutableLongStateOf(0L) }
     var viewportTransformTick by remember { mutableLongStateOf(0L) }
+    var scrollToPageRequestId by remember(sessionKey) { mutableStateOf<String?>(null) }
+    var scrollToPageTargetLocalRect by remember(sessionKey) { mutableStateOf<DocRect?>(null) }
+    var scrollToPageRequestTick by remember(sessionKey) { mutableLongStateOf(0L) }
+    var pendingScrollAfterLayoutPageId by remember(sessionKey) { mutableStateOf<String?>(null) }
+
+    val latestBrushConfig by rememberUpdatedState(brushConfig)
+    val dirtyContinuousPageIds = remember(sessionKey) { Collections.synchronizedSet(LinkedHashSet<String>()) }
+    val continuousSessionManager = remember(sessionKey, isContinuousMultiPage, cacheBudgetBytes) {
+        if (isContinuousMultiPage) {
+            MultiPageSessionManager(
+                filesDir = context.applicationContext.filesDir,
+                activeBrushConfigProvider = { latestBrushConfig },
+                onLocalMutationCommitted = { pageId ->
+                    dirtyContinuousPageIds.add(pageId)
+                    CloudSyncScheduler.notifyLocalMutation(context)
+                },
+                onPageReadyCallback = { _, _ ->
+                    mainHandler.post {
+                        hydrationRevisionTick++
+                        historyRevisionTick++
+                        externalDrawTick++
+                    }
+                },
+                totalTileBudgetBytes = cacheBudgetBytes
+            )
+        } else {
+            null
+        }
+    }
+
+    val effectiveContinuousPages: List<PageEntity> = remember(
+        isContinuousMultiPage,
+        notebookPages,
+        currentPageEntity,
+        target.pageId
+    ) {
+        if (!isContinuousMultiPage) {
+            emptyList()
+        } else if (notebookPages.isNotEmpty()) {
+            notebookPages.sortedBy { it.pageIndexInNotebook }
+        } else {
+            listOfNotNull(currentPageEntity)
+        }
+    }
+    val continuousLayout: ContinuousPageLayout? = remember(isContinuousMultiPage, effectiveContinuousPages) {
+        if (isContinuousMultiPage && effectiveContinuousPages.isNotEmpty()) {
+            ContinuousPageLayout.build(effectiveContinuousPages)
+        } else {
+            null
+        }
+    }
+    LaunchedEffect(continuousSessionManager, effectiveContinuousPages, target.pageId) {
+        val manager = continuousSessionManager ?: return@LaunchedEffect
+        if (effectiveContinuousPages.isEmpty()) return@LaunchedEffect
+        val activeIdx = effectiveContinuousPages
+            .indexOfFirst { it.id == target.pageId }
+            .let { if (it >= 0) it else 0 }
+        manager.updatePagesAndFocus(effectiveContinuousPages, activeIdx)
+        val pendingPageId = pendingScrollAfterLayoutPageId
+        if (pendingPageId != null && manager.currentLayout.slotForPageId(pendingPageId) != null) {
+            pendingScrollAfterLayoutPageId = null
+            scrollToPageRequestId = pendingPageId
+            scrollToPageTargetLocalRect = null
+            scrollToPageRequestTick++
+        }
+    }
 
     val activePageMatch = searchUiState.activeMatchForCurrentPage?.takeIf { it.pageId == target.pageId }
     val latestActivePageMatch by rememberUpdatedState(activePageMatch)
     fun bumpOverlayTransformTickIfVisible() {
-        if (canvasStateHolder.hasPageObjects || latestActivePageMatch != null) {
+        val hasAnyObjects = if (continuousSessionManager != null) {
+            continuousSessionManager.readyPageIdsSnapshot().any { id ->
+                continuousSessionManager.getReadyRuntime(id)?.canvasStateHolder?.hasPageObjects == true
+            }
+        } else {
+            canvasStateHolder.hasPageObjects
+        }
+        if (hasAnyObjects || latestActivePageMatch != null) {
             viewportTransformTick++
         }
     }
 
-    val latestBrushConfig by rememberUpdatedState(brushConfig)
-    val strokeJournal = remember(target) {
-        StrokeJournal(
-            pageDirectory = File(context.filesDir, "pages/${target.pageId}"),
-            activeBrushConfigProvider = { latestBrushConfig },
-            shapeMetaProvider = { strokeId -> canvasStateHolder.getShapeMeta(strokeId) },
-            onMutationCommitted = {
-                CloudSyncScheduler.notifyLocalMutation(context)
-            }
+    val strokeJournal = remember(sessionKey, isContinuousMultiPage) {
+        if (isContinuousMultiPage) {
+            null
+        } else {
+            StrokeJournal(
+                pageDirectory = File(context.filesDir, "pages/${target.pageId}"),
+                activeBrushConfigProvider = { latestBrushConfig },
+                shapeMetaProvider = { strokeId -> canvasStateHolder.getShapeMeta(strokeId) },
+                onMutationCommitted = {
+                    CloudSyncScheduler.notifyLocalMutation(context)
+                }
+            )
+        }
+    }
+
+    fun resolveBindingForPage(pageId: String): ActivePageBinding? {
+        if (continuousSessionManager != null && continuousLayout != null) {
+            val slot = continuousLayout.slotForPageId(pageId) ?: return null
+            val runtime = continuousSessionManager.getReadyRuntime(pageId) ?: return null
+            return ActivePageBinding(
+                pageId = pageId,
+                pageIndex = slot.pageIndex,
+                originXPt = slot.leftPt,
+                originYPt = slot.topPt,
+                canvasStateHolder = runtime.canvasStateHolder,
+                strokeJournal = runtime.strokeJournal,
+                dryInkRasterCache = runtime.dryInkRasterCache,
+                isReadOnly = runtime.isReadOnly
+            )
+        }
+        val singleJournal = strokeJournal ?: return null
+        return ActivePageBinding(
+            pageId = target.pageId,
+            pageIndex = currentPageEntity?.pageIndexInNotebook ?: 0,
+            originXPt = 0f,
+            originYPt = 0f,
+            canvasStateHolder = canvasStateHolder,
+            strokeJournal = singleJournal,
+            dryInkRasterCache = dryInkRasterCache,
+            isReadOnly = isReadOnlyPage
         )
+    }
+
+    fun resolveViewportTargetBinding(): ActivePageBinding? {
+        if (continuousSessionManager != null && continuousLayout != null) {
+            val wsCenter = if (viewportSize.width > 0 && viewportSize.height > 0) {
+                transformMatrix.screenToDoc(viewportSize.width * 0.5f, viewportSize.height * 0.5f)
+            } else {
+                null
+            }
+            val slot = if (wsCenter != null) {
+                continuousLayout.findSlotAtWorkspacePoint(wsCenter.xPt, wsCenter.yPt)
+                    ?: continuousLayout.findNearestSlotForViewportCenter(wsCenter.yPt)
+            } else {
+                null
+            } ?: continuousLayout.slotForPageId(latestTargetPageId)
+                ?: continuousLayout.slots.firstOrNull()
+                ?: return null
+            return resolveBindingForPage(slot.pageId)
+        }
+        return resolveBindingForPage(target.pageId)
     }
 
     fun syncZoomPercentFromMatrix() {
@@ -2414,7 +2581,15 @@ private fun NotebookPagePane(
             focalYPx = viewportSize.height * 0.5f,
             zoomFactor = zoomFactor
         )
-        dryInkRasterCache.onGestureSettled(transformMatrix.scale)
+        if (continuousSessionManager != null) {
+            for (readyId in continuousSessionManager.readyPageIdsSnapshot()) {
+                continuousSessionManager.getReadyRuntime(readyId)
+                    ?.dryInkRasterCache
+                    ?.onGestureSettled(transformMatrix.scale)
+            }
+        } else {
+            dryInkRasterCache.onGestureSettled(transformMatrix.scale)
+        }
         syncZoomPercentFromMatrix()
         bumpOverlayTransformTickIfVisible()
         externalDrawTick++
@@ -2423,20 +2598,45 @@ private fun NotebookPagePane(
     fun fitPageToViewportNow(overridePaddingPx: Float? = null) {
         if (viewportSize.width <= 0 || viewportSize.height <= 0) return
         val paddingPx = overridePaddingPx ?: if (isFullScreenCanvas) 0f else 36f
-        transformMatrix.fitPageToViewport(
-            pageWidthPt = paperConfig.pageDimensions.widthPt,
-            pageHeightPt = paperConfig.pageDimensions.heightPt,
-            viewportWidthPx = viewportSize.width.toFloat(),
-            viewportHeightPx = viewportSize.height.toFloat(),
-            paddingPx = paddingPx
-        )
-        dryInkRasterCache.onGestureSettled(transformMatrix.scale)
+        val layout = continuousLayout
+        val manager = continuousSessionManager
+        if (manager != null && layout != null) {
+            val slot = layout.slotForPageId(latestTargetPageId) ?: layout.slots.firstOrNull()
+            if (slot != null) {
+                transformMatrix.fitPageToViewport(
+                    pageWidthPt = slot.widthPt,
+                    pageHeightPt = slot.heightPt,
+                    viewportWidthPx = viewportSize.width.toFloat(),
+                    viewportHeightPx = viewportSize.height.toFloat(),
+                    paddingPx = paddingPx
+                )
+                val fitScale = transformMatrix.scale
+                val (panX, panY) = layout.computeCameraPanForSlot(
+                    slot = slot,
+                    scale = fitScale,
+                    viewportWidthPx = viewportSize.width.toFloat(),
+                    viewportHeightPx = viewportSize.height.toFloat(),
+                    verticalPaddingPx = paddingPx
+                )
+                transformMatrix.setTransform(scale = fitScale, panXPx = panX, panYPx = panY)
+                manager.getReadyRuntime(slot.pageId)?.dryInkRasterCache?.onGestureSettled(fitScale)
+            }
+        } else {
+            transformMatrix.fitPageToViewport(
+                pageWidthPt = paperConfig.pageDimensions.widthPt,
+                pageHeightPt = paperConfig.pageDimensions.heightPt,
+                viewportWidthPx = viewportSize.width.toFloat(),
+                viewportHeightPx = viewportSize.height.toFloat(),
+                paddingPx = paddingPx
+            )
+            dryInkRasterCache.onGestureSettled(transformMatrix.scale)
+        }
         syncZoomPercentFromMatrix()
         bumpOverlayTransformTickIfVisible()
         externalDrawTick++
     }
 
-    fun viewportCenterDocPoint(): DocPoint = if (viewportSize.width > 0 && viewportSize.height > 0) {
+    fun viewportCenterWorkspacePoint(): DocPoint = if (viewportSize.width > 0 && viewportSize.height > 0) {
         transformMatrix.screenToDoc(
             viewportSize.width * 0.5f,
             viewportSize.height * 0.5f
@@ -2448,44 +2648,47 @@ private fun NotebookPagePane(
         )
     }
 
-    val latestPageId by rememberUpdatedState(target.pageId)
-    val latestStrokeJournal by rememberUpdatedState(strokeJournal)
     val insertImageLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { pickedUri ->
         if (pickedUri == null) return@rememberLauncherForActivityResult
-        val activePageId = latestPageId
-        val activeJournal = latestStrokeJournal
+        val binding = resolveViewportTargetBinding() ?: return@rememberLauncherForActivityResult
+        if (binding.isReadOnly) return@rememberLauncherForActivityResult
+        val centerWs = viewportCenterWorkspacePoint()
+        val centerLocal = DocPoint(
+            xPt = centerWs.xPt - binding.originXPt,
+            yPt = centerWs.yPt - binding.originYPt
+        )
         coroutineScope.launch {
             runCatching {
                 withContext(Dispatchers.IO) {
                     importPickedImageAsPageAsset(
                         context = context,
                         sourceUri = pickedUri,
-                        pageId = activePageId
+                        pageId = binding.pageId
                     )
                 }
             }.onSuccess { imported ->
-                val centerDoc = viewportCenterDocPoint()
                 val maxDocSpan = 260f
                 val longestPx = maxOf(imported.widthPx, imported.heightPx).toFloat().coerceAtLeast(1f)
                 val docW = (imported.widthPx / longestPx * maxDocSpan).coerceAtLeast(48f)
                 val docH = (imported.heightPx / longestPx * maxDocSpan).coerceAtLeast(48f)
                 val imgObj = PageObject.ImageObject(
                     id = UUID.randomUUID().toString(),
-                    zOrder = canvasStateHolder.allocateObjectZOrder(),
+                    zOrder = binding.canvasStateHolder.allocateObjectZOrder(),
                     bounds = DocRect(
-                        leftPt = centerDoc.xPt - docW * 0.5f,
-                        topPt = centerDoc.yPt - docH * 0.5f,
-                        rightPt = centerDoc.xPt + docW * 0.5f,
-                        bottomPt = centerDoc.yPt + docH * 0.5f
+                        leftPt = centerLocal.xPt - docW * 0.5f,
+                        topPt = centerLocal.yPt - docH * 0.5f,
+                        rightPt = centerLocal.xPt + docW * 0.5f,
+                        bottomPt = centerLocal.yPt + docH * 0.5f
                     ),
                     imageAssetRelativePath = imported.relativePath,
                     rotationRadians = 0f
                 )
-                canvasStateHolder.addPageObject(imgObj)
-                activeJournal.appendAddObject(imgObj)
+                binding.canvasStateHolder.addPageObject(imgObj)
+                binding.strokeJournal.appendAddObject(imgObj)
                 selectedObjectId = imgObj.id
+                selectedObjectPageId = binding.pageId
                 historyRevisionTick++
                 viewportTransformTick++
             }.onFailure { err ->
@@ -2505,98 +2708,132 @@ private fun NotebookPagePane(
         fitPageToViewportNow(overridePaddingPx = if (isFullScreenCanvas) 0f else 36f)
     }
 
-    fun currentPersistedStrokes(): List<PersistedStrokeRecord> =
-        canvasStateHolder.allStrokesSorted().map { entry ->
+    fun persistedStrokesFrom(holder: CanvasStateHolder): List<PersistedStrokeRecord> =
+        holder.allStrokesSorted().map { entry ->
             StrokeBinarySerializer.fromIndexedDryStroke(
                 entry = entry,
                 brushConfig = brushConfig,
-                shapeMeta = canvasStateHolder.getShapeMeta(entry.id)
+                shapeMeta = holder.getShapeMeta(entry.id)
             )
         }
+
+    suspend fun formatInMemoryTarget(
+        holder: CanvasStateHolder,
+        journal: StrokeJournal,
+        rasterCache: DryInkRasterCache,
+        onlyUnformattedOcr: Boolean,
+        formatText: Boolean
+    ): hu.bdev.stylusnote.ui.canvas.PageFormatSummary {
+        val strokes = persistedStrokesFrom(holder)
+        val res = if (onlyUnformattedOcr) {
+            HandwritingToLatexConverter.formatUnformattedStrokesInPage(
+                pageStrokes = strokes,
+                existingObjects = holder.allPageObjects(),
+                ocrLanguage = notebookOcrLanguage,
+                geminiClient = geminiClient,
+                canvasStateHolder = holder,
+                journalSink = journal
+            )
+        } else {
+            HandwritingToLatexConverter.formatPageStrokesStructured(
+                pageStrokes = strokes,
+                formatText = formatText,
+                geminiClient = geminiClient,
+                canvasStateHolder = holder,
+                journalSink = journal,
+                context = context,
+                ocrLanguage = notebookOcrLanguage
+            )
+        }
+        val summary = res.getOrThrow()
+        rasterCache.clearAll()
+        externalDrawTick++
+        historyRevisionTick++
+        return summary
+    }
 
     suspend fun executeAiFormattingAcrossPages(
         targets: List<PageEntity>,
         onlyUnformattedOcr: Boolean,
         formatText: Boolean
     ): hu.bdev.stylusnote.ui.canvas.PageFormatSummary {
+        continuousSessionManager?.flushAllJournals()
         var totalTexts = 0
         var totalFormulas = 0
         var totalShapes = 0
         var lastModel: String? = null
 
         for (pageEntity in targets) {
-            if (pageEntity.id == target.pageId) {
-                val res = if (onlyUnformattedOcr) {
-                    HandwritingToLatexConverter.formatUnformattedStrokesInPage(
-                        pageStrokes = currentPersistedStrokes(),
-                        existingObjects = canvasStateHolder.allPageObjects(),
-                        ocrLanguage = notebookOcrLanguage,
-                        geminiClient = geminiClient,
-                        canvasStateHolder = canvasStateHolder,
-                        journalSink = strokeJournal
-                    )
-                } else {
-                    HandwritingToLatexConverter.formatPageStrokesStructured(
-                        pageStrokes = currentPersistedStrokes(),
-                        formatText = formatText,
-                        geminiClient = geminiClient,
-                        canvasStateHolder = canvasStateHolder,
-                        journalSink = strokeJournal,
-                        context = context,
-                        ocrLanguage = notebookOcrLanguage
+            val warmRuntime = continuousSessionManager?.getReadyRuntime(pageEntity.id)
+            val singleJournal = if (continuousSessionManager == null && pageEntity.id == target.pageId) {
+                strokeJournal
+            } else {
+                null
+            }
+            val summary = when {
+                warmRuntime != null -> {
+                    dirtyContinuousPageIds.add(pageEntity.id)
+                    formatInMemoryTarget(
+                        holder = warmRuntime.canvasStateHolder,
+                        journal = warmRuntime.strokeJournal,
+                        rasterCache = warmRuntime.dryInkRasterCache,
+                        onlyUnformattedOcr = onlyUnformattedOcr,
+                        formatText = formatText
                     )
                 }
-                val summary = res.getOrThrow()
-                totalTexts += summary.formattedTextCount
-                totalFormulas += summary.formattedFormulaCount
-                totalShapes += summary.formattedShapeCount
-                summary.modelIdUsed?.takeIf { it.isNotBlank() }?.let { lastModel = it }
-                dryInkRasterCache.clearAll()
-                externalDrawTick++
-                historyRevisionTick++
-            } else {
-                val pageDir = File(context.filesDir, "pages/${pageEntity.id}")
-                val bgJournal = StrokeJournal(pageDirectory = pageDir)
-                val summary = withContext(Dispatchers.IO) {
-                    val rec = bgJournal.openAndRecover()
-                    try {
-                        if (rec.isReadOnly || rec.strokes.isEmpty()) {
-                            hu.bdev.stylusnote.ui.canvas.PageFormatSummary(0, 0, 0)
-                        } else {
-                            val maxZ = rec.objects.maxOfOrNull { it.zOrder } ?: 1_000_000L
-                            val res = if (onlyUnformattedOcr) {
-                                HandwritingToLatexConverter.formatUnformattedStrokesInPage(
-                                    pageStrokes = rec.strokes,
-                                    existingObjects = rec.objects,
-                                    ocrLanguage = notebookOcrLanguage,
-                                    geminiClient = geminiClient,
-                                    canvasStateHolder = null,
-                                    journalSink = bgJournal,
-                                    startingZOrder = maxZ
-                                )
+                singleJournal != null -> {
+                    formatInMemoryTarget(
+                        holder = canvasStateHolder,
+                        journal = singleJournal,
+                        rasterCache = dryInkRasterCache,
+                        onlyUnformattedOcr = onlyUnformattedOcr,
+                        formatText = formatText
+                    )
+                }
+                else -> {
+                    val pageDir = File(context.filesDir, "pages/${pageEntity.id}")
+                    val bgJournal = StrokeJournal(pageDirectory = pageDir)
+                    withContext(Dispatchers.IO) {
+                        val rec = bgJournal.openAndRecover()
+                        try {
+                            if (rec.isReadOnly || rec.strokes.isEmpty()) {
+                                hu.bdev.stylusnote.ui.canvas.PageFormatSummary(0, 0, 0)
                             } else {
-                                HandwritingToLatexConverter.formatPageStrokesStructured(
-                                    pageStrokes = rec.strokes,
-                                    formatText = formatText,
-                                    geminiClient = geminiClient,
-                                    canvasStateHolder = null,
-                                    journalSink = bgJournal,
-                                    context = context,
-                                    startingZOrder = maxZ,
-                                    ocrLanguage = notebookOcrLanguage
-                                )
+                                val maxZ = rec.objects.maxOfOrNull { it.zOrder } ?: 1_000_000L
+                                val res = if (onlyUnformattedOcr) {
+                                    HandwritingToLatexConverter.formatUnformattedStrokesInPage(
+                                        pageStrokes = rec.strokes,
+                                        existingObjects = rec.objects,
+                                        ocrLanguage = notebookOcrLanguage,
+                                        geminiClient = geminiClient,
+                                        canvasStateHolder = null,
+                                        journalSink = bgJournal,
+                                        startingZOrder = maxZ
+                                    )
+                                } else {
+                                    HandwritingToLatexConverter.formatPageStrokesStructured(
+                                        pageStrokes = rec.strokes,
+                                        formatText = formatText,
+                                        geminiClient = geminiClient,
+                                        canvasStateHolder = null,
+                                        journalSink = bgJournal,
+                                        context = context,
+                                        startingZOrder = maxZ,
+                                        ocrLanguage = notebookOcrLanguage
+                                    )
+                                }
+                                res.getOrThrow()
                             }
-                            res.getOrThrow()
+                        } finally {
+                            bgJournal.close(compactBeforeClose = !rec.isReadOnly)
                         }
-                    } finally {
-                        bgJournal.closeBlocking(compactBeforeClose = !rec.isReadOnly)
                     }
                 }
-                totalTexts += summary.formattedTextCount
-                totalFormulas += summary.formattedFormulaCount
-                totalShapes += summary.formattedShapeCount
-                summary.modelIdUsed?.takeIf { it.isNotBlank() }?.let { lastModel = it }
             }
+            totalTexts += summary.formattedTextCount
+            totalFormulas += summary.formattedFormulaCount
+            totalShapes += summary.formattedShapeCount
+            summary.modelIdUsed?.takeIf { it.isNotBlank() }?.let { lastModel = it }
         }
 
         return hu.bdev.stylusnote.ui.canvas.PageFormatSummary(
@@ -2611,16 +2848,23 @@ private fun NotebookPagePane(
         contract = ActivityResultContracts.CreateDocument("application/pdf")
     ) { uri ->
         if (uri != null) {
+            val binding = resolveBindingForPage(latestTargetPageId)
             coroutineScope.launch(Dispatchers.IO) {
                 runCatching {
-                    val liveStrokes = canvasStateHolder.allStrokesSorted().associate { it.id to it.stroke }
+                    val activeHolder = binding?.canvasStateHolder ?: canvasStateHolder
+                    val activePage = currentPageEntity ?: notebookPages.firstOrNull { it.id == latestTargetPageId }
+                    val activeConfig = activePage?.pageSizePreset?.toPagePaperConfig(
+                        canvasMode = activePage.canvasMode,
+                        templateType = activePage.templateType
+                    ) ?: paperConfig
+                    val liveStrokes = activeHolder.allStrokesSorted().associate { it.id to it.stroke }
                     val exportPage = ExportablePdfPage(
                         pageNumberOneBased = pageNumber,
-                        paperConfig = paperConfig,
-                        strokes = currentPersistedStrokes(),
-                        objects = canvasStateHolder.allPageObjects(),
-                        backgroundPdfAssetId = currentPageEntity?.pdfAssetId,
-                        backgroundPdfPageIndex = currentPageEntity?.pdfPageIndex,
+                        paperConfig = activeConfig,
+                        strokes = persistedStrokesFrom(activeHolder),
+                        objects = activeHolder.allPageObjects(),
+                        backgroundPdfAssetId = activePage?.pdfAssetId,
+                        backgroundPdfPageIndex = activePage?.pdfPageIndex,
                         liveInkStrokesById = liveStrokes
                     )
                     context.contentResolver.openOutputStream(uri)?.use { out ->
@@ -2633,7 +2877,7 @@ private fun NotebookPagePane(
         }
     }
 
-    LaunchedEffect(target, benchmarkStrokeCount) {
+    LaunchedEffect(sessionKey, benchmarkStrokeCount) {
         if (benchmarkStrokeCount > 0) {
             notebookTitle = "Benchmark ($benchmarkStrokeCount vonal)"
             pageNumber = 1
@@ -2699,21 +2943,50 @@ private fun NotebookPagePane(
             templateType = loadedOrCreatedPage.templateType
         )
 
-        val recovery = strokeJournal.openAndRecover()
-        isReadOnlyPage = recovery.isReadOnly
-        val loadedStrokes = ArrayList<IndexedDryStroke>(recovery.strokes.size)
-        val loadedMetas = LinkedHashMap<String, ShapeMeta>()
-        for (record in recovery.strokes) {
-            val (dry, _) = StrokeBinarySerializer.toIndexedDryStroke(record)
-            loadedStrokes.add(dry)
-            record.shapeMeta?.let { loadedMetas[record.id] = it }
+        val singleJournal = strokeJournal
+        if (continuousSessionManager != null) {
+            val allPages = withContext(Dispatchers.IO) {
+                database.pageDao().getPagesForNotebook(target.notebookId)
+            }.ifEmpty { listOf(loadedOrCreatedPage) }
+            val activeIdx = allPages.indexOfFirst { it.id == target.pageId }.let { if (it >= 0) it else 0 }
+            continuousSessionManager.updatePagesAndFocus(allPages, activeIdx)
+            externalDrawTick++
+            historyRevisionTick++
+            hasHydratedPageContent = true
+        } else if (singleJournal != null) {
+            val recovery = singleJournal.openAndRecover()
+            isReadOnlyPage = recovery.isReadOnly
+            val loadedStrokes = ArrayList<IndexedDryStroke>(recovery.strokes.size)
+            val loadedMetas = LinkedHashMap<String, ShapeMeta>()
+            for (record in recovery.strokes) {
+                val (dry, _) = StrokeBinarySerializer.toIndexedDryStroke(record)
+                loadedStrokes.add(dry)
+                record.shapeMeta?.let { loadedMetas[record.id] = it }
+            }
+            canvasStateHolder.restoreLoadedStrokes(loadedStrokes, loadedMetas)
+            canvasStateHolder.restoreLoadedObjects(recovery.objects)
+            dryInkRasterCache.clearAll()
+            externalDrawTick++
+            historyRevisionTick++
+            hasHydratedPageContent = true
         }
-        canvasStateHolder.restoreLoadedStrokes(loadedStrokes, loadedMetas)
-        canvasStateHolder.restoreLoadedObjects(recovery.objects)
-        dryInkRasterCache.clearAll()
-        externalDrawTick++
-        historyRevisionTick++
-        hasHydratedPageContent = true
+    }
+
+    LaunchedEffect(isContinuousMultiPage, target.pageId, notebookPages) {
+        if (!isContinuousMultiPage) return@LaunchedEffect
+        val activePage = notebookPages.firstOrNull { it.id == target.pageId } ?: return@LaunchedEffect
+        currentPageEntity = activePage
+        pageNumber = activePage.pageIndexInNotebook + 1
+        paperConfig = activePage.pageSizePreset.toPagePaperConfig(
+            canvasMode = activePage.canvasMode,
+            templateType = activePage.templateType
+        )
+    }
+
+    LaunchedEffect(searchUiState.isOpen, continuousSessionManager) {
+        if (searchUiState.isOpen && continuousSessionManager != null) {
+            continuousSessionManager.flushAllJournals()
+        }
     }
 
     LaunchedEffect(target.pageId, historyRevisionTick) {
@@ -2728,73 +3001,164 @@ private fun NotebookPagePane(
         activePageMatch?.matchedSnippet,
         searchUiState.navigateTriggerTick,
         hasHydratedPageContent,
-        viewportSize
+        viewportSize,
+        continuousLayout
     ) {
         val targetRect = activePageMatch?.highlightDocRect ?: return@LaunchedEffect
         if (!hasHydratedPageContent || viewportSize.width <= 0 || viewportSize.height <= 0) {
             return@LaunchedEffect
         }
+        val matchPageId = activePageMatch.pageId
+        val slot = continuousLayout?.slotForPageId(matchPageId)
+        val wsTargetRect = slot?.localRectToWorkspaceRect(targetRect) ?: targetRect
+        if (continuousSessionManager != null && slot != null) {
+            continuousSessionManager.updateActiveFocus(slot.pageIndex)
+        }
         val panned = transformMatrix.centerOnDocRectIfNeeded(
-            targetRect = targetRect,
+            targetRect = wsTargetRect,
             viewportWidthPx = viewportSize.width.toFloat(),
             viewportHeightPx = viewportSize.height.toFloat(),
             forceCenter = false
         )
         if (panned) {
-            dryInkRasterCache.onGestureSettled(transformMatrix.scale)
+            if (continuousSessionManager != null) {
+                for (readyId in continuousSessionManager.readyPageIdsSnapshot()) {
+                    continuousSessionManager.getReadyRuntime(readyId)
+                        ?.dryInkRasterCache
+                        ?.onGestureSettled(transformMatrix.scale)
+                }
+            } else {
+                dryInkRasterCache.onGestureSettled(transformMatrix.scale)
+            }
             syncZoomPercentFromMatrix()
             viewportTransformTick++
             externalDrawTick++
         }
     }
 
-    var switchedWithinWorkspace by remember(target.pageId) { mutableStateOf(false) }
+    var switchedWithinWorkspace by remember(sessionKey) { mutableStateOf(false) }
 
-    DisposableEffect(lifecycleOwner, strokeJournal, target.pageId, benchmarkStrokeCount) {
+    DisposableEffect(lifecycleOwner, sessionKey, benchmarkStrokeCount) {
         if (benchmarkStrokeCount > 0) {
             return@DisposableEffect onDispose {}
         }
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
-                val hadLocalEdits = strokeJournal.consumeLocalMutationsFlag()
-                strokeJournal.flushAndSyncBlocking()
-                BackgroundOcrWorker.enqueueForPage(context, target.pageId)
-                if (hadLocalEdits) {
-                    CloudSyncScheduler.onNotebookExit(
-                        context = context,
-                        database = database,
-                        editedPageId = target.pageId
-                    )
+                val manager = continuousSessionManager
+                if (manager != null) {
+                    val snapshotDirty = synchronized(dirtyContinuousPageIds) {
+                        dirtyContinuousPageIds.toList().also { dirtyContinuousPageIds.clear() }
+                    }
+                    CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+                        manager.flushAllJournals()
+                        val now = System.currentTimeMillis()
+                        for (dirtyId in snapshotDirty) {
+                            database.pageDao().touchPageTimestamp(dirtyId, now)
+                            BackgroundOcrWorker.enqueueForPage(context, dirtyId)
+                        }
+                        if (snapshotDirty.isNotEmpty()) {
+                            CloudSyncScheduler.onNotebookExit(
+                                context = context,
+                                database = database,
+                                editedPageId = snapshotDirty.last()
+                            )
+                        }
+                    }
+                } else {
+                    val journal = strokeJournal ?: return@LifecycleEventObserver
+                    val hadLocalEdits = journal.consumeLocalMutationsFlag()
+                    CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+                        journal.flushAndSync()
+                        BackgroundOcrWorker.enqueueForPage(context, target.pageId)
+                        if (hadLocalEdits) {
+                            CloudSyncScheduler.onNotebookExit(
+                                context = context,
+                                database = database,
+                                editedPageId = target.pageId
+                            )
+                        }
+                    }
                 }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
-            val hadLocalEdits = strokeJournal.consumeLocalMutationsFlag()
-            strokeJournal.closeBlocking(compactBeforeClose = !strokeJournal.isReadOnly)
-            BackgroundOcrWorker.enqueueForPage(context, target.pageId)
-            if (!switchedWithinWorkspace) {
-                CloudSyncScheduler.onNotebookExit(
-                    context = context,
-                    database = if (hadLocalEdits) database else null,
-                    editedPageId = if (hadLocalEdits) target.pageId else null
-                )
+            val manager = continuousSessionManager
+            if (manager != null) {
+                val snapshotDirty = synchronized(dirtyContinuousPageIds) {
+                    dirtyContinuousPageIds.toList().also { dirtyContinuousPageIds.clear() }
+                }
+                CoroutineScope(SupervisorJob() + Dispatchers.IO + NonCancellable).launch {
+                    manager.flushAllJournals()
+                    val now = System.currentTimeMillis()
+                    for (dirtyId in snapshotDirty) {
+                        database.pageDao().touchPageTimestamp(dirtyId, now)
+                        BackgroundOcrWorker.enqueueForPage(context, dirtyId)
+                    }
+                    manager.disposeSuspending()
+                    CloudSyncScheduler.onNotebookExit(
+                        context = context,
+                        database = if (snapshotDirty.isNotEmpty()) database else null,
+                        editedPageId = snapshotDirty.lastOrNull()
+                    )
+                }
+            } else {
+                val journal = strokeJournal ?: return@onDispose
+                val hadLocalEdits = journal.consumeLocalMutationsFlag()
+                val closingPageId = target.pageId
+                val shouldNotifyExit = !switchedWithinWorkspace
+                CoroutineScope(SupervisorJob() + Dispatchers.IO + NonCancellable).launch {
+                    journal.close(compactBeforeClose = !journal.isReadOnly)
+                    BackgroundOcrWorker.enqueueForPage(context, closingPageId)
+                    if (shouldNotifyExit) {
+                        CloudSyncScheduler.onNotebookExit(
+                            context = context,
+                            database = if (hadLocalEdits) database else null,
+                            editedPageId = if (hadLocalEdits) closingPageId else null
+                        )
+                    }
+                }
             }
         }
     }
 
     historyRevisionTick
-    val canUndo = canvasStateHolder.canUndo
-    val canRedo = canvasStateHolder.canRedo
+    hydrationRevisionTick
+    val canUndo = continuousSessionManager?.undoCoordinator?.canUndo ?: canvasStateHolder.canUndo
+    val canRedo = continuousSessionManager?.undoCoordinator?.canRedo ?: canvasStateHolder.canRedo
 
-    fun switchToPage(nextPageId: String) {
+    fun switchToPage(nextPageId: String, targetLocalRect: DocRect? = null) {
+        if (continuousSessionManager != null) {
+            val slot = continuousLayout?.slotForPageId(nextPageId)
+            if (slot != null) {
+                continuousSessionManager.updateActiveFocus(slot.pageIndex)
+                scrollToPageRequestId = nextPageId
+                scrollToPageTargetLocalRect = targetLocalRect
+                scrollToPageRequestTick++
+            } else {
+                pendingScrollAfterLayoutPageId = nextPageId
+            }
+            if (nextPageId != latestTargetPageId) {
+                coroutineScope.launch(Dispatchers.IO) {
+                    database.notebookDao().getNotebookById(target.notebookId)?.let { nb ->
+                        if (nb.lastOpenedPageId != nextPageId) {
+                            database.notebookDao().upsertNotebook(nb.copy(lastOpenedPageId = nextPageId))
+                        }
+                    }
+                }
+                CloudSyncScheduler.onPageTransition(context)
+                onSelectPageTarget(OpenedPageTarget(target.notebookId, nextPageId))
+            }
+            return
+        }
+        val singleJournal = strokeJournal ?: return
         if (nextPageId == target.pageId) return
         switchedWithinWorkspace = true
         coroutineScope.launch {
             withContext(Dispatchers.IO) {
-                val hadLocalEdits = strokeJournal.consumeLocalMutationsFlag()
-                strokeJournal.flushAndSync()
+                val hadLocalEdits = singleJournal.consumeLocalMutationsFlag()
+                singleJournal.flushAndSync()
                 val now = System.currentTimeMillis()
                 if (hadLocalEdits) {
                     database.pageDao().touchPageTimestamp(target.pageId, now)
@@ -2808,20 +3172,27 @@ private fun NotebookPagePane(
         }
     }
 
-    DisposableEffect(target.pageId, hasHydratedPageContent) {
-        if (hasHydratedPageContent) {
+    val bridgeReady = if (isContinuousMultiPage) {
+        hasHydratedPageContent && (continuousSessionManager?.getReadyRuntime(target.pageId) != null)
+    } else {
+        hasHydratedPageContent
+    }
+    DisposableEffect(sessionKey, target.pageId, bridgeReady) {
+        if (bridgeReady) {
+            val activeHolder = continuousSessionManager?.getReadyRuntime(target.pageId)?.canvasStateHolder
+                ?: canvasStateHolder
             onPublishSearchBridge(
                 ActivePageSearchBridge(
                     pageId = target.pageId,
                     liveStrokesProvider = {
-                        SearchTextIndexer.buildSearchablePersistedRecords(canvasStateHolder.allStrokesSorted())
+                        SearchTextIndexer.buildSearchablePersistedRecords(activeHolder.allStrokesSorted())
                     },
-                    liveObjectsProvider = { canvasStateHolder.allPageObjects() },
+                    liveObjectsProvider = { activeHolder.allPageObjects() },
                     livePageTitleProvider = {
                         notebookPages.firstOrNull { it.id == target.pageId }?.title
                             ?: currentPageEntity?.title
                     },
-                    switchPageAction = ::switchToPage
+                    switchPageAction = { nextId -> switchToPage(nextId) }
                 )
             )
         }
@@ -2836,7 +3207,11 @@ private fun NotebookPagePane(
         coroutineScope.launch {
             try {
                 val createdPair = withContext(Dispatchers.IO) {
-                    strokeJournal.flushAndSync()
+                    if (continuousSessionManager != null) {
+                        continuousSessionManager.flushAllJournals()
+                    } else {
+                        strokeJournal?.flushAndSync()
+                    }
                     val now = System.currentTimeMillis()
                     val nb = database.notebookDao().getNotebookById(target.notebookId)
                         ?: return@withContext null
@@ -2888,6 +3263,17 @@ private fun NotebookPagePane(
                     CloudSyncScheduler.onPageTransition(context)
                     onShowLeftPageDrawerChange(false)
                     onShowWorkspaceBanner("${newPageNum}. oldal létrehozva")
+                    if (continuousSessionManager != null) {
+                        val immediateSlot = continuousLayout?.slotForPageId(newPageId)
+                        if (immediateSlot != null) {
+                            continuousSessionManager.updateActiveFocus(immediateSlot.pageIndex)
+                            scrollToPageRequestId = newPageId
+                            scrollToPageTargetLocalRect = null
+                            scrollToPageRequestTick++
+                        } else {
+                            pendingScrollAfterLayoutPageId = newPageId
+                        }
+                    }
                     onSelectPageTarget(OpenedPageTarget(target.notebookId, newPageId))
                 }
             } finally {
@@ -2900,11 +3286,16 @@ private fun NotebookPagePane(
     val currentIdxOneBased = if (activePageIdx >= 0) activePageIdx + 1 else pageNumber
     val totalPageCount = notebookPages.size.coerceAtLeast(currentIdxOneBased)
 
-    var lassoPreviewObjectIds by remember(target.pageId) { mutableStateOf<Set<String>>(emptySet()) }
-    var lassoPreviewDeltaXPt by remember(target.pageId) { mutableFloatStateOf(0f) }
-    var lassoPreviewDeltaYPt by remember(target.pageId) { mutableFloatStateOf(0f) }
-    var lassoPreviewRotationRad by remember(target.pageId) { mutableFloatStateOf(0f) }
-    var lassoPreviewRotationCenter by remember(target.pageId) { mutableStateOf<DocPoint?>(null) }
+    var lassoPreviewPageId by remember(sessionKey) { mutableStateOf<String?>(null) }
+    var lassoPreviewObjectIds by remember(sessionKey) { mutableStateOf<Set<String>>(emptySet()) }
+    var lassoPreviewDeltaXPt by remember(sessionKey) { mutableFloatStateOf(0f) }
+    var lassoPreviewDeltaYPt by remember(sessionKey) { mutableFloatStateOf(0f) }
+    var lassoPreviewRotationRad by remember(sessionKey) { mutableFloatStateOf(0f) }
+    var lassoPreviewRotationCenter by remember(sessionKey) { mutableStateOf<DocPoint?>(null) }
+
+    val fallbackJournalForSingleSurface = strokeJournal ?: remember(sessionKey) {
+        StrokeJournal(pageDirectory = File(context.filesDir, "pages/${target.pageId}"))
+    }
 
     Box(modifier = modifier.fillMaxSize()) {
         StylusDrawingSurface(
@@ -2915,7 +3306,7 @@ private fun NotebookPagePane(
             dryStrokeStore = canvasStateHolder,
             dryInkRasterCache = dryInkRasterCache,
             oledStrokeCache = oledStrokeCache,
-            journalCommitSink = strokeJournal,
+            journalCommitSink = fallbackJournalForSingleSurface,
             onTogglePenEraser = onTogglePenEraser,
             onCanvasStateMutated = {
                 historyRevisionTick++
@@ -2940,10 +3331,12 @@ private fun NotebookPagePane(
             onCanvasTouchStart = {
                 if (selectedObjectId != null) {
                     selectedObjectId = null
+                    selectedObjectPageId = null
                 }
             },
             onNavigationGestureEnd = {
-                if (paperConfig.canvasMode == CanvasMode.FIXED_PAGE &&
+                if (!isContinuousMultiPage &&
+                    paperConfig.canvasMode == CanvasMode.FIXED_PAGE &&
                     benchmarkStrokeCount == 0 &&
                     viewportSize.width > 0 &&
                     viewportSize.height > 0
@@ -2982,17 +3375,18 @@ private fun NotebookPagePane(
             totalPages = totalPageCount,
             initialPagePaddingPx = if (isFullScreenCanvas) 0f else 36f,
             onAiAutoFormatLassoSelection = { selectedIds, onFormatted ->
-                if (selectedIds.isEmpty()) {
+                val binding = resolveBindingForPage(target.pageId)
+                if (selectedIds.isEmpty() || binding == null || binding.isReadOnly) {
                     onFormatted(false)
                 } else {
                     coroutineScope.launch {
                         val selectedRecords = selectedIds.mapNotNull { id ->
-                            canvasStateHolder.getStroke(id)?.let { entry ->
+                            binding.canvasStateHolder.getStroke(id)?.let { entry ->
                                 val strokeColor = entry.stroke.brush.colorIntArgb
                                 StrokeBinarySerializer.fromIndexedDryStroke(
                                     entry = entry,
                                     brushConfig = brushConfig.copy(colorArgb = strokeColor),
-                                    shapeMeta = canvasStateHolder.getShapeMeta(id)
+                                    shapeMeta = binding.canvasStateHolder.getShapeMeta(id)
                                 )
                             }
                         }
@@ -3016,13 +3410,14 @@ private fun NotebookPagePane(
                             val res = HandwritingToLatexConverter.autoFormatLassoSelection(
                                 selectedStrokes = selectedRecords,
                                 geminiClient = geminiClient,
-                                canvasStateHolder = canvasStateHolder,
+                                canvasStateHolder = binding.canvasStateHolder,
                                 context = context,
-                                journalSink = strokeJournal
+                                journalSink = binding.strokeJournal
                             )
                         ) {
                             is LassoAutoFormatResult.Success -> {
                                 selectedObjectId = null
+                                selectedObjectPageId = null
                                 historyRevisionTick++
                                 copilotNoticeBannerHu = res.noticeHu
                                 onFormatted(true)
@@ -3037,8 +3432,115 @@ private fun NotebookPagePane(
             },
             onLassoSelectedObject = { objId ->
                 selectedObjectId = objId
+                selectedObjectPageId = target.pageId
             },
             onLassoObjectPreviewChanged = { ids, dx, dy, rot, center ->
+                lassoPreviewPageId = target.pageId
+                lassoPreviewObjectIds = ids
+                lassoPreviewDeltaXPt = dx
+                lassoPreviewDeltaYPt = dy
+                lassoPreviewRotationRad = rot
+                lassoPreviewRotationCenter = center
+            },
+            multiPageSessionManager = continuousSessionManager,
+            multiPageLayout = continuousLayout,
+            initialPageId = target.pageId,
+            hydrationVersionTick = hydrationRevisionTick,
+            scrollToPageRequestId = scrollToPageRequestId,
+            scrollToPageTargetLocalRect = scrollToPageTargetLocalRect,
+            scrollToPageRequestTick = scrollToPageRequestTick,
+            onActiveSlotChanged = { slot ->
+                if (continuousSessionManager != null) {
+                    continuousSessionManager.updateActiveFocus(slot.pageIndex)
+                    if (slot.pageId != latestTargetPageId) {
+                        coroutineScope.launch(Dispatchers.IO) {
+                            database.notebookDao().getNotebookById(target.notebookId)?.let { nb ->
+                                if (nb.lastOpenedPageId != slot.pageId) {
+                                    database.notebookDao().upsertNotebook(nb.copy(lastOpenedPageId = slot.pageId))
+                                }
+                            }
+                        }
+                        onSelectPageTarget(OpenedPageTarget(target.notebookId, slot.pageId))
+                    }
+                }
+            },
+            onPageMutated = { mutatedPageId ->
+                dirtyContinuousPageIds.add(mutatedPageId)
+                historyRevisionTick++
+                if (benchmarkStrokeCount == 0) {
+                    coroutineScope.launch(Dispatchers.IO) {
+                        database.pageDao().markOcrSyncState(
+                            pageId = mutatedPageId,
+                            needsSync = true,
+                            updatedAtMs = System.currentTimeMillis()
+                        )
+                    }
+                }
+            },
+            onLassoSelectedObjectInPage = { pageId, objId ->
+                selectedObjectId = objId
+                selectedObjectPageId = pageId ?: target.pageId
+            },
+            onAiAutoFormatLassoSelectionInPage = { pageId, selectedIds, onFormatted ->
+                val resolvedPageId = pageId ?: latestTargetPageId
+                val binding = resolveBindingForPage(resolvedPageId)
+                if (selectedIds.isEmpty() || binding == null || binding.isReadOnly) {
+                    onFormatted(false)
+                } else {
+                    coroutineScope.launch {
+                        val selectedRecords = selectedIds.mapNotNull { id ->
+                            binding.canvasStateHolder.getStroke(id)?.let { entry ->
+                                val strokeColor = entry.stroke.brush.colorIntArgb
+                                StrokeBinarySerializer.fromIndexedDryStroke(
+                                    entry = entry,
+                                    brushConfig = brushConfig.copy(colorArgb = strokeColor),
+                                    shapeMeta = binding.canvasStateHolder.getShapeMeta(id)
+                                )
+                            }
+                        }
+                        if (selectedRecords.isEmpty()) {
+                            onFormatted(false)
+                            return@launch
+                        }
+                        val isLocalSingleShape = selectedRecords.size == 1 &&
+                            ShapeRecognizer.recognize(
+                                samples = selectedRecords.first().samples,
+                                requireHoldAtEnd = false,
+                                minConfidence = 0.74f
+                            ) != null
+                        if (!isLocalSingleShape && !consentState.isReadyForUserInitiatedCall) {
+                            onOpenConsentDialog()
+                            onFormatted(false)
+                            return@launch
+                        }
+                        copilotNoticeBannerHu = "AI formázás folyamatban..."
+                        when (
+                            val res = HandwritingToLatexConverter.autoFormatLassoSelection(
+                                selectedStrokes = selectedRecords,
+                                geminiClient = geminiClient,
+                                canvasStateHolder = binding.canvasStateHolder,
+                                context = context,
+                                journalSink = binding.strokeJournal
+                            )
+                        ) {
+                            is LassoAutoFormatResult.Success -> {
+                                dirtyContinuousPageIds.add(resolvedPageId)
+                                selectedObjectId = null
+                                selectedObjectPageId = null
+                                historyRevisionTick++
+                                copilotNoticeBannerHu = res.noticeHu
+                                onFormatted(true)
+                            }
+                            is LassoAutoFormatResult.Failure -> {
+                                copilotNoticeBannerHu = res.messageHu
+                                onFormatted(false)
+                            }
+                        }
+                    }
+                }
+            },
+            onLassoObjectPreviewChangedInPage = { pageId, ids, dx, dy, rot, center ->
+                lassoPreviewPageId = pageId
                 lassoPreviewObjectIds = ids
                 lassoPreviewDeltaXPt = dx
                 lassoPreviewDeltaYPt = dy
@@ -3050,93 +3552,92 @@ private fun NotebookPagePane(
         )
 
         historyRevisionTick
-        val livePageObjects = canvasStateHolder.allPageObjects()
-        if (livePageObjects.isNotEmpty()) {
-            PageObjectsOverlayLayer(
-                pageObjects = livePageObjects,
-                transformMatrix = transformMatrix,
-                isOledMode = isDarkTheme,
-                selectedObjectId = selectedObjectId,
-                onSelectObject = { selectedObjectId = it },
-                onUpdateObject = { updatedObj ->
-                    canvasStateHolder.updatePageObject(updatedObj)
-                    historyRevisionTick++
-                    coroutineScope.launch { strokeJournal.appendUpdateObject(updatedObj) }
-                },
-                onDeleteObject = { objId ->
-                    canvasStateHolder.removePageObject(objId)
-                    if (selectedObjectId == objId) selectedObjectId = null
-                    historyRevisionTick++
-                    coroutineScope.launch { strokeJournal.appendRemoveObject(objId) }
-                },
-                onRestoreOriginalStrokes = { targetObj ->
-                    val sourceRecords = when (targetObj) {
-                        is PageObject.LatexObject -> targetObj.originalStrokes
-                        is PageObject.FormattedTextObject -> targetObj.originalStrokes
-                        else -> emptyList()
-                    }
-                    if (sourceRecords.isNotEmpty()) {
-                        val pairs = sourceRecords.map { rec ->
-                            val (entry, _) = StrokeBinarySerializer.toIndexedDryStroke(rec)
-                            rec to entry
-                        }
-                        val metaMap = sourceRecords.mapNotNull { rec ->
-                            rec.shapeMeta?.let { meta -> rec.id to meta }
-                        }.toMap()
-                        val (dirtyBounds, insertedEntries) = canvasStateHolder.restoreObjectToOriginalStrokes(
-                            objectId = targetObj.id,
-                            restoredEntries = pairs.map { it.second },
-                            shapeMetas = metaMap
-                        )
-                        if (insertedEntries.isNotEmpty()) {
-                            val insertedById = insertedEntries.associateBy { it.id }
-                            val journalRecords = pairs.map { (rec, _) ->
-                                val finalEntry = insertedById[rec.id]
-                                if (finalEntry != null) rec.copy(zOrder = finalEntry.zIndex) else rec
-                            }
-                            dirtyBounds?.let { dryInkRasterCache.invalidateDocRect(it) }
-                            if (selectedObjectId == targetObj.id) selectedObjectId = null
+        hydrationRevisionTick
+        if (continuousSessionManager != null && continuousLayout != null) {
+            for (slot in continuousLayout.slots) {
+                val runtime = continuousSessionManager.getReadyRuntime(slot.pageId) ?: continue
+                val slotObjects = runtime.canvasStateHolder.allPageObjects()
+                if (slotObjects.isEmpty()) continue
+                key(slot.pageId) {
+                    val slotBinding = ActivePageBinding(
+                        pageId = slot.pageId,
+                        pageIndex = slot.pageIndex,
+                        originXPt = slot.leftPt,
+                        originYPt = slot.topPt,
+                        canvasStateHolder = runtime.canvasStateHolder,
+                        strokeJournal = runtime.strokeJournal,
+                        dryInkRasterCache = runtime.dryInkRasterCache,
+                        isReadOnly = runtime.isReadOnly
+                    )
+                    BoundPageObjectsOverlay(
+                        binding = slotBinding,
+                        pageObjects = slotObjects,
+                        transformMatrix = transformMatrix,
+                        isOledMode = isDarkTheme,
+                        selectedObjectId = if (selectedObjectPageId == slot.pageId) selectedObjectId else null,
+                        onSelectObject = { objId ->
+                            selectedObjectId = objId
+                            selectedObjectPageId = if (objId != null) slot.pageId else null
+                        },
+                        consentState = consentState,
+                        onOpenConsentDialog = onOpenConsentDialog,
+                        geminiClient = geminiClient,
+                        coroutineScope = coroutineScope,
+                        onStepByStepFailure = { copilotNoticeBannerHu = it },
+                        onMutated = {
+                            dirtyContinuousPageIds.add(slot.pageId)
                             historyRevisionTick++
-                            coroutineScope.launch {
-                                strokeJournal.appendRemoveObject(targetObj.id)
-                                strokeJournal.appendAddStrokes(journalRecords)
-                            }
-                        }
-                    }
-                },
-                onRequestStepByStep = { latexObj ->
-                    if (!consentState.isReadyForUserInitiatedCall) {
-                        onOpenConsentDialog()
-                    } else {
-                        coroutineScope.launch {
-                            HandwritingToLatexConverter.generateStepByStepDerivationCard(
-                                latexObject = latexObj,
-                                geminiClient = geminiClient,
-                                canvasStateHolder = canvasStateHolder,
-                                journalSink = strokeJournal
-                            ).onSuccess {
-                                historyRevisionTick++
-                            }.onFailure { err ->
-                                copilotNoticeBannerHu = err.message ?: "Sikertelen levezetés."
-                            }
-                        }
-                    }
-                },
-                lassoPreviewObjectIds = lassoPreviewObjectIds,
-                lassoPreviewDeltaXPt = lassoPreviewDeltaXPt,
-                lassoPreviewDeltaYPt = lassoPreviewDeltaYPt,
-                lassoPreviewRotationRadians = lassoPreviewRotationRad,
-                lassoPreviewRotationCenter = lassoPreviewRotationCenter,
-                viewportTransformTick = viewportTransformTick,
-                modifier = Modifier.fillMaxSize()
-            )
+                        },
+                        lassoPreviewObjectIds = if (lassoPreviewPageId == slot.pageId) {
+                            lassoPreviewObjectIds
+                        } else {
+                            emptySet()
+                        },
+                        lassoPreviewDeltaXPt = lassoPreviewDeltaXPt,
+                        lassoPreviewDeltaYPt = lassoPreviewDeltaYPt,
+                        lassoPreviewRotationRadians = lassoPreviewRotationRad,
+                        lassoPreviewRotationCenter = lassoPreviewRotationCenter,
+                        viewportTransformTick = viewportTransformTick
+                    )
+                }
+            }
+        } else {
+            val singleBinding = resolveBindingForPage(target.pageId)
+            val livePageObjects = canvasStateHolder.allPageObjects()
+            if (singleBinding != null && livePageObjects.isNotEmpty()) {
+                BoundPageObjectsOverlay(
+                    binding = singleBinding,
+                    pageObjects = livePageObjects,
+                    transformMatrix = transformMatrix,
+                    isOledMode = isDarkTheme,
+                    selectedObjectId = selectedObjectId,
+                    onSelectObject = { objId ->
+                        selectedObjectId = objId
+                        selectedObjectPageId = if (objId != null) target.pageId else null
+                    },
+                    consentState = consentState,
+                    onOpenConsentDialog = onOpenConsentDialog,
+                    geminiClient = geminiClient,
+                    coroutineScope = coroutineScope,
+                    onStepByStepFailure = { copilotNoticeBannerHu = it },
+                    onMutated = { historyRevisionTick++ },
+                    lassoPreviewObjectIds = lassoPreviewObjectIds,
+                    lassoPreviewDeltaXPt = lassoPreviewDeltaXPt,
+                    lassoPreviewDeltaYPt = lassoPreviewDeltaYPt,
+                    lassoPreviewRotationRadians = lassoPreviewRotationRad,
+                    lassoPreviewRotationCenter = lassoPreviewRotationCenter,
+                    viewportTransformTick = viewportTransformTick
+                )
+            }
         }
 
         val highlightRect = activePageMatch?.highlightDocRect
         if (highlightRect != null) {
             viewportTransformTick
+            val matchSlot = continuousLayout?.slotForPageId(activePageMatch.pageId)
+            val wsHighlightRect = matchSlot?.localRectToWorkspaceRect(highlightRect) ?: highlightRect
             SearchHighlightCanvasOverlay(
-                highlightDocRect = highlightRect,
+                highlightDocRect = wsHighlightRect,
                 transformSnapshot = transformMatrix.snapshot(),
                 isOledMode = palette.isOledDeepBlack,
                 modifier = Modifier
@@ -3286,7 +3787,12 @@ private fun NotebookPagePane(
             }
         }
 
-        if (isReadOnlyPage) {
+        val activePageIsReadOnly = if (isContinuousMultiPage) {
+            continuousSessionManager?.getReadyRuntime(target.pageId)?.isReadOnly == true
+        } else {
+            isReadOnlyPage
+        }
+        if (activePageIsReadOnly) {
             Surface(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -3305,6 +3811,52 @@ private fun NotebookPagePane(
         }
 
         fun applyHistoryTransition(isUndo: Boolean) {
+            val manager = continuousSessionManager
+            if (manager != null) {
+                coroutineScope.launch {
+                    historyMutex.withLock {
+                        val res = if (isUndo) {
+                            manager.applyUndo()
+                        } else {
+                            manager.applyRedo()
+                        } ?: return@withLock
+                        val runtime = manager.getReadyRuntime(res.pageId)
+                        if (selectedObjectId != null &&
+                            selectedObjectPageId == res.pageId &&
+                            runtime?.canvasStateHolder?.getPageObject(selectedObjectId!!) == null
+                        ) {
+                            selectedObjectId = null
+                            selectedObjectPageId = null
+                        }
+                        if (!res.isReadOnly) {
+                            dirtyContinuousPageIds.add(res.pageId)
+                            coroutineScope.launch(Dispatchers.IO) {
+                                database.pageDao().markOcrSyncState(
+                                    pageId = res.pageId,
+                                    needsSync = true,
+                                    updatedAtMs = System.currentTimeMillis()
+                                )
+                                CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
+                            }
+                        }
+                        if (res.didRehydratePage || res.pageId != latestTargetPageId) {
+                            val slot = continuousLayout?.slotForPageId(res.pageId)
+                            if (slot != null) {
+                                manager.updateActiveFocus(slot.pageIndex)
+                            }
+                            scrollToPageRequestId = res.pageId
+                            scrollToPageTargetLocalRect = res.affectedBoundsLocal
+                            scrollToPageRequestTick++
+                            onSelectPageTarget(OpenedPageTarget(target.notebookId, res.pageId))
+                        }
+                        externalDrawTick++
+                        historyRevisionTick++
+                    }
+                }
+                return
+            }
+
+            val singleJournal = strokeJournal ?: return
             val outcome = if (isUndo) {
                 canvasStateHolder.undoWithAction()
             } else {
@@ -3314,12 +3866,13 @@ private fun NotebookPagePane(
             outcome.affectedBounds?.let { dryInkRasterCache.invalidateDocRect(it) }
             if (selectedObjectId != null && canvasStateHolder.getPageObject(selectedObjectId!!) == null) {
                 selectedObjectId = null
+                selectedObjectPageId = null
             }
             if (!isReadOnlyPage) {
                 if (isUndo) {
-                    strokeJournal.enqueueCanvasActionInverse(action)
+                    singleJournal.enqueueCanvasActionInverse(action)
                 } else {
-                    strokeJournal.enqueueCanvasActionForward(action)
+                    singleJournal.enqueueCanvasActionForward(action)
                 }
                 coroutineScope.launch(Dispatchers.IO) {
                     database.pageDao().markOcrSyncState(
@@ -3392,36 +3945,45 @@ private fun NotebookPagePane(
                 viewportSize = viewportSize,
                 onInsertShape = { shapeType, strokeWidthPt, strokeColorArgb, hasFill ->
                     onUpdateShapeDefaults(strokeWidthPt, strokeColorArgb, hasFill)
-                    val centerDoc = viewportCenterDocPoint()
-                    val defaultHalfW = if (
-                        shapeType == GeometricShapeType.LINE ||
-                        shapeType == GeometricShapeType.ARROW ||
-                        shapeType == GeometricShapeType.DOUBLE_ARROW
-                    ) 95f else 68f
-                    val defaultHalfH = if (
-                        shapeType == GeometricShapeType.LINE ||
-                        shapeType == GeometricShapeType.ARROW ||
-                        shapeType == GeometricShapeType.DOUBLE_ARROW
-                    ) 24f else 68f
-                    val shapeObj = PageObject.GeometricShapeObject(
-                        id = UUID.randomUUID().toString(),
-                        zOrder = canvasStateHolder.allocateObjectZOrder(),
-                        bounds = DocRect(
-                            leftPt = centerDoc.xPt - defaultHalfW,
-                            topPt = centerDoc.yPt - defaultHalfH,
-                            rightPt = centerDoc.xPt + defaultHalfW,
-                            bottomPt = centerDoc.yPt + defaultHalfH
-                        ),
-                        shapeType = shapeType,
-                        strokeWidthPt = strokeWidthPt,
-                        canonicalStrokeColorArgb = strokeColorArgb,
-                        hasFill = hasFill,
-                        canonicalFillColorArgb = (strokeColorArgb and 0x00FFFFFF) or 0x28000000
-                    )
-                    canvasStateHolder.addPageObject(shapeObj)
-                    coroutineScope.launch { strokeJournal.appendAddObject(shapeObj) }
-                    selectedObjectId = shapeObj.id
-                    historyRevisionTick++
+                    val binding = resolveViewportTargetBinding()
+                    if (binding != null && !binding.isReadOnly) {
+                        val centerWs = viewportCenterWorkspacePoint()
+                        val centerDoc = DocPoint(
+                            xPt = centerWs.xPt - binding.originXPt,
+                            yPt = centerWs.yPt - binding.originYPt
+                        )
+                        val defaultHalfW = if (
+                            shapeType == GeometricShapeType.LINE ||
+                            shapeType == GeometricShapeType.ARROW ||
+                            shapeType == GeometricShapeType.DOUBLE_ARROW
+                        ) 95f else 68f
+                        val defaultHalfH = if (
+                            shapeType == GeometricShapeType.LINE ||
+                            shapeType == GeometricShapeType.ARROW ||
+                            shapeType == GeometricShapeType.DOUBLE_ARROW
+                        ) 24f else 68f
+                        val shapeObj = PageObject.GeometricShapeObject(
+                            id = UUID.randomUUID().toString(),
+                            zOrder = binding.canvasStateHolder.allocateObjectZOrder(),
+                            bounds = DocRect(
+                                leftPt = centerDoc.xPt - defaultHalfW,
+                                topPt = centerDoc.yPt - defaultHalfH,
+                                rightPt = centerDoc.xPt + defaultHalfW,
+                                bottomPt = centerDoc.yPt + defaultHalfH
+                            ),
+                            shapeType = shapeType,
+                            strokeWidthPt = strokeWidthPt,
+                            canonicalStrokeColorArgb = strokeColorArgb,
+                            hasFill = hasFill,
+                            canonicalFillColorArgb = (strokeColorArgb and 0x00FFFFFF) or 0x28000000
+                        )
+                        binding.canvasStateHolder.addPageObject(shapeObj)
+                        coroutineScope.launch { binding.strokeJournal.appendAddObject(shapeObj) }
+                        dirtyContinuousPageIds.add(binding.pageId)
+                        selectedObjectId = shapeObj.id
+                        selectedObjectPageId = binding.pageId
+                        historyRevisionTick++
+                    }
                 },
                 onDismiss = { showShapePicker = false }
             )
@@ -3526,6 +4088,115 @@ private fun NotebookPagePane(
             )
         }
     }
+}
+
+@Composable
+private fun BoundPageObjectsOverlay(
+    binding: ActivePageBinding,
+    pageObjects: List<PageObject>,
+    transformMatrix: CanvasTransformMatrix,
+    isOledMode: Boolean,
+    selectedObjectId: String?,
+    onSelectObject: (String?) -> Unit,
+    consentState: AiConsentState,
+    onOpenConsentDialog: () -> Unit,
+    geminiClient: GeminiClient,
+    coroutineScope: CoroutineScope,
+    onStepByStepFailure: (String) -> Unit,
+    onMutated: () -> Unit,
+    lassoPreviewObjectIds: Set<String>,
+    lassoPreviewDeltaXPt: Float,
+    lassoPreviewDeltaYPt: Float,
+    lassoPreviewRotationRadians: Float,
+    lassoPreviewRotationCenter: DocPoint?,
+    viewportTransformTick: Long
+) {
+    PageObjectsOverlayLayer(
+        pageObjects = pageObjects,
+        transformMatrix = transformMatrix,
+        isOledMode = isOledMode,
+        selectedObjectId = selectedObjectId,
+        onSelectObject = onSelectObject,
+        onUpdateObject = { updatedObj ->
+            if (!binding.isReadOnly) {
+                binding.canvasStateHolder.updatePageObject(updatedObj)
+                onMutated()
+                coroutineScope.launch { binding.strokeJournal.appendUpdateObject(updatedObj) }
+            }
+        },
+        onDeleteObject = { objId ->
+            if (!binding.isReadOnly) {
+                binding.canvasStateHolder.removePageObject(objId)
+                if (selectedObjectId == objId) onSelectObject(null)
+                onMutated()
+                coroutineScope.launch { binding.strokeJournal.appendRemoveObject(objId) }
+            }
+        },
+        onRestoreOriginalStrokes = { targetObj ->
+            if (!binding.isReadOnly) {
+                val sourceRecords = when (targetObj) {
+                    is PageObject.LatexObject -> targetObj.originalStrokes
+                    is PageObject.FormattedTextObject -> targetObj.originalStrokes
+                    else -> emptyList()
+                }
+                if (sourceRecords.isNotEmpty()) {
+                    val pairs = sourceRecords.map { rec ->
+                        val (entry, _) = StrokeBinarySerializer.toIndexedDryStroke(rec)
+                        rec to entry
+                    }
+                    val metaMap = sourceRecords.mapNotNull { rec ->
+                        rec.shapeMeta?.let { meta -> rec.id to meta }
+                    }.toMap()
+                    val (dirtyBounds, insertedEntries) = binding.canvasStateHolder.restoreObjectToOriginalStrokes(
+                        objectId = targetObj.id,
+                        restoredEntries = pairs.map { it.second },
+                        shapeMetas = metaMap
+                    )
+                    if (insertedEntries.isNotEmpty()) {
+                        val insertedById = insertedEntries.associateBy { it.id }
+                        val journalRecords = pairs.map { (rec, _) ->
+                            val finalEntry = insertedById[rec.id]
+                            if (finalEntry != null) rec.copy(zOrder = finalEntry.zIndex) else rec
+                        }
+                        dirtyBounds?.let { binding.dryInkRasterCache.invalidateDocRect(it) }
+                        if (selectedObjectId == targetObj.id) onSelectObject(null)
+                        onMutated()
+                        coroutineScope.launch {
+                            binding.strokeJournal.appendRemoveObject(targetObj.id)
+                            binding.strokeJournal.appendAddStrokes(journalRecords)
+                        }
+                    }
+                }
+            }
+        },
+        onRequestStepByStep = { latexObj ->
+            if (!consentState.isReadyForUserInitiatedCall) {
+                onOpenConsentDialog()
+            } else if (!binding.isReadOnly) {
+                coroutineScope.launch {
+                    HandwritingToLatexConverter.generateStepByStepDerivationCard(
+                        latexObject = latexObj,
+                        geminiClient = geminiClient,
+                        canvasStateHolder = binding.canvasStateHolder,
+                        journalSink = binding.strokeJournal
+                    ).onSuccess {
+                        onMutated()
+                    }.onFailure { err ->
+                        onStepByStepFailure(err.message ?: "Sikertelen levezetés.")
+                    }
+                }
+            }
+        },
+        lassoPreviewObjectIds = lassoPreviewObjectIds,
+        lassoPreviewDeltaXPt = lassoPreviewDeltaXPt,
+        lassoPreviewDeltaYPt = lassoPreviewDeltaYPt,
+        lassoPreviewRotationRadians = lassoPreviewRotationRadians,
+        lassoPreviewRotationCenter = lassoPreviewRotationCenter,
+        viewportTransformTick = viewportTransformTick,
+        pageOriginXPt = binding.originXPt,
+        pageOriginYPt = binding.originYPt,
+        modifier = Modifier.fillMaxSize()
+    )
 }
 
 @Composable

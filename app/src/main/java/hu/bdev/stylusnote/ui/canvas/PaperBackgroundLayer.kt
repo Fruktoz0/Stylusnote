@@ -5,8 +5,11 @@ import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Typeface
 import androidx.compose.ui.graphics.toArgb
+import androidx.core.graphics.withSave
 import hu.bdev.stylusnote.core.math.CanvasTransformMatrix
+import hu.bdev.stylusnote.core.math.ContinuousPageLayout
 import hu.bdev.stylusnote.core.math.DocRect
+import hu.bdev.stylusnote.core.math.PageLayoutSlot
 import hu.bdev.stylusnote.domain.model.CanvasMode
 import hu.bdev.stylusnote.domain.model.PagePaperConfig
 import hu.bdev.stylusnote.domain.model.PaperTemplateType
@@ -256,6 +259,85 @@ object PaperBackgroundRenderer {
                 adjacentLabelPaint
             )
         }
+    }
+
+    /**
+     * Renders a single fixed-page sheet inside [ContinuousPageLayout] at `(slot.leftPt, slot.topPt)`
+     * in Layer 1 vector space with exact zoom-compensated stroke widths.
+     */
+    @Synchronized
+    fun drawContinuousSlotBackground(
+        canvas: Canvas,
+        viewportWidthPx: Int,
+        viewportHeightPx: Int,
+        transformMatrix: CanvasTransformMatrix,
+        slot: PageLayoutSlot,
+        palette: StylusSurfacePalette
+    ) {
+        if (viewportWidthPx <= 0 || viewportHeightPx <= 0) return
+
+        val snap = transformMatrix.snapshot()
+        val scale = snap.scale.coerceAtLeast(0.05f)
+        val visibleWorkspaceRect = transformMatrix.screenRectToDocRect(
+            leftPx = 0f,
+            topPx = 0f,
+            rightPx = viewportWidthPx.toFloat(),
+            bottomPx = viewportHeightPx.toFloat()
+        )
+        val localVisible = DocRect(
+            leftPt = max(0f, visibleWorkspaceRect.leftPt - slot.leftPt),
+            topPt = max(0f, visibleWorkspaceRect.topPt - slot.topPt),
+            rightPt = min(slot.widthPt, visibleWorkspaceRect.rightPt - slot.leftPt),
+            bottomPt = min(slot.heightPt, visibleWorkspaceRect.bottomPt - slot.topPt)
+        )
+        val localBounds = DocRect(0f, 0f, slot.widthPt, slot.heightPt)
+
+        configurePaints(scale = scale, palette = palette)
+        transformMatrix.populateDocToScreenMatrix(docToScreenMatrix)
+        canvas.withSave {
+            concat(docToScreenMatrix)
+            translate(slot.leftPt, slot.topPt)
+            drawFixedSheetBackgroundAndTemplate(
+                canvas = this,
+                drawBounds = localBounds,
+                clippedRect = localVisible,
+                scale = scale,
+                paperConfig = slot.config
+            )
+        }
+    }
+
+    /**
+     * Draws a crisp screen-space page indicator ("2 / 9") centered in the gap above each sheet
+     * (or cleanly above page 1 when zoomed) without modifying or overlapping sheet contents.
+     */
+    @Synchronized
+    fun drawContinuousPageGapLabel(
+        canvas: Canvas,
+        viewportWidthPx: Int,
+        viewportHeightPx: Int,
+        transformMatrix: CanvasTransformMatrix,
+        slot: PageLayoutSlot,
+        totalPages: Int,
+        gapPt: Float,
+        palette: StylusSurfacePalette
+    ) {
+        if (totalPages <= 1 || viewportWidthPx <= 0 || viewportHeightPx <= 0) return
+        val labelWorkspaceYPt = slot.topPt - gapPt * 0.5f
+        val screenCenter = transformMatrix.docToScreen(slot.centerXPt, labelWorkspaceYPt)
+        if (screenCenter.yPx < -32f || screenCenter.yPx > viewportHeightPx + 32f) return
+
+        val density = canvas.density.takeIf { it > 0 }?.div(160f) ?: 1.5f
+        adjacentLabelPaint.textSize = 11f * density
+        adjacentLabelPaint.color = if (palette.isOledDeepBlack) 0xFF8B94A6.toInt() else 0xFF6B778C.toInt()
+        val fm = adjacentLabelPaint.fontMetrics
+        val baselineOffset = -(fm.ascent + fm.descent) * 0.5f
+        canvas.drawText(
+            "${slot.pageIndex + 1} / $totalPages",
+            screenCenter.xPx,
+            screenCenter.yPx + baselineOffset,
+            adjacentLabelPaint
+        )
     }
 
     /**
