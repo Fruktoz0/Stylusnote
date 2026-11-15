@@ -14,6 +14,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
+import java.net.SocketTimeoutException
 import java.util.Base64
 
 class GeminiClientAndCatalogTest {
@@ -78,33 +79,33 @@ class GeminiClientAndCatalogTest {
     }
 
     @Test
-    fun modelCatalogSelectsNewestFlashAndExcludesRetiredGemini25Flash() {
+    fun modelCatalogPrioritizesActiveFlashModelsAndExcludesSpecializedOrLegacyVariants() {
         val sampleModelsJson = """
             {
               "models": [
+                {
+                  "name": "models/gemini-1.0-pro",
+                  "displayName": "Gemini 1.0 Pro",
+                  "supportedGenerationMethods": ["generateContent"]
+                },
+                {
+                  "name": "models/gemini-2.0-flash",
+                  "displayName": "Gemini 2.0 Flash",
+                  "supportedGenerationMethods": ["generateContent"]
+                },
+                {
+                  "name": "models/gemini-2.5-flash-preview-tts",
+                  "displayName": "Gemini 2.5 Flash TTS",
+                  "supportedGenerationMethods": ["generateContent"]
+                },
                 {
                   "name": "models/gemini-2.5-flash",
                   "displayName": "Gemini 2.5 Flash",
                   "supportedGenerationMethods": ["generateContent"]
                 },
                 {
-                  "name": "models/gemini-3.0-flash",
-                  "displayName": "Gemini 3.0 Flash",
-                  "supportedGenerationMethods": ["generateContent"]
-                },
-                {
-                  "name": "models/gemini-3.8-flash-preview",
-                  "displayName": "Gemini 3.8 Flash Preview",
-                  "supportedGenerationMethods": ["generateContent"]
-                },
-                {
-                  "name": "models/gemini-3.8-flash",
-                  "displayName": "Gemini 3.8 Flash",
-                  "supportedGenerationMethods": ["generateContent"]
-                },
-                {
-                  "name": "models/gemini-3.8-pro",
-                  "displayName": "Gemini 3.8 Pro",
+                  "name": "models/gemini-2.5-pro",
+                  "displayName": "Gemini 2.5 Pro",
                   "supportedGenerationMethods": ["generateContent"]
                 }
               ]
@@ -112,21 +113,88 @@ class GeminiClientAndCatalogTest {
         """.trimIndent()
 
         val parsed = ModelCatalog.parseModelsListJson(sampleModelsJson)
-        val retired25 = parsed.first { it.id == "gemini-2.5-flash" }
-        assertTrue("gemini-2.5-flash must be flagged as retired", retired25.isRetired)
+        val retired10 = parsed.first { it.id == "gemini-1.0-pro" }
+        assertTrue("gemini-1.0-pro must be flagged as retired", retired10.isRetired)
 
         val autoSelection = ModelCatalog.selectBestFlashModel(parsed, userOverrideId = null)
-        assertEquals("gemini-3.8-flash", autoSelection.selectedModelId)
+        assertEquals("gemini-2.5-flash", autoSelection.selectedModelId)
         assertNull(autoSelection.retiredModelNoticeHu)
-        assertFalse(autoSelection.availableFlashModels.any { it.id == "gemini-2.5-flash" })
-        assertFalse(autoSelection.availableFlashModels.any { it.id == "gemini-3.8-pro" })
+        assertTrue(autoSelection.availableFlashModels.any { it.id == "gemini-2.5-flash" })
+        assertTrue(autoSelection.availableFlashModels.any { it.id == "gemini-2.0-flash" })
+        assertFalse(autoSelection.availableFlashModels.any { it.id == "gemini-2.5-flash-preview-tts" })
+        assertFalse(autoSelection.availableFlashModels.any { it.id == "gemini-2.5-pro" })
 
         val overrideRetired = ModelCatalog.selectBestFlashModel(
             models = parsed,
-            userOverrideId = "models/gemini-2.5-flash"
+            userOverrideId = "models/gemini-1.0-pro"
         )
-        assertEquals("gemini-3.8-flash", overrideRetired.selectedModelId)
+        assertEquals("gemini-2.5-flash", overrideRetired.selectedModelId)
         assertNotNull(overrideRetired.retiredModelNoticeHu)
+    }
+
+    @Test
+    fun automaticModeFailsOverAcrossTimeoutAnd503ToNextFlashModel() = runBlocking {
+        val storage = InMemoryAiSettingsStorage()
+        val consentStore = AiConsentStore(storage, JvmAesGcmCipher(), clockNowMs = { 10_000L })
+        consentStore.saveApiKey("AIzaSyFailoverTestKey")
+        consentStore.recordConsentAccepted(enableAi = true)
+
+        var nowMs = 2_000_000L
+        val attemptedModels = mutableListOf<String>()
+
+        val interceptor = Interceptor { chain ->
+            val req = chain.request()
+            val path = req.url.encodedPath
+            if (path.endsWith("/v1beta/models")) {
+                return@Interceptor Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(503)
+                    .message("Catalog temporary unavailable")
+                    .body("""{"error":{"message":"unavailable"}}""".toResponseBody("application/json".toMediaType()))
+                    .build()
+            }
+
+            attemptedModels += path
+            when {
+                path.contains("gemini-2.5-flash:") -> throw SocketTimeoutException("Simulated 60s timeout")
+                path.contains("gemini-2.0-flash") -> Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(503)
+                    .message("Overloaded")
+                    .body("""{"error":{"message":"Model overloaded"}}""".toResponseBody("application/json".toMediaType()))
+                    .build()
+                else -> Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body("""{"candidates":[{"content":{"parts":[{"text":"OK válasz"}]}}]}""".toResponseBody("application/json".toMediaType()))
+                    .build()
+            }
+        }
+
+        val httpClient = OkHttpClient.Builder().addInterceptor(interceptor).build()
+        val catalog = ModelCatalog(httpClient = httpClient, clockNowMs = { nowMs })
+        val client = GeminiClient(
+            consentStore = consentStore,
+            modelCatalog = catalog,
+            httpClient = httpClient,
+            minRequestIntervalMs = 0L,
+            clockNowMs = { nowMs },
+            delayMs = { ms -> nowMs += ms }
+        )
+
+        val response = client.generateContent(
+            trigger = UserInitiatedAiTrigger.HANDWRITING_TO_MARKDOWN,
+            promptText = "Format text"
+        )
+
+        assertEquals("OK válasz", response.text)
+        assertEquals("gemini-2.5-flash-lite", response.modelIdUsed)
+        assertNotNull(response.modelSwitchedNoticeHu)
+        assertTrue(attemptedModels.size == 3)
     }
 
     @Test

@@ -13,6 +13,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.util.Base64
+import java.util.concurrent.TimeUnit
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -68,7 +69,7 @@ data class GeminiResponse(
 class GeminiClient(
     private val consentStore: AiConsentStore,
     private val modelCatalog: ModelCatalog = ModelCatalog(),
-    private val httpClient: OkHttpClient = OkHttpClient(),
+    private val httpClient: OkHttpClient = defaultGeminiHttpClient(),
     private val baseUrl: String = ModelCatalog.DEFAULT_BASE_URL,
     private val minRequestIntervalMs: Long = DEFAULT_MIN_REQUEST_INTERVAL_MS,
     private val maxRequestsPerMinute: Int = DEFAULT_MAX_REQUESTS_PER_MINUTE,
@@ -115,111 +116,162 @@ class GeminiClient(
                 "Nincs beállítva saját Google AI Studio (BYOK) API-kulcs."
             )
 
-        var resolution = modelCatalog.resolveActiveFlashModel(
+        val (initialCandidates, initialNotice) = modelCatalog.buildCandidateFlashModelChain(
             apiKey = apiKey,
             userOverrideId = state.selectedModelIdOverride
         )
-        var activeModelId = resolution.selectedModelId
-        var switchNotice = resolution.retiredModelNoticeHu
-        var handled404Switch = false
+        val candidateQueue = ArrayDeque<String>(initialCandidates)
+        val triedModels = LinkedHashSet<String>()
+        var switchNotice = initialNotice
+        var catalogRefreshedOnFailure = false
+        var firstFailedModelId: String? = null
+        var lastFailure: Throwable? = null
 
-        var attempt429 = 0
-        while (true) {
-            acquireRateLimitSlot()
+        val payloadJson = buildGenerateContentRequestJson(
+            promptText = promptText,
+            inlinePngImages = inlinePngImages,
+            responseMimeType = responseMimeType,
+            responseSchemaJson = responseSchemaJson,
+            systemInstruction = systemInstruction,
+            temperature = temperature
+        )
 
-            val payloadJson = buildGenerateContentRequestJson(
-                promptText = promptText,
-                inlinePngImages = inlinePngImages,
-                responseMimeType = responseMimeType,
-                responseSchemaJson = responseSchemaJson,
-                systemInstruction = systemInstruction,
-                temperature = temperature
-            )
-            val endpoint = "${baseUrl.trimEnd('/')}/v1beta/models/$activeModelId:generateContent"
-            val request = Request.Builder()
-                .url(endpoint)
-                .header("x-goog-api-key", apiKey)
-                .header("Content-Type", "application/json; charset=utf-8")
-                .post(payloadJson.toRequestBody(JSON_MEDIA_TYPE))
-                .build()
+        while (candidateQueue.isNotEmpty()) {
+            val activeModelId = candidateQueue.removeFirst()
+            if (!triedModels.add(activeModelId)) continue
 
-            val result = withContext(Dispatchers.IO) {
-                httpClient.newCall(request).execute().use { response ->
-                    val statusCode = response.code
-                    val retryAfterHeader = response.header("Retry-After")
-                    val bodyText = response.body?.string().orEmpty()
-                    HttpCallOutcome(statusCode, retryAfterHeader, bodyText)
+            var attempt429 = 0
+            while (true) {
+                acquireRateLimitSlot()
+
+                val endpoint = "${baseUrl.trimEnd('/')}/v1beta/models/$activeModelId:generateContent"
+                val request = Request.Builder()
+                    .url(endpoint)
+                    .header("x-goog-api-key", apiKey)
+                    .header("Content-Type", "application/json; charset=utf-8")
+                    .post(payloadJson.toRequestBody(JSON_MEDIA_TYPE))
+                    .build()
+
+                val result = try {
+                    withContext(Dispatchers.IO) {
+                        httpClient.newCall(request).execute().use { response ->
+                            val statusCode = response.code
+                            val retryAfterHeader = response.header("Retry-After")
+                            val bodyText = response.body?.string().orEmpty()
+                            HttpCallOutcome(statusCode, retryAfterHeader, bodyText)
+                        }
+                    }
+                } catch (ioe: IOException) {
+                    lastFailure = ioe
+                    if (firstFailedModelId == null) firstFailedModelId = activeModelId
+                    break
                 }
-            }
 
-            when {
-                result.statusCode in 200..299 -> {
-                    val parsed = parseGenerateContentResponse(result.bodyText, promptText, inlinePngImages)
-                    consentStore.incrementUsageCounters(
-                        requestsDelta = 1,
-                        tokensDelta = parsed.promptTokensEstimate
-                    )
-                    return GeminiResponse(
-                        text = parsed.text,
-                        modelIdUsed = activeModelId,
-                        modelSwitchedNoticeHu = switchNotice,
-                        promptTokensEstimate = parsed.promptTokensEstimate
-                    )
-                }
+                when {
+                    result.statusCode in 200..299 -> {
+                        val parsed = try {
+                            parseGenerateContentResponse(result.bodyText, promptText, inlinePngImages).also {
+                                if (it.text.isBlank()) {
+                                    throw GeminiHttpException(502, "Üres AI szövegválasz érkezett ($activeModelId).")
+                                }
+                            }
+                        } catch (parseErr: GeminiHttpException) {
+                            lastFailure = parseErr
+                            if (firstFailedModelId == null) firstFailedModelId = activeModelId
+                            break
+                        }
 
-                result.statusCode == 404 && !handled404Switch -> {
-                    handled404Switch = true
-                    val updated = modelCatalog.onModelNotFound(
-                        retiredModelId = activeModelId,
-                        apiKey = apiKey,
-                        aiConsentStore = consentStore
-                    )
-                    if (updated.selectedModelId == activeModelId) {
-                        throw GeminiModelRetiredException(
-                            retiredModelId = activeModelId,
-                            replacementModelId = null,
-                            message = "A(z) '$activeModelId' modell nem érhető el (HTTP 404), és nincs tartalék Flash modell."
+                        consentStore.incrementUsageCounters(
+                            requestsDelta = 1,
+                            tokensDelta = parsed.promptTokensEstimate
+                        )
+                        val resolvedNotice = switchNotice ?: firstFailedModelId?.let { failed ->
+                            "Automatikus modellváltás ($failed → $activeModelId)."
+                        }
+                        return GeminiResponse(
+                            text = parsed.text,
+                            modelIdUsed = activeModelId,
+                            modelSwitchedNoticeHu = resolvedNotice,
+                            promptTokensEstimate = parsed.promptTokensEstimate
                         )
                     }
-                    activeModelId = updated.selectedModelId
-                    switchNotice = updated.retiredModelNoticeHu
-                }
 
-                result.statusCode == 404 -> {
-                    throw GeminiModelRetiredException(
-                        retiredModelId = activeModelId,
-                        replacementModelId = null,
-                        message = "A tartalék '$activeModelId' modell is HTTP 404 hibát adott."
-                    )
-                }
+                    result.statusCode == 404 -> {
+                        modelCatalog.markModelRetiredLocally(activeModelId)
+                        if (firstFailedModelId == null) firstFailedModelId = activeModelId
+                        if (!catalogRefreshedOnFailure) {
+                            catalogRefreshedOnFailure = true
+                            val updated = runCatching {
+                                modelCatalog.onModelNotFound(
+                                    retiredModelId = activeModelId,
+                                    apiKey = apiKey,
+                                    aiConsentStore = consentStore
+                                )
+                            }.getOrNull()
+                            if (updated != null) {
+                                switchNotice = updated.retiredModelNoticeHu ?: switchNotice
+                                // Prepend newly discovered active models so the refreshed catalog candidate runs next.
+                                val freshIds = buildList {
+                                    if (updated.selectedModelId !in triedModels) add(updated.selectedModelId)
+                                    updated.availableFlashModels.forEach { info ->
+                                        if (!info.isRetired && !info.isSpecializedMediaVariant && info.id !in triedModels) {
+                                            add(info.id)
+                                        }
+                                    }
+                                }.distinct()
+                                for (id in freshIds.asReversed()) {
+                                    candidateQueue.remove(id)
+                                    candidateQueue.addFirst(id)
+                                }
+                            }
+                        }
+                        lastFailure = GeminiModelRetiredException(
+                            retiredModelId = activeModelId,
+                            replacementModelId = candidateQueue.firstOrNull(),
+                            message = "A(z) '$activeModelId' modell nem érhető el (HTTP 404)."
+                        )
+                        break
+                    }
 
-                result.statusCode == 429 -> {
-                    val waitMs = computeRetryDelayMs(result.retryAfterHeader, attempt429)
-                    if (attempt429 >= maxRetriesOn429) {
-                        throw GeminiRateLimitExceededException(
+                    result.statusCode == 429 -> {
+                        val waitMs = computeRetryDelayMs(result.retryAfterHeader, attempt429)
+                        if (attempt429 < maxRetriesOn429) {
+                            attempt429++
+                            delayMs(waitMs)
+                            continue
+                        }
+                        val err = GeminiRateLimitExceededException(
                             retryAfterMs = waitMs,
                             message = "Gemini API kvóta / rate limit túllépve (HTTP 429). Próbáld újra ${waitMs / 1000} mp múlva."
                         )
+                        lastFailure = err
+                        if (firstFailedModelId == null) firstFailedModelId = activeModelId
+                        break
                     }
-                    attempt429++
-                    delayMs(waitMs)
-                }
 
-                result.statusCode == 401 || result.statusCode == 403 -> {
-                    throw GeminiHttpException(
-                        result.statusCode,
-                        "Érvénytelen vagy jogosulatlan Gemini API-kulcs (HTTP ${result.statusCode})."
-                    )
-                }
+                    result.statusCode == 401 || result.statusCode == 403 -> {
+                        throw GeminiHttpException(
+                            result.statusCode,
+                            "Érvénytelen vagy jogosulatlan Gemini API-kulcs (HTTP ${result.statusCode})."
+                        )
+                    }
 
-                else -> {
-                    throw GeminiHttpException(
-                        result.statusCode,
-                        "Gemini API hiba (HTTP ${result.statusCode}): ${extractApiErrorMessage(result.bodyText)}"
-                    )
+                    else -> {
+                        lastFailure = GeminiHttpException(
+                            result.statusCode,
+                            "Gemini API hiba ($activeModelId, HTTP ${result.statusCode}): ${extractApiErrorMessage(result.bodyText)}"
+                        )
+                        if (firstFailedModelId == null) firstFailedModelId = activeModelId
+                        break
+                    }
                 }
             }
         }
+
+        throw lastFailure ?: GeminiHttpException(
+            503,
+            "Egyik elérhető Gemini Flash modell sem válaszolt sikeresen."
+        )
     }
 
     private suspend fun acquireRateLimitSlot() {
@@ -314,6 +366,13 @@ class GeminiClient(
         const val DEFAULT_MAX_RETRIES_ON_429 = 3
         const val DEFAULT_BASE_BACKOFF_MS = 1_500L
         const val DEFAULT_MAX_BACKOFF_MS = 60_000L
+
+        internal fun defaultGeminiHttpClient(): OkHttpClient = OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .callTimeout(75, TimeUnit.SECONDS)
+            .build()
 
         const val DEFAULT_INLINE_IMAGE_LONG_EDGE_PX = 1536
         const val MIN_INLINE_IMAGE_LONG_EDGE_PX = 512

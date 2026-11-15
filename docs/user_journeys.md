@@ -36,16 +36,17 @@ sequenceDiagram
 
 ---
 
-## 2. Lasszó Szellemkép-mentes Mozgatás és `✨ AI` Automatikus Formázás
+## 2. Lasszó Szellemkép-mentes Mozgatás, Sarok-Forgatás és `✨ AI` Automatikus Formázás
 
 ```mermaid
 flowchart LR
-    A["Lasszó kijelölés (≥60% pont bent)"] --> M["Húzás közben excludedStrokeIds → eredeti hely üres, nincs szellemkép"]
+    A["Lasszó kijelölés (≥60% pont bent)"] --> M["Húzás / Sarok-forgatás közben excludedStrokeIds → eredeti hely üres, nincs szellemkép"]
+    M --> R["Élő preScale / preRotate előnézet → ACTION_UP: AffineTransform2D véglegesítés"]
     A --> AI{"✨ AI gomb (LassoSelectionActionBar)"}
     AI -- 1 vonás és alakzat (<10 ms helyi) --> SH["ShapeRecognizer → vektoros vonal / kör / háromszög / téglalap / nyíl"]
-    AI -- Összetett kijelölés (768 px PNG) --> G{"Gemini Flash JSON besorolás"}
+    AI -- Összetett kijelölés (768 px PNG) --> G{"Gemini Flash + Multi-Flash Failover (60s timeout)"}
     G -- formula --> L["jlatexmath validálás → LatexObject"]
-    G -- text --> T["FormattedTextObject (HandwritingFontFamily emberi íráshoz hasonló stílus)"]
+    G -- text --> T["FormattedTextObject (nem-sticky kijelölés, HandwritingFontFamily)"]
     G -- shape --> SH2["Vektoros alakzat + ShapeMeta"]
     L & T & SH2 --> U["Atomikus CompositeAction + StrokeJournal → 1 lépéses Undo"]
 ```
@@ -71,18 +72,16 @@ flowchart TD
 
 ---
 
-## 4. Kétujjas Pan & Pinch-Zoom a 144 Hz-es GPU Kompozit Gyorsítótáron
+## 4. 1-ujjas Pan & 2-ujjas Pinch-Zoom a 144 Hz-es GPU Kompozit Gyorsítótáron
 
 ```mermaid
 flowchart LR
-    A["2 ujjas érintés (ACTION_DOWN / POINTER_DOWN)"] --> B["InProgressStrokesView: requestDisallowInterceptTouchEvent(true)"]
-    B --> C["StylusInputRouter.handleTwoFingerNavigation (centroid horgony + skála)"]
-    C --> D["ADPF PerformanceHintManager (6,94 ms céltartam) + DryCanvasView.invalidate()"]
-    D --> E{"CompositePageSnapshot érvényes?"}
-    E -- Igen (Fix oldal aktív gesztus alatt) --> F["1x GPU Hardware Bitmap TextureOp blit (~4,47 ms P50 / 6,04 ms P95)"]
-    E -- Nem (Végtelen vászon / lasszó húzás / túlnagyítva) --> G["PaperBackgroundRenderer kötegelt rajz + 512x512 LRU csempék"]
-    C --> H["100 ms inaktivitás (settleRunnable)"]
-    H --> I["Háttérszálas rebakeSettledScale → éles csempék + GPU Snapshot frissítése"]
+    A["1-ujjas pan vagy 2-ujjas pinch-zoom"] --> B["InProgressStrokesView: requestDisallowInterceptTouchEvent(true)"]
+    B --> C["StylusInputRouter (centroid horgony + skála) → DryCanvasView.invalidate() (Compose zoom-% szinkron csak gesztus végén)"]
+    C --> E{"CompositePageSnapshot érvényes?"}
+    E -- Igen (Fix oldal aktív gesztus alatt) --> F["1x GPU Hardware Bitmap TextureOp blit (4,37 ms P50 / 6,05 ms P95)"]
+    E -- Nem (Végtelen vászon / lasszó / többoldalas szél) --> G["PaperBackgroundRenderer kötegelt rajz + 512x512 LRU csempék"]
+    C --> H["onNavigationGestureEnd + 100 ms settleRunnable → zoom-% frissítés & éles csempék"]
 ```
 
 ---
@@ -100,14 +99,27 @@ flowchart TD
 
 ---
 
-## 6. Lebegő Eszköztár, 2 Lépcsős Ecsetfül és AI Formázó (Oldal / Munkafüzet)
+## 6. Lebegő Eszköztár, Eszközmemória, Teljes Képernyő és AI Formázó
 
 ```mermaid
 flowchart LR
-    T1["FloatingToolDock: globális (x,y) + összecsukott/nyitott állapot (ToolDockPreferencesStore)"] --> T2["Összecsukva: Toll | Radír | Vissza + Megnyitás"]
-    T1 --> T3["Eszköz hosszú érintése → 2 lépcsős BrushSettingsPopover (312 dp lényegi fül ⇄ 472 dp teljes stúdió)"]
-    A1["Bal felső AI gomb → AiCopilotSheet (ESC / backdrop zárás)"] --> A2["Hatókör: Csak adott oldal / Teljes munkafüzet"]
+    T1["FloatingToolDock: globális (x,y), összecsukva Toll|Radír|Vissza + Teljes képernyő gomb"] --> T2["Eszközváltás → független perToolConfigs vastagság/szín/átlátszóság visszaállítás"]
+    T1 --> T3["Eszköz hosszú érintése → eszközhöz igazított 2 lépcsős BrushSettingsPopover (kompakt 1-8 pt ⇄ teljes stúdió + átlátszóság)"]
+    A1["Bal felső sarokba simuló CanvasTopToolbar AI gomb → AiCopilotSheet"] --> A2["Hatókör: Csak adott oldal / Teljes munkafüzet"]
     A2 --> A3["1. Teljes formázás (HandwritingFontFamily szöveg + ábrák + képletek)"]
     A2 --> A4["2. Csak alakzatok és képletek (kézírásos folyószöveg érintetlen marad)"]
+```
+
+---
+
+## 7. Geometriai Alakzatok Beszúrása, Füzet-OCR és Oldalak Drag & Drop Átrendezése
+
+```mermaid
+flowchart TD
+    S1["FloatingToolDock: Alakzatok gomb → 2 oldalas ShapePickerPopover (24+8 2D/3D alakzat, szín, kitöltés)"] --> S2["Vászon közepére beszúrt GeometricShapeObject (SNOT tag=6)"]
+    S2 --> S3["4 sarok méretező + felső forgató fogantyú + kitöltés/szín/törlés menü → PdfExportManager vektoros export"]
+    O1["FloatingToolDock: OCR gomb"] --> O2["Még nem formázott kézírások szűrése (kiemelők és kész blokkok kihagyva)"]
+    O2 --> O3["Összes oldal átírása a füzet ocrLanguage nyelvén → FormattedTextObject"]
+    P1["Bal oldalon függőlegesen eltolható LeftPagePullTab → LeftPageDrawer"] --> P2["Drag & Drop oldalsorrend módosítás (reorderPagesInNotebook) & + Új oldal létrehozása"]
 ```
 

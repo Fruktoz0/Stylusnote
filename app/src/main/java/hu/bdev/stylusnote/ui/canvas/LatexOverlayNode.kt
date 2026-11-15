@@ -32,12 +32,14 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Functions
 import androidx.compose.material.icons.filled.Remove
+import androidx.compose.material.icons.filled.RotateRight
 import androidx.compose.material.icons.filled.ShowChart
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
@@ -52,6 +54,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -63,6 +66,7 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.key.Key
@@ -71,7 +75,10 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.IntOffset
@@ -91,6 +98,7 @@ import hu.bdev.stylusnote.core.math.CanvasTransformMatrix
 import hu.bdev.stylusnote.core.math.ColorLuminanceInverter
 import hu.bdev.stylusnote.core.math.DocPoint
 import hu.bdev.stylusnote.core.math.DocRect
+import hu.bdev.stylusnote.core.math.GeometricShapeRenderer
 import hu.bdev.stylusnote.core.math.RecognizedShapeType
 import hu.bdev.stylusnote.core.math.ShapeMeta
 import hu.bdev.stylusnote.core.math.ShapeRecognizer
@@ -99,17 +107,22 @@ import hu.bdev.stylusnote.data.local.StrokeBinarySerializer
 import hu.bdev.stylusnote.data.local.StrokeJournal
 import hu.bdev.stylusnote.domain.model.AffineTransform2D
 import hu.bdev.stylusnote.domain.model.BrushConfig
+import hu.bdev.stylusnote.domain.model.OcrLanguageTag
 import hu.bdev.stylusnote.domain.model.PageObject
 import hu.bdev.stylusnote.domain.model.PersistedStrokeRecord
+import hu.bdev.stylusnote.domain.model.StrokeLayerType
 import hu.bdev.stylusnote.domain.repository.CanvasStateHolder
 import hu.bdev.stylusnote.ui.theme.HandwritingFontFamily
 import org.json.JSONObject
 import ru.noties.jlatexmath.JLatexMathDrawable
 import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.math.sin
 
 /**
  * Structural + optional native `jlatexmath-android` syntax validator for Gemini LaTeX outputs
@@ -666,15 +679,92 @@ object HandwritingToLatexConverter {
         canvasStateHolder: CanvasStateHolder? = null,
         journalSink: StrokeJournal? = null,
         context: Context? = null,
-        startingZOrder: Long = 1_000_000L
+        startingZOrder: Long = 1_000_000L,
+        ocrLanguage: OcrLanguageTag = OcrLanguageTag.HUNGARIAN
     ): Result<PageFormatSummary> = runCatching {
         if (pageStrokes.isEmpty()) {
             return@runCatching PageFormatSummary(0, 0, 0)
         }
+        executeStructuredFormattingPass(
+            targetStrokes = pageStrokes,
+            formatText = formatText,
+            textOnlyOcr = false,
+            ocrLanguage = ocrLanguage,
+            geminiClient = geminiClient,
+            canvasStateHolder = canvasStateHolder,
+            journalSink = journalSink,
+            context = context,
+            startingZOrder = startingZOrder
+        )
+    }
 
-        val frame = computeStrokeCanvasFrame(pageStrokes)
+    /**
+     * Incremental whole-notebook OCR pass: converts only handwritten ink strokes that have NOT
+     * yet been turned into [PageObject.FormattedTextObject] or [PageObject.LatexObject], respecting
+     * the workbook's configured [ocrLanguage]. Already formatted blocks remain untouched.
+     */
+    suspend fun formatUnformattedStrokesInPage(
+        pageStrokes: List<PersistedStrokeRecord>,
+        existingObjects: List<PageObject>,
+        ocrLanguage: OcrLanguageTag,
+        geminiClient: GeminiClient,
+        canvasStateHolder: CanvasStateHolder? = null,
+        journalSink: StrokeJournal? = null,
+        startingZOrder: Long = 1_000_000L
+    ): Result<PageFormatSummary> = runCatching {
+        val formattedObjects = existingObjects.filter {
+            it is PageObject.FormattedTextObject || it is PageObject.LatexObject
+        }
+        val excludedStrokeIds = HashSet<String>()
+        val excludedRects = ArrayList<DocRect>(formattedObjects.size)
+        for (obj in formattedObjects) {
+            excludedRects.add(obj.bounds.inflate(8f))
+            when (obj) {
+                is PageObject.FormattedTextObject -> excludedStrokeIds.addAll(obj.sourceStrokeIds)
+                is PageObject.LatexObject -> excludedStrokeIds.addAll(obj.sourceStrokeIds)
+                else -> Unit
+            }
+        }
+        val unformattedStrokes = pageStrokes.filter { stroke ->
+            stroke.layer != StrokeLayerType.HIGHLIGHTER &&
+                !excludedStrokeIds.contains(stroke.id) &&
+                excludedRects.none { rect ->
+                    rect.contains(
+                        (stroke.bounds.leftPt + stroke.bounds.rightPt) * 0.5f,
+                        (stroke.bounds.topPt + stroke.bounds.bottomPt) * 0.5f
+                    )
+                }
+        }
+        if (unformattedStrokes.isEmpty()) {
+            return@runCatching PageFormatSummary(0, 0, 0)
+        }
+        executeStructuredFormattingPass(
+            targetStrokes = unformattedStrokes,
+            formatText = true,
+            textOnlyOcr = true,
+            ocrLanguage = ocrLanguage,
+            geminiClient = geminiClient,
+            canvasStateHolder = canvasStateHolder,
+            journalSink = journalSink,
+            context = null,
+            startingZOrder = startingZOrder
+        )
+    }
+
+    private suspend fun executeStructuredFormattingPass(
+        targetStrokes: List<PersistedStrokeRecord>,
+        formatText: Boolean,
+        textOnlyOcr: Boolean,
+        ocrLanguage: OcrLanguageTag,
+        geminiClient: GeminiClient,
+        canvasStateHolder: CanvasStateHolder?,
+        journalSink: StrokeJournal?,
+        context: Context?,
+        startingZOrder: Long
+    ): PageFormatSummary {
+        val frame = computeStrokeCanvasFrame(targetStrokes)
         val bitmap = renderStrokesToCanonicalLightBitmap(
-            strokes = pageStrokes,
+            strokes = targetStrokes,
             targetLongEdgePx = GeminiClient.DEFAULT_INLINE_IMAGE_LONG_EDGE_PX
         )
         val pngBytes = try {
@@ -683,12 +773,16 @@ object HandwritingToLatexConverter {
             if (!bitmap.isRecycled) bitmap.recycle()
         }
 
-        val modeInstruction = if (formatText) {
-            "Az oldalon látható ÖSSZES elemet azonosítsd: `text` (kézzel írt bekezdések/listák), " +
-                "`formula` (matematikai képletek LaTeX-ben), és `shape` (vonalak, nyilak, téglalapok, körök, háromszögek). "
-        } else {
-            "Az oldalon kizárólag a `formula` (matematikai képletek LaTeX-ben) és `shape` (ábrák, nyilak, téglalapok, körök, háromszögek, vonalak) elemeket add vissza; " +
-                "a sima kézírott folyószöveget hagyd figyelmen kívül! "
+        val modeInstruction = when {
+            textOnlyOcr ->
+                "Az oldalon látható kézzel írott szövegeket írd át pontosan ${ocrLanguage.displayName} (${ocrLanguage.bcp47Tag}) nyelven, " +
+                    "kizárólag `text` elemekként! A rajzolt ábrákat, alakzatokat és kereteket hagyd figyelmen kívül! "
+            formatText ->
+                "Az oldalon látható ÖSSZES elemet azonosítsd (${ocrLanguage.displayName} / ${ocrLanguage.bcp47Tag} kontextusban): " +
+                    "`text` (kézzel írt bekezdések/listák), `formula` (matematikai képletek LaTeX-ben), és `shape` (vonalak, nyilak, téglalapok, körök, háromszögek). "
+            else ->
+                "Az oldalon kizárólag a `formula` (matematikai képletek LaTeX-ben) és `shape` (ábrák, nyilak, téglalapok, körök, háromszögek, vonalak) elemeket add vissza; " +
+                    "a sima kézírott folyószöveget hagyd figyelmen kívül! "
         }
 
         val response = geminiClient.generateContent(
@@ -699,12 +793,12 @@ object HandwritingToLatexConverter {
             inlinePngImages = listOf(pngBytes),
             responseMimeType = "application/json",
             responseSchemaJson = PAGE_FORMAT_SCHEMA,
-            systemInstruction = "Precíz jegyzet- és ábrafelismerő vagy. Pontos 0..1000-es koordinátájú JSON-t adj vissza."
+            systemInstruction = "Precíz jegyzet-, kézírás- és ábrafelismerő vagy. Pontos 0..1000-es koordinátájú JSON-t adj vissza."
         )
 
         val root = JSONObject(GeminiClient.stripMarkdownCodeFences(response.text))
         val array = root.optJSONArray("elements")
-            ?: return@runCatching PageFormatSummary(0, 0, 0, response.modelIdUsed)
+            ?: return PageFormatSummary(0, 0, 0, response.modelIdUsed)
 
         val consumedStrokeIds = LinkedHashSet<String>()
         var nextZ = startingZOrder
@@ -715,6 +809,7 @@ object HandwritingToLatexConverter {
         for (i in 0 until array.length()) {
             val item = array.optJSONObject(i) ?: continue
             val kind = item.optString("kind").trim().lowercase()
+            if (textOnlyOcr && kind != "text") continue
             if (!formatText && kind == "text") continue
 
             val boxArr = item.optJSONArray("box") ?: continue
@@ -731,19 +826,19 @@ object HandwritingToLatexConverter {
             )
 
             val matchBox = rawBox.inflate(14f)
-            val matchedStrokes = pageStrokes.filter { s ->
+            val matchedStrokes = targetStrokes.filter { s ->
                 !consumedStrokeIds.contains(s.id) &&
                     matchBox.contains((s.bounds.leftPt + s.bounds.rightPt) * 0.5f, (s.bounds.topPt + s.bounds.bottomPt) * 0.5f)
             }
             if (matchedStrokes.isEmpty() && array.length() > 1) continue
 
-            val targetStrokes = matchedStrokes.ifEmpty {
-                pageStrokes.filter { !consumedStrokeIds.contains(it.id) }
+            val activeGroupStrokes = matchedStrokes.ifEmpty {
+                targetStrokes.filter { !consumedStrokeIds.contains(it.id) }
             }
-            if (targetStrokes.isEmpty()) continue
-            val targetIds = targetStrokes.map { it.id }
-            val tightBounds = mergeStrokeDocRects(targetStrokes)
-            val canonicalColor = targetStrokes.first().canonicalColorArgb
+            if (activeGroupStrokes.isEmpty()) continue
+            val targetIds = activeGroupStrokes.map { it.id }
+            val tightBounds = mergeStrokeDocRects(activeGroupStrokes)
+            val canonicalColor = activeGroupStrokes.first().canonicalColorArgb
             val zOrder = canvasStateHolder?.allocateObjectZOrder() ?: (++nextZ)
 
             when (kind) {
@@ -751,9 +846,9 @@ object HandwritingToLatexConverter {
                     val shapeType = parseRecognizedShapeType(item.optString("shapeType"))
                         ?: RecognizedShapeType.RECTANGLE
                     val meta = buildShapeMetaForBounds(shapeType, tightBounds)
-                    val tpl = targetStrokes.first().samples.firstOrNull() ?: defaultTemplateSample(tightBounds)
+                    val tpl = activeGroupStrokes.first().samples.firstOrNull() ?: defaultTemplateSample(tightBounds)
                     val snappedSamples = meta.generateSamples(tpl)
-                    val snappedRecord = buildSnappedStrokeRecord(targetStrokes.first(), meta, snappedSamples)
+                    val snappedRecord = buildSnappedStrokeRecord(activeGroupStrokes.first(), meta, snappedSamples)
                     if (canvasStateHolder != null) {
                         val (snappedEntry, _) = StrokeBinarySerializer.toIndexedDryStroke(snappedRecord)
                         canvasStateHolder.replaceStrokesWithSnappedShape(targetIds, snappedEntry.stroke, meta)
@@ -805,7 +900,7 @@ object HandwritingToLatexConverter {
             }
         }
 
-        PageFormatSummary(
+        return PageFormatSummary(
             formattedTextCount = textCount,
             formattedFormulaCount = formulaCount,
             formattedShapeCount = shapeCount,
@@ -840,7 +935,8 @@ object HandwritingToLatexConverter {
         sourceStrokeIds: List<String>
     ): PageObject.FormattedTextObject {
         val lines = text.lines().size.coerceAtLeast(1)
-        val estimatedPt = ((bounds.heightPt / lines) * 0.62f).coerceIn(14f, 34f)
+        val rawLineHeightPt = bounds.heightPt / lines
+        val estimatedPt = (rawLineHeightPt * 0.72f).coerceIn(11f, 56f)
         return PageObject.FormattedTextObject(
             id = java.util.UUID.randomUUID().toString(),
             zOrder = zOrder,
@@ -979,8 +1075,13 @@ fun PageObjectsOverlayLayer(
 ) {
     val snapshot = transformMatrix.snapshot()
     val scale = snapshot.scale.coerceAtLeast(0.1f)
+    var overlayCoords by remember { mutableStateOf<LayoutCoordinates?>(null) }
 
-    Box(modifier = modifier.fillMaxSize()) {
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .onGloballyPositioned { overlayCoords = it }
+    ) {
         for (obj in pageObjects) {
             if (obj is PageObject.PdfPageRefObject) continue
 
@@ -989,9 +1090,10 @@ fun PageObjectsOverlayLayer(
             val heightPx = (obj.bounds.heightPt * scale).coerceAtLeast(28f)
             val isSelected = (obj.id == selectedObjectId)
 
-            val density = androidx.compose.ui.platform.LocalDensity.current
+            val density = LocalDensity.current
             val widthDp = with(density) { widthPx.toDp() }
             val heightDp = with(density) { heightPx.toDp() }
+            val latestObj by rememberUpdatedState(obj)
 
             Box(
                 modifier = Modifier
@@ -1002,15 +1104,15 @@ fun PageObjectsOverlayLayer(
                         )
                     }
                     .size(width = widthDp, height = heightDp)
-                    .pointerInput(obj.id, obj.bounds, scale) {
+                    .pointerInput(obj.id, scale) {
                         detectDragGestures(
-                            onDragStart = { onSelectObject(obj.id) },
+                            onDragStart = { onSelectObject(latestObj.id) },
                             onDrag = { change, dragAmount ->
                                 change.consume()
                                 val dxDoc = dragAmount.x / scale
                                 val dyDoc = dragAmount.y / scale
                                 onUpdateObject(
-                                    obj.transform(AffineTransform2D.translation(dxDoc, dyDoc))
+                                    latestObj.transform(AffineTransform2D.translation(dxDoc, dyDoc))
                                 )
                             }
                         )
@@ -1056,11 +1158,205 @@ fun PageObjectsOverlayLayer(
                         textObject = obj,
                         scale = scale,
                         isOledMode = isOledMode,
-                        isSelected = isSelected,
-                        onUpdateObject = onUpdateObject,
-                        onDelete = { onDeleteObject(obj.id) }
+                        isSelected = isSelected
+                    )
+
+                    is PageObject.GeometricShapeObject -> GeometricShapeOverlayNode(
+                        shapeObject = obj,
+                        scale = scale,
+                        isOledMode = isOledMode,
+                        isSelected = isSelected
                     )
                 }
+            }
+
+            if (isSelected && obj is PageObject.GeometricShapeObject) {
+                GeometricShapeInteractiveHandles(
+                    shapeObject = obj,
+                    transformMatrix = transformMatrix,
+                    scale = scale,
+                    widthPx = widthPx,
+                    heightPx = heightPx,
+                    overlayCoordsProvider = { overlayCoords },
+                    onUpdateObject = onUpdateObject
+                )
+            }
+
+            if (
+                isSelected &&
+                (obj is PageObject.LatexObject ||
+                    obj is PageObject.FormattedTextObject ||
+                    obj is PageObject.GeometricShapeObject)
+            ) {
+                FloatingObjectActionPill(
+                    obj = obj,
+                    screenTopLeft = screenTopLeft,
+                    heightPx = heightPx,
+                    onUpdateObject = onUpdateObject,
+                    onDeleteObject = { onDeleteObject(obj.id) },
+                    onDeselect = { onSelectObject(null) },
+                    onRequestStepByStep = onRequestStepByStep
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun FloatingObjectActionPill(
+    obj: PageObject,
+    screenTopLeft: hu.bdev.stylusnote.core.math.ScreenPoint,
+    heightPx: Float,
+    onUpdateObject: (PageObject) -> Unit,
+    onDeleteObject: () -> Unit,
+    onDeselect: () -> Unit,
+    onRequestStepByStep: (PageObject.LatexObject) -> Unit
+) {
+    Surface(
+        modifier = Modifier.offset {
+            IntOffset(
+                x = screenTopLeft.xPx.roundToInt().coerceAtLeast(8),
+                y = (screenTopLeft.yPx + heightPx + 8f).roundToInt().coerceAtLeast(8)
+            )
+        },
+        shape = RoundedCornerShape(14.dp),
+        tonalElevation = 6.dp,
+        shadowElevation = 8.dp
+    ) {
+        FlowRow(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            if (obj is PageObject.LatexObject) {
+                TextButton(onClick = { onRequestStepByStep(obj) }) {
+                    Icon(
+                        imageVector = Icons.Default.AutoAwesome,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Levezetés")
+                }
+            }
+
+            if (obj is PageObject.GeometricShapeObject) {
+                TextButton(
+                    onClick = { onUpdateObject(obj.copy(hasFill = !obj.hasFill)) }
+                ) {
+                    Text(if (obj.hasFill) "Kitöltés: Be" else "Kitöltés: Ki")
+                }
+            }
+
+            val currentColor = when (obj) {
+                is PageObject.LatexObject -> obj.canonicalColorArgb
+                is PageObject.FormattedTextObject -> obj.canonicalColorArgb
+                is PageObject.GeometricShapeObject -> obj.canonicalStrokeColorArgb
+                else -> BrushConfig.DEFAULT_INK_COLOR_ARGB
+            }
+            LATEX_COLOR_SWATCHES.forEach { swatchArgb ->
+                Box(
+                    modifier = Modifier
+                        .size(22.dp)
+                        .clip(CircleShape)
+                        .background(Color(swatchArgb))
+                        .border(
+                            width = if (currentColor == swatchArgb) 2.dp else 1.dp,
+                            color = MaterialTheme.colorScheme.outline,
+                            shape = CircleShape
+                        )
+                        .clickable {
+                            when (obj) {
+                                is PageObject.LatexObject -> onUpdateObject(obj.copy(canonicalColorArgb = swatchArgb))
+                                is PageObject.FormattedTextObject -> onUpdateObject(obj.copy(canonicalColorArgb = swatchArgb))
+                                is PageObject.GeometricShapeObject -> onUpdateObject(
+                                    obj.copy(
+                                        canonicalStrokeColorArgb = swatchArgb,
+                                        canonicalFillColorArgb = (swatchArgb and 0x00FFFFFF) or 0x28000000
+                                    )
+                                )
+                                else -> Unit
+                            }
+                        }
+                )
+            }
+
+            IconButton(
+                onClick = {
+                    when (obj) {
+                        is PageObject.LatexObject -> {
+                            val cx = (obj.bounds.leftPt + obj.bounds.rightPt) * 0.5f
+                            val cy = (obj.bounds.topPt + obj.bounds.bottomPt) * 0.5f
+                            onUpdateObject(obj.transform(AffineTransform2D.scalingAround(1.15f, 1.15f, cx, cy)))
+                        }
+                        is PageObject.FormattedTextObject -> {
+                            onUpdateObject(obj.copy(fontSizePt = (obj.fontSizePt + 2f).coerceAtMost(72f)))
+                        }
+                        is PageObject.GeometricShapeObject -> {
+                            val cx = obj.bounds.centerXPt
+                            val cy = obj.bounds.centerYPt
+                            onUpdateObject(obj.transform(AffineTransform2D.scalingAround(1.15f, 1.15f, cx, cy)))
+                        }
+                        else -> Unit
+                    }
+                },
+                modifier = Modifier.size(28.dp)
+            ) {
+                Icon(Icons.Default.Add, contentDescription = "Nagyítás", modifier = Modifier.size(16.dp))
+            }
+
+            IconButton(
+                onClick = {
+                    when (obj) {
+                        is PageObject.LatexObject -> {
+                            val cx = (obj.bounds.leftPt + obj.bounds.rightPt) * 0.5f
+                            val cy = (obj.bounds.topPt + obj.bounds.bottomPt) * 0.5f
+                            onUpdateObject(obj.transform(AffineTransform2D.scalingAround(0.87f, 0.87f, cx, cy)))
+                        }
+                        is PageObject.FormattedTextObject -> {
+                            onUpdateObject(obj.copy(fontSizePt = (obj.fontSizePt - 2f).coerceAtLeast(10f)))
+                        }
+                        is PageObject.GeometricShapeObject -> {
+                            val cx = obj.bounds.centerXPt
+                            val cy = obj.bounds.centerYPt
+                            onUpdateObject(obj.transform(AffineTransform2D.scalingAround(0.87f, 0.87f, cx, cy)))
+                        }
+                        else -> Unit
+                    }
+                },
+                modifier = Modifier.size(28.dp)
+            ) {
+                Icon(Icons.Default.Remove, contentDescription = "Kicsinyítés", modifier = Modifier.size(16.dp))
+            }
+
+            if (obj is PageObject.GeometricShapeObject) {
+                IconButton(
+                    onClick = {
+                        onUpdateObject(obj.copy(rotationRadians = obj.rotationRadians + (15.0 * PI / 180.0).toFloat()))
+                    },
+                    modifier = Modifier.size(28.dp)
+                ) {
+                    Icon(Icons.Default.RotateRight, contentDescription = "Forgatás +15°", modifier = Modifier.size(16.dp))
+                }
+            }
+
+            IconButton(onClick = onDeleteObject, modifier = Modifier.size(28.dp)) {
+                Icon(
+                    Icons.Default.Delete,
+                    contentDescription = "Törlés",
+                    tint = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.size(16.dp)
+                )
+            }
+
+            IconButton(onClick = onDeselect, modifier = Modifier.size(28.dp)) {
+                Icon(
+                    Icons.Default.Check,
+                    contentDescription = "Kijelölés levétele",
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(16.dp)
+                )
             }
         }
     }
@@ -1401,15 +1697,12 @@ private val LATEX_COLOR_SWATCHES = listOf(
     0xFFB91C1C.toInt()
 )
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun FormattedTextOverlayNode(
     textObject: PageObject.FormattedTextObject,
     scale: Float,
     isOledMode: Boolean,
-    isSelected: Boolean,
-    onUpdateObject: (PageObject.FormattedTextObject) -> Unit,
-    onDelete: () -> Unit
+    isSelected: Boolean
 ) {
     val effectiveColorArgb = remember(textObject.canonicalColorArgb, isOledMode) {
         if (isOledMode) {
@@ -1418,9 +1711,12 @@ private fun FormattedTextOverlayNode(
             textObject.canonicalColorArgb
         }
     }
-    val scaledFontSp = (textObject.fontSizePt * scale * 0.72f).coerceIn(11f, 84f).sp
+    val density = LocalDensity.current
+    val scaledFontSp = with(density) {
+        (textObject.fontSizePt * scale).coerceAtLeast(8f).toSp()
+    }
 
-    Column(
+    Box(
         modifier = Modifier
             .fillMaxSize()
             .then(
@@ -1434,86 +1730,233 @@ private fun FormattedTextOverlayNode(
                     Modifier
                 }
             )
-            .padding(4.dp)
+            .padding(2.dp)
+            .graphicsLayer {
+                if (abs(textObject.rotationRadians) > 1e-4f) {
+                    rotationZ = (textObject.rotationRadians * 180.0 / PI).toFloat()
+                }
+            },
+        contentAlignment = Alignment.TopStart
     ) {
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f)
-                .graphicsLayer {
-                    if (abs(textObject.rotationRadians) > 1e-4f) {
-                        rotationZ = (textObject.rotationRadians * 180.0 / PI).toFloat()
-                    }
-                },
-            contentAlignment = Alignment.TopStart
-        ) {
-            Text(
-                text = textObject.text,
-                color = Color(effectiveColorArgb),
-                fontFamily = HandwritingFontFamily,
-                fontSize = scaledFontSp,
-                lineHeight = scaledFontSp * 1.25f
-            )
-        }
+        Text(
+            text = textObject.text,
+            color = Color(effectiveColorArgb),
+            fontFamily = HandwritingFontFamily,
+            fontSize = scaledFontSp,
+            lineHeight = scaledFontSp * 1.2f
+        )
+    }
+}
 
-        if (isSelected) {
-            Surface(
-                shape = RoundedCornerShape(12.dp),
-                tonalElevation = 4.dp,
-                shadowElevation = 6.dp
-            ) {
-                FlowRow(
-                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    LATEX_COLOR_SWATCHES.forEach { swatchArgb ->
-                        Box(
-                            modifier = Modifier
-                                .size(22.dp)
-                                .clip(CircleShape)
-                                .background(Color(swatchArgb))
-                                .border(
-                                    width = if (textObject.canonicalColorArgb == swatchArgb) 2.dp else 1.dp,
-                                    color = MaterialTheme.colorScheme.outline,
-                                    shape = CircleShape
-                                )
-                                .clickable {
-                                    onUpdateObject(textObject.copy(canonicalColorArgb = swatchArgb))
-                                }
-                        )
-                    }
-                    IconButton(
-                        onClick = {
-                            onUpdateObject(
-                                textObject.copy(fontSizePt = (textObject.fontSizePt + 2f).coerceAtMost(72f))
+@Composable
+private fun GeometricShapeOverlayNode(
+    shapeObject: PageObject.GeometricShapeObject,
+    scale: Float,
+    isOledMode: Boolean,
+    isSelected: Boolean
+) {
+    val effectiveStrokeArgb = remember(shapeObject.canonicalStrokeColorArgb, isOledMode) {
+        if (isOledMode) {
+            ColorLuminanceInverter.invertArgbLuminance(shapeObject.canonicalStrokeColorArgb)
+        } else {
+            shapeObject.canonicalStrokeColorArgb
+        }
+    }
+    val effectiveFillArgb = remember(shapeObject.canonicalFillColorArgb, isOledMode, effectiveStrokeArgb) {
+        if (isOledMode) {
+            (effectiveStrokeArgb and 0x00FFFFFF) or 0x2E000000
+        } else {
+            shapeObject.canonicalFillColorArgb
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val strokePx = (shapeObject.strokeWidthPt * scale).coerceIn(1.2f, 24f)
+            GeometricShapeRenderer.drawShape(
+                canvas = drawContext.canvas.nativeCanvas,
+                shapeType = shapeObject.shapeType,
+                bounds = android.graphics.RectF(0f, 0f, size.width, size.height),
+                strokeWidthPx = strokePx,
+                strokeColorArgb = effectiveStrokeArgb,
+                hasFill = shapeObject.hasFill,
+                fillColorArgb = effectiveFillArgb,
+                rotationRadians = shapeObject.rotationRadians
+            )
+            if (isSelected) {
+                val cx = size.width * 0.5f
+                val cy = size.height * 0.5f
+                val angleDeg = (shapeObject.rotationRadians * 180.0 / PI).toFloat()
+                rotate(degrees = angleDeg, pivot = Offset(cx, cy)) {
+                    drawRect(
+                        color = Color(0xFF1A56DB),
+                        style = Stroke(
+                            width = 1.6.dp.toPx(),
+                            pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(
+                                floatArrayOf(10f, 8f),
+                                0f
                             )
-                        },
-                        modifier = Modifier.size(28.dp)
-                    ) {
-                        Icon(Icons.Default.Add, contentDescription = "Szöveg nagyítása", modifier = Modifier.size(16.dp))
-                    }
-                    IconButton(
-                        onClick = {
-                            onUpdateObject(
-                                textObject.copy(fontSizePt = (textObject.fontSizePt - 2f).coerceAtLeast(10f))
-                            )
-                        },
-                        modifier = Modifier.size(28.dp)
-                    ) {
-                        Icon(Icons.Default.Remove, contentDescription = "Szöveg kicsinyítése", modifier = Modifier.size(16.dp))
-                    }
-                    IconButton(onClick = onDelete, modifier = Modifier.size(28.dp)) {
-                        Icon(
-                            Icons.Default.Delete,
-                            contentDescription = "Szöveg törlése",
-                            tint = MaterialTheme.colorScheme.error,
-                            modifier = Modifier.size(16.dp)
                         )
-                    }
+                    )
                 }
             }
         }
     }
 }
+
+@Composable
+private fun GeometricShapeInteractiveHandles(
+    shapeObject: PageObject.GeometricShapeObject,
+    transformMatrix: CanvasTransformMatrix,
+    scale: Float,
+    widthPx: Float,
+    heightPx: Float,
+    overlayCoordsProvider: () -> LayoutCoordinates?,
+    onUpdateObject: (PageObject) -> Unit
+) {
+    val latestObj by rememberUpdatedState(shapeObject)
+    val density = LocalDensity.current
+    val handleBoxPx = with(density) { 28.dp.toPx() }
+    val halfHandlePx = handleBoxPx * 0.5f
+    val stemGapPx = with(density) { 28.dp.toPx() }
+
+    val centerScreen = transformMatrix.docToScreen(
+        shapeObject.bounds.centerXPt,
+        shapeObject.bounds.centerYPt
+    )
+    val c = cos(shapeObject.rotationRadians)
+    val s = sin(shapeObject.rotationRadians)
+
+    fun rotatedOffset(lx: Float, ly: Float): Offset = Offset(
+        x = centerScreen.xPx + lx * c - ly * s,
+        y = centerScreen.yPx + lx * s + ly * c
+    )
+
+    val halfW = widthPx * 0.5f
+    val halfH = heightPx * 0.5f
+
+    // 4 corner resize handles
+    val corners = listOf(
+        -1f to -1f,
+        +1f to -1f,
+        +1f to +1f,
+        -1f to +1f
+    )
+    corners.forEach { (sx, sy) ->
+        val cornerCenter = rotatedOffset(sx * halfW, sy * halfH)
+        var handleCoords by remember { mutableStateOf<LayoutCoordinates?>(null) }
+        Box(
+            modifier = Modifier
+                .offset {
+                    IntOffset(
+                        x = (cornerCenter.x - halfHandlePx).roundToInt(),
+                        y = (cornerCenter.y - halfHandlePx).roundToInt()
+                    )
+                }
+                .size(28.dp)
+                .onGloballyPositioned { handleCoords = it }
+                .pointerInput(shapeObject.id, scale, sx, sy) {
+                    detectDragGestures { change, _ ->
+                        change.consume()
+                        val oCoords = overlayCoordsProvider() ?: return@detectDragGestures
+                        val hCoords = handleCoords ?: return@detectDragGestures
+                        val overlayPt = oCoords.localPositionOf(hCoords, change.position)
+                        val cur = latestObj
+                        val rot = cur.rotationRadians
+                        val cosR = cos(rot)
+                        val sinR = sin(rot)
+                        // Pin opposite corner in document space so resizing feels anchored
+                        val oppLocalX = -sx * cur.bounds.widthPt * 0.5f
+                        val oppLocalY = -sy * cur.bounds.heightPt * 0.5f
+                        val oppDocX = cur.bounds.centerXPt + oppLocalX * cosR - oppLocalY * sinR
+                        val oppDocY = cur.bounds.centerYPt + oppLocalX * sinR + oppLocalY * cosR
+
+                        val fingerDoc = transformMatrix.screenToDoc(overlayPt.x, overlayPt.y)
+                        val vx = fingerDoc.xPt - oppDocX
+                        val vy = fingerDoc.yPt - oppDocY
+                        val newW = ((vx * cosR + vy * sinR) * sx).coerceAtLeast(24f)
+                        val newH = ((-vx * sinR + vy * cosR) * sy).coerceAtLeast(24f)
+                        val cLocalX = sx * newW * 0.5f
+                        val cLocalY = sy * newH * 0.5f
+                        val newCx = oppDocX + cLocalX * cosR - cLocalY * sinR
+                        val newCy = oppDocY + cLocalX * sinR + cLocalY * cosR
+
+                        onUpdateObject(
+                            cur.copy(
+                                bounds = DocRect(
+                                    leftPt = newCx - newW * 0.5f,
+                                    topPt = newCy - newH * 0.5f,
+                                    rightPt = newCx + newW * 0.5f,
+                                    bottomPt = newCy + newH * 0.5f
+                                )
+                            )
+                        )
+                    }
+                },
+            contentAlignment = Alignment.Center
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(12.dp)
+                    .clip(CircleShape)
+                    .background(Color.White)
+                    .border(2.dp, Color(0xFF1A56DB), CircleShape)
+            )
+        }
+    }
+
+    // Top-center free-rotation knob + connecting stem
+    val topMid = rotatedOffset(0f, -halfH)
+    val rotKnobCenter = rotatedOffset(0f, -halfH - stemGapPx)
+    Canvas(modifier = Modifier.fillMaxSize()) {
+        drawLine(
+            color = Color(0xFF1A56DB),
+            start = topMid,
+            end = rotKnobCenter,
+            strokeWidth = 1.6.dp.toPx()
+        )
+    }
+    var rotHandleCoords by remember { mutableStateOf<LayoutCoordinates?>(null) }
+    Box(
+        modifier = Modifier
+            .offset {
+                IntOffset(
+                    x = (rotKnobCenter.x - halfHandlePx).roundToInt(),
+                    y = (rotKnobCenter.y - halfHandlePx).roundToInt()
+                )
+            }
+            .size(30.dp)
+            .clip(CircleShape)
+            .background(Color.White)
+            .border(1.8.dp, Color(0xFF1A56DB), CircleShape)
+            .onGloballyPositioned { rotHandleCoords = it }
+            .pointerInput(shapeObject.id, scale) {
+                detectDragGestures { change, _ ->
+                    change.consume()
+                    val oCoords = overlayCoordsProvider() ?: return@detectDragGestures
+                    val hCoords = rotHandleCoords ?: return@detectDragGestures
+                    val overlayPt = oCoords.localPositionOf(hCoords, change.position)
+                    val cur = latestObj
+                    val curCenter = transformMatrix.docToScreen(
+                        cur.bounds.centerXPt,
+                        cur.bounds.centerYPt
+                    )
+                    val angle = atan2(
+                        overlayPt.y - curCenter.yPx,
+                        overlayPt.x - curCenter.xPx
+                    ) + (PI.toFloat() * 0.5f)
+                    onUpdateObject(cur.copy(rotationRadians = angle))
+                }
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(
+            imageVector = Icons.Default.RotateRight,
+            contentDescription = "Alakzat forgatása",
+            tint = Color(0xFF1A56DB),
+            modifier = Modifier.size(16.dp)
+        )
+    }
+}
+
 

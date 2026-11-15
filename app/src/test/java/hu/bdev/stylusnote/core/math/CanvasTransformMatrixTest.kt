@@ -106,5 +106,23 @@ class CanvasTransformMatrixTest {
         matrix.zoomAroundScreenPoint(focalXPx = 500f, focalYPx = 500f, zoomFactor = 0.1f)
         assertEquals(0.65f, matrix.scale, 1e-6f)
     }
+
+    @Test
+    fun fitPageToViewportNormalizesRelativeZoomTo100Percent() {
+        val matrix = CanvasTransformMatrix()
+        val a4 = PageDimensionsPt.A4_PORTRAIT
+        // Simulated Xiaomi Pad 8 portrait viewport (~3.4x raw pixels per PDF point)
+        matrix.fitPageToViewport(
+            pageWidthPt = a4.widthPt,
+            pageHeightPt = a4.heightPt,
+            viewportWidthPx = 2136f,
+            viewportHeightPx = 3200f,
+            paddingPx = 48f
+        )
+
+        assertEquals(100, matrix.relativeZoomPercent)
+        matrix.zoomAroundScreenPoint(focalXPx = 1000f, focalYPx = 1500f, zoomFactor = 0.1f)
+        assertEquals(65, matrix.relativeZoomPercent)
+    }
 }
 

@@ -4,9 +4,6 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Matrix
-import android.os.Build
-import android.os.PerformanceHintManager
-import android.os.Process
 import android.view.MotionEvent
 import android.view.View
 import android.widget.FrameLayout
@@ -54,7 +51,9 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke as ComposeStroke
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.IntSize
@@ -106,6 +105,8 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
@@ -179,6 +180,14 @@ private class LassoSelectionRuntime {
     var dragOriginDoc: DocPoint? = null
     var liveDeltaXPt: Float = 0f
     var liveDeltaYPt: Float = 0f
+    var isRotatingSelection: Boolean = false
+    var rotationStartAngleRad: Float = 0f
+    var liveRotationRadians: Float = 0f
+    var rotationCenterXPt: Float = 0f
+    var rotationCenterYPt: Float = 0f
+
+    val isInteractingWithSelection: Boolean
+        get() = isDraggingSelection || isRotatingSelection
 }
 
 private sealed interface EraserWorkCommand {
@@ -258,7 +267,11 @@ fun StylusDrawingSurface(
     onCanvasStateMutated: () -> Unit = {},
     onViewportSizeChanged: (IntSize) -> Unit = {},
     onViewportTransformChanged: () -> Unit = {},
+    onCanvasTouchStart: () -> Unit = {},
+    onNavigationGestureEnd: () -> Unit = {},
     onAiAutoFormatLassoSelection: (selectedIds: Set<String>, onFormatted: (clearSelection: Boolean) -> Unit) -> Unit = { _, _ -> },
+    currentPageIndexOneBased: Int = 1,
+    totalPages: Int = 1,
     externalDrawVersionTick: Long = 0L,
     modifier: Modifier = Modifier
 ) {
@@ -286,7 +299,7 @@ fun StylusDrawingSurface(
     val livePreviewMatrix = remember { Matrix() }
 
     var viewportSize by remember { mutableStateOf(IntSize.Zero) }
-    var hasInitializedViewport by remember { mutableStateOf(false) }
+    var hasInitializedViewport by remember(transformMatrix) { mutableStateOf(false) }
     var activeRebakeJob by remember { mutableStateOf<Job?>(null) }
 
     val eraserRadiusPx = with(density) { brushConfig.eraserRadiusDp.dp.toPx() }
@@ -378,9 +391,13 @@ fun StylusDrawingSurface(
             var latestIsOledMode: Boolean = palette.isOledDeepBlack
             var latestPaperConfig: PagePaperConfig = paperConfig
             var latestPalette: StylusSurfacePalette = palette
+            var latestCurrentPageOneBased: Int = currentPageIndexOneBased
+            var latestTotalPages: Int = totalPages
             var onTogglePenEraserCallback: () -> Unit = onTogglePenEraser
             var onMutatedCallback: () -> Unit = onCanvasStateMutated
             var onViewportTransformChangedCallback: () -> Unit = onViewportTransformChanged
+            var onCanvasTouchStartCallback: () -> Unit = onCanvasTouchStart
+            var onNavigationGestureEndCallback: () -> Unit = onNavigationGestureEnd
         }
     }.apply {
         config = brushConfig
@@ -392,23 +409,53 @@ fun StylusDrawingSurface(
         latestIsOledMode = palette.isOledDeepBlack
         latestPaperConfig = paperConfig
         latestPalette = palette
+        latestCurrentPageOneBased = currentPageIndexOneBased
+        latestTotalPages = totalPages
         onTogglePenEraserCallback = onTogglePenEraser
         onMutatedCallback = onCanvasStateMutated
         onViewportTransformChangedCallback = onViewportTransformChanged
+        onCanvasTouchStartCallback = onCanvasTouchStart
+        onNavigationGestureEndCallback = onNavigationGestureEnd
     }
 
     fun startLassoInteraction(firstPt: DocPoint) {
         val bounds = lassoRuntime.selectionBounds
-        if (bounds != null && lassoRuntime.selectedIds.isNotEmpty() && bounds.inflate(18f).contains(firstPt.xPt, firstPt.yPt)) {
+        val distToRotateHandlePx = if (bounds != null) {
+            hypot(
+                (firstPt.xPt - bounds.rightPt) * transformMatrix.scale,
+                (firstPt.yPt - bounds.topPt) * transformMatrix.scale
+            )
+        } else {
+            Float.MAX_VALUE
+        }
+        val rotateHandleHitPx = with(density) { 28.dp.toPx() }
+        if (bounds != null && lassoRuntime.selectedIds.isNotEmpty() && distToRotateHandlePx <= rotateHandleHitPx) {
+            val cx = bounds.centerXPt
+            val cy = bounds.centerYPt
+            lassoRuntime.isRotatingSelection = true
+            lassoRuntime.rotationCenterXPt = cx
+            lassoRuntime.rotationCenterYPt = cy
+            lassoRuntime.rotationStartAngleRad = atan2(firstPt.yPt - cy, firstPt.xPt - cx)
+            lassoRuntime.liveRotationRadians = 0f
+            lassoRuntime.isDraggingSelection = false
+            lassoRuntime.dragOriginDoc = null
+            lassoRuntime.liveDeltaXPt = 0f
+            lassoRuntime.liveDeltaYPt = 0f
+            dryCanvasViewRef?.invalidate()
+        } else if (bounds != null && lassoRuntime.selectedIds.isNotEmpty() && bounds.inflate(18f).contains(firstPt.xPt, firstPt.yPt)) {
             lassoRuntime.isDraggingSelection = true
             lassoRuntime.dragOriginDoc = firstPt
             lassoRuntime.liveDeltaXPt = 0f
             lassoRuntime.liveDeltaYPt = 0f
+            lassoRuntime.isRotatingSelection = false
+            lassoRuntime.liveRotationRadians = 0f
             dryCanvasViewRef?.invalidate()
         } else {
             lassoRuntime.selectedIds = emptySet()
             lassoRuntime.selectionBounds = null
             lassoRuntime.isDraggingSelection = false
+            lassoRuntime.isRotatingSelection = false
+            lassoRuntime.liveRotationRadians = 0f
             lassoRuntime.activePolygon = ArrayList<DocPoint>(64).apply { add(firstPt) }
         }
         lassoSelectionVersion.longValue++
@@ -417,7 +464,15 @@ fun StylusDrawingSurface(
 
     fun moveLassoInteraction(points: List<DocPoint>) {
         if (points.isEmpty()) return
-        if (lassoRuntime.isDraggingSelection) {
+        if (lassoRuntime.isRotatingSelection) {
+            val last = points.last()
+            val currentAngle = atan2(
+                last.yPt - lassoRuntime.rotationCenterYPt,
+                last.xPt - lassoRuntime.rotationCenterXPt
+            )
+            lassoRuntime.liveRotationRadians = currentAngle - lassoRuntime.rotationStartAngleRad
+            dryCanvasViewRef?.invalidate()
+        } else if (lassoRuntime.isDraggingSelection) {
             val origin = lassoRuntime.dragOriginDoc ?: return
             val last = points.last()
             lassoRuntime.liveDeltaXPt = last.xPt - origin.xPt
@@ -431,7 +486,41 @@ fun StylusDrawingSurface(
 
     fun finishLassoInteraction(finalPoints: List<DocPoint>) {
         val stateHolder = dryStrokeStore as? CanvasStateHolder
-        if (lassoRuntime.isDraggingSelection) {
+        if (lassoRuntime.isRotatingSelection) {
+            if (finalPoints.isNotEmpty()) {
+                val endPt = finalPoints.last()
+                val currentAngle = atan2(
+                    endPt.yPt - lassoRuntime.rotationCenterYPt,
+                    endPt.xPt - lassoRuntime.rotationCenterXPt
+                )
+                lassoRuntime.liveRotationRadians = currentAngle - lassoRuntime.rotationStartAngleRad
+            }
+            val angleRad = lassoRuntime.liveRotationRadians
+            val cx = lassoRuntime.rotationCenterXPt
+            val cy = lassoRuntime.rotationCenterYPt
+            val selected = lassoRuntime.selectedIds
+            val oldBounds = lassoRuntime.selectionBounds
+            lassoRuntime.isRotatingSelection = false
+            lassoRuntime.rotationStartAngleRad = 0f
+            lassoRuntime.liveRotationRadians = 0f
+
+            if (stateHolder != null && selected.isNotEmpty() && abs(angleRad) > 0.005f) {
+                val rotation = AffineTransform2D.rotationAround(angleRad, cx, cy)
+                val dirty = stateHolder.transformStrokes(selected, rotation)
+                if (dirty != null) {
+                    for (id in selected) {
+                        oledStrokeCache.invalidate(id)
+                    }
+                    oldBounds?.let { dryInkRasterCache.invalidateDocRect(it) }
+                    dryInkRasterCache.invalidateDocRect(dirty)
+                    lassoRuntime.selectionBounds = stateHolder.computeSelectionBounds(selected)
+                    journalCommitSink.onStrokesTransformed(selected.toList(), rotation)
+                    dryDrawTick.longValue++
+                    routerConfigHolder.onMutatedCallback()
+                }
+            }
+            dryCanvasViewRef?.invalidate()
+        } else if (lassoRuntime.isDraggingSelection) {
             val origin = lassoRuntime.dragOriginDoc
             if (origin != null && finalPoints.isNotEmpty()) {
                 val endPt = finalPoints.last()
@@ -482,13 +571,16 @@ fun StylusDrawingSurface(
     }
 
     fun cancelLassoInteraction() {
-        val wasDragging = lassoRuntime.isDraggingSelection
+        val wasTransforming = lassoRuntime.isInteractingWithSelection
         lassoRuntime.isDraggingSelection = false
         lassoRuntime.dragOriginDoc = null
         lassoRuntime.liveDeltaXPt = 0f
         lassoRuntime.liveDeltaYPt = 0f
+        lassoRuntime.isRotatingSelection = false
+        lassoRuntime.rotationStartAngleRad = 0f
+        lassoRuntime.liveRotationRadians = 0f
         lassoRuntime.activePolygon = ArrayList()
-        if (wasDragging) {
+        if (wasTransforming) {
             dryCanvasViewRef?.invalidate()
         }
         lassoSelectionVersion.longValue++
@@ -844,6 +936,41 @@ fun StylusDrawingSurface(
     LaunchedEffect(paperConfig) {
         dryDrawTick.longValue++
     }
+    LaunchedEffect(transformMatrix, paperConfig.pageDimensions, viewportSize) {
+        val vp = viewportSize
+        if (!hasInitializedViewport && vp.width > 0 && vp.height > 0) {
+            transformMatrix.fitPageToViewport(
+                pageWidthPt = paperConfig.pageDimensions.widthPt,
+                pageHeightPt = paperConfig.pageDimensions.heightPt,
+                viewportWidthPx = vp.width.toFloat(),
+                viewportHeightPx = vp.height.toFloat()
+            )
+            dryInkRasterCache.syncInitialScale(transformMatrix.scale)
+            val initPaperConfig = routerConfigHolder.latestPaperConfig
+            val initPalette = routerConfigHolder.latestPalette
+            val isOled = initPalette.isOledDeepBlack
+            if (dryStrokeStore.spatialIndex.size > 0 || initPaperConfig.canvasMode == CanvasMode.FIXED_PAGE) {
+                withContext(Dispatchers.Default) {
+                    dryInkRasterCache.prewarmVisibleTiles(
+                        viewportWidthPx = vp.width,
+                        viewportHeightPx = vp.height,
+                        transformMatrix = transformMatrix,
+                        spatialIndex = dryStrokeStore.spatialIndex,
+                        isOledMode = isOled,
+                        pageWidthPt = initPaperConfig.pageDimensions.widthPt,
+                        pageHeightPt = initPaperConfig.pageDimensions.heightPt,
+                        paperConfig = initPaperConfig,
+                        palette = initPalette,
+                        strokeAdapter = { entry -> oledStrokeCache.adaptStroke(entry, isOled) }
+                    )
+                }
+            }
+            hasInitializedViewport = true
+            dryDrawTick.longValue++
+            dryCanvasViewRef?.invalidate()
+            routerConfigHolder.onViewportTransformChangedCallback()
+        }
+    }
     LaunchedEffect(dryDrawTick.longValue, externalDrawVersionTick, paperConfig, palette.isOledDeepBlack) {
         dryCanvasViewRef?.invalidate()
     }
@@ -1024,12 +1151,6 @@ fun StylusDrawingSurface(
                         FrameLayout.LayoutParams.MATCH_PARENT
                     )
                 }
-                val hintSession = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    context.getSystemService(PerformanceHintManager::class.java)
-                        ?.createHintSession(intArrayOf(Process.myTid()), 6_944_444L)
-                } else {
-                    null
-                }
                 val wetView = InProgressStrokesView(context).apply {
                     layoutParams = FrameLayout.LayoutParams(
                         FrameLayout.LayoutParams.MATCH_PARENT,
@@ -1066,9 +1187,6 @@ fun StylusDrawingSurface(
                         override fun onViewAttachedToWindow(v: View) = Unit
                         override fun onViewDetachedFromWindow(v: View) {
                             v.removeCallbacks(settleRunnable)
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                                hintSession?.close()
-                            }
                         }
                     })
 
@@ -1078,10 +1196,6 @@ fun StylusDrawingSurface(
                         wetStrokeSink = wetStrokeSink,
                         predictorBridge = predictorBridge,
                         onTransformChanged = {
-                            val wasInGesture = dryInkRasterCache.isGestureInProgress
-                            if (!wasInGesture && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                                hintSession?.reportActualWorkDuration(6_900_000L)
-                            }
                             dryInkRasterCache.onGestureTransformChanged()
                             dryCanvasView.invalidate()
                             if (lassoRuntime.selectedIds.isNotEmpty() || lassoRuntime.activePolygon.isNotEmpty()) {
@@ -1097,6 +1211,13 @@ fun StylusDrawingSurface(
                         },
                         onTogglePenEraser = {
                             routerConfigHolder.onTogglePenEraserCallback()
+                        },
+                        onCanvasTouchStart = {
+                            routerConfigHolder.onCanvasTouchStartCallback()
+                        },
+                        onNavigationGestureEnd = {
+                            routerConfigHolder.onViewportTransformChangedCallback()
+                            routerConfigHolder.onNavigationGestureEndCallback()
                         }
                     ).also { createdRouter ->
                         createdRouter.setStabilizationPercent(brushConfig.clampedStabilizationPercent)
@@ -1121,14 +1242,13 @@ fun StylusDrawingSurface(
                 }
 
                 dryCanvasView.onDrawCallback = { canvas ->
-                    val drawStartNs = System.nanoTime()
                     val paperCfg = routerConfigHolder.latestPaperConfig
                     val pal = routerConfigHolder.latestPalette
                     val isOled = pal.isOledDeepBlack
                     val vpW = dryCanvasView.width
                     val vpH = dryCanvasView.height
                     if (vpW > 0 && vpH > 0) {
-                        val usedComposite = !lassoRuntime.isDraggingSelection &&
+                        val usedComposite = !lassoRuntime.isInteractingWithSelection &&
                             dryInkRasterCache.drawCompositePageIfAvailable(
                                 canvas = canvas,
                                 transformMatrix = transformMatrix,
@@ -1154,28 +1274,53 @@ fun StylusDrawingSurface(
                                 spatialIndex = dryStrokeStore.spatialIndex,
                                 isOledMode = isOled,
                                 strokeAdapter = { entry -> oledStrokeCache.adaptStroke(entry, isOled) },
-                                excludedStrokeIds = if (lassoRuntime.isDraggingSelection) {
+                                excludedStrokeIds = if (lassoRuntime.isInteractingWithSelection) {
                                     lassoRuntime.selectedIds
                                 } else {
                                     emptySet()
                                 },
-                                excludedBounds = if (lassoRuntime.isDraggingSelection) {
+                                excludedBounds = if (lassoRuntime.isInteractingWithSelection) {
                                     lassoRuntime.selectionBounds
                                 } else {
                                     null
                                 }
                             )
                         }
+                        if (
+                            !usedComposite &&
+                            paperCfg.canvasMode == CanvasMode.FIXED_PAGE &&
+                            routerConfigHolder.latestTotalPages > 1
+                        ) {
+                            PaperBackgroundRenderer.drawAdjacentFixedPagesIfVisible(
+                                canvas = canvas,
+                                viewportWidthPx = vpW,
+                                viewportHeightPx = vpH,
+                                transformMatrix = transformMatrix,
+                                paperConfig = paperCfg,
+                                palette = pal,
+                                currentPageIndexOneBased = routerConfigHolder.latestCurrentPageOneBased,
+                                totalPages = routerConfigHolder.latestTotalPages
+                            )
+                        }
 
-                        // Live Lasso drag preview rendered directly with translated transform without rebuilding Strokes.
-                        if (lassoRuntime.isDraggingSelection && lassoRuntime.selectedIds.isNotEmpty()) {
+                        // Live Lasso move/rotate preview rendered directly with transformed matrix without rebuilding Strokes.
+                        if (lassoRuntime.isInteractingWithSelection && lassoRuntime.selectedIds.isNotEmpty()) {
                             val holder = dryStrokeStore as? CanvasStateHolder
                             if (holder != null) {
                                 transformMatrix.populateDocToScreenMatrix(livePreviewMatrix)
-                                livePreviewMatrix.preTranslate(
-                                    lassoRuntime.liveDeltaXPt,
-                                    lassoRuntime.liveDeltaYPt
-                                )
+                                if (lassoRuntime.isRotatingSelection) {
+                                    val angleDeg = (lassoRuntime.liveRotationRadians * (180.0 / PI)).toFloat()
+                                    livePreviewMatrix.preRotate(
+                                        angleDeg,
+                                        lassoRuntime.rotationCenterXPt,
+                                        lassoRuntime.rotationCenterYPt
+                                    )
+                                } else {
+                                    livePreviewMatrix.preTranslate(
+                                        lassoRuntime.liveDeltaXPt,
+                                        lassoRuntime.liveDeltaYPt
+                                    )
+                                }
                                 for (id in lassoRuntime.selectedIds) {
                                     val entry = holder.getStroke(id) ?: continue
                                     val renderStroke = oledStrokeCache.adaptStroke(entry, isOled)
@@ -1203,11 +1348,6 @@ fun StylusDrawingSurface(
                             dryCanvasView.postOnAnimation {
                                 dryCanvasView.invalidate()
                             }
-                        }
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                            hintSession?.reportActualWorkDuration(
-                                (System.nanoTime() - drawStartNs).coerceAtLeast(1_000_000L)
-                            )
                         }
                     }
                 }
@@ -1248,7 +1388,7 @@ fun StylusDrawingSurface(
         lassoSelectionVersion.longValue
         val selectedCount = lassoRuntime.selectedIds.size
         val stateHolder = dryStrokeStore as? CanvasStateHolder
-        if (selectedCount > 0 && stateHolder != null && !lassoRuntime.isDraggingSelection) {
+        if (selectedCount > 0 && stateHolder != null && !lassoRuntime.isInteractingWithSelection) {
             LassoSelectionActionBar(
                 selectedCount = selectedCount,
                 onAiAutoFormatSelection = {
@@ -1378,17 +1518,70 @@ private fun LassoSelectionCanvasOverlay(
                 bottomPt = bounds.bottomPt + dy
             )
             val screenRect = transformMatrix.docRectToScreenRect(shifted)
-            drawRect(
-                color = Color(0xFF1A56DB).copy(alpha = 0.08f),
-                topLeft = Offset(screenRect.leftPt, screenRect.topPt),
-                size = Size(screenRect.widthPt, screenRect.heightPt)
+            val center = Offset(
+                (screenRect.leftPt + screenRect.rightPt) * 0.5f,
+                (screenRect.topPt + screenRect.bottomPt) * 0.5f
             )
-            drawRect(
-                color = Color(0xFF1A56DB),
-                topLeft = Offset(screenRect.leftPt, screenRect.topPt),
-                size = Size(screenRect.widthPt, screenRect.heightPt),
-                style = ComposeStroke(width = 2f, pathEffect = dashEffect)
-            )
+            val angleDeg = if (lassoRuntime.isRotatingSelection) {
+                (lassoRuntime.liveRotationRadians * (180.0 / PI)).toFloat()
+            } else {
+                0f
+            }
+            rotate(degrees = angleDeg, pivot = center) {
+                drawRect(
+                    color = Color(0xFF1A56DB).copy(alpha = 0.08f),
+                    topLeft = Offset(screenRect.leftPt, screenRect.topPt),
+                    size = Size(screenRect.widthPt, screenRect.heightPt)
+                )
+                drawRect(
+                    color = Color(0xFF1A56DB),
+                    topLeft = Offset(screenRect.leftPt, screenRect.topPt),
+                    size = Size(screenRect.widthPt, screenRect.heightPt),
+                    style = ComposeStroke(width = 2f, pathEffect = dashEffect)
+                )
+                // Free-rotation handle in the top-right corner of the Lasso selection marquee.
+                val handleCenter = Offset(screenRect.rightPt, screenRect.topPt)
+                val handleRadiusPx = 14.dp.toPx()
+                drawCircle(
+                    color = Color.White,
+                    radius = handleRadiusPx,
+                    center = handleCenter
+                )
+                drawCircle(
+                    color = Color(0xFF1A56DB),
+                    radius = handleRadiusPx,
+                    center = handleCenter,
+                    style = ComposeStroke(width = 2.2f)
+                )
+                val iconRadius = handleRadiusPx * 0.48f
+                drawArc(
+                    color = Color(0xFF1A56DB),
+                    startAngle = -55f,
+                    sweepAngle = 270f,
+                    useCenter = false,
+                    topLeft = Offset(handleCenter.x - iconRadius, handleCenter.y - iconRadius),
+                    size = Size(iconRadius * 2f, iconRadius * 2f),
+                    style = ComposeStroke(width = 2f, cap = StrokeCap.Round)
+                )
+                val arrowTip = Offset(
+                    handleCenter.x + iconRadius * 0.62f,
+                    handleCenter.y - iconRadius * 0.80f
+                )
+                drawLine(
+                    color = Color(0xFF1A56DB),
+                    start = Offset(arrowTip.x - iconRadius * 0.42f, arrowTip.y - iconRadius * 0.08f),
+                    end = arrowTip,
+                    strokeWidth = 2f,
+                    cap = StrokeCap.Round
+                )
+                drawLine(
+                    color = Color(0xFF1A56DB),
+                    start = Offset(arrowTip.x + iconRadius * 0.05f, arrowTip.y + iconRadius * 0.42f),
+                    end = arrowTip,
+                    strokeWidth = 2f,
+                    cap = StrokeCap.Round
+                )
+            }
         }
     }
 }

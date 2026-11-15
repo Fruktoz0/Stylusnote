@@ -9,6 +9,7 @@ import hu.bdev.stylusnote.core.math.ShapeMeta
 import hu.bdev.stylusnote.domain.model.AffineTransform2D
 import hu.bdev.stylusnote.domain.model.BrushConfig
 import hu.bdev.stylusnote.domain.model.BrushToolType
+import hu.bdev.stylusnote.domain.model.GeometricShapeType
 import hu.bdev.stylusnote.domain.model.PageObject
 import hu.bdev.stylusnote.domain.model.PersistedStrokeRecord
 import hu.bdev.stylusnote.domain.model.StrokeLayerType
@@ -152,6 +153,17 @@ class StrokeJournalRoundTripTest {
                 canonicalColorArgb = 0xFF1A1F29.toInt(),
                 rotationRadians = 0.02f,
                 sourceStrokeIds = listOf(stroke.id)
+            ),
+            PageObject.GeometricShapeObject(
+                id = "shape-1",
+                zOrder = 106L,
+                bounds = DocRect(120f, 200f, 260f, 340f),
+                shapeType = GeometricShapeType.CYLINDER,
+                strokeWidthPt = 1.6f,
+                canonicalStrokeColorArgb = 0xFF111827.toInt(),
+                hasFill = true,
+                canonicalFillColorArgb = 0x26111827,
+                rotationRadians = 0.35f
             )
         )
 

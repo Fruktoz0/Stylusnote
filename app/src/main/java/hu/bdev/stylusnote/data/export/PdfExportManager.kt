@@ -17,6 +17,7 @@ import hu.bdev.stylusnote.core.hardware.StylusPointSample
 import hu.bdev.stylusnote.core.ai.FunctionEvaluator
 import hu.bdev.stylusnote.core.math.CanvasTransformMatrix
 import hu.bdev.stylusnote.core.math.DocPoint
+import hu.bdev.stylusnote.core.math.GeometricShapeRenderer
 import hu.bdev.stylusnote.core.math.PageDimensionsPt
 import hu.bdev.stylusnote.domain.model.BrushConfig
 import hu.bdev.stylusnote.domain.model.BrushToolType
@@ -426,6 +427,19 @@ class PdfExportManager(
                 }
                 layout.draw(canvas)
                 canvas.restore()
+            }
+
+            is PageObject.GeometricShapeObject -> {
+                GeometricShapeRenderer.drawShape(
+                    canvas = canvas,
+                    shapeType = obj.shapeType,
+                    bounds = RectF(obj.bounds.leftPt, obj.bounds.topPt, obj.bounds.rightPt, obj.bounds.bottomPt),
+                    strokeWidthPx = obj.strokeWidthPt.coerceIn(0.4f, 12f),
+                    strokeColorArgb = obj.canonicalStrokeColorArgb,
+                    hasFill = obj.hasFill,
+                    fillColorArgb = obj.canonicalFillColorArgb,
+                    rotationRadians = obj.rotationRadians
+                )
             }
         }
     }

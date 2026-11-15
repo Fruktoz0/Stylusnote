@@ -17,6 +17,7 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -24,6 +25,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -41,7 +43,6 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Gesture
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.Tune
-import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -64,6 +65,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
@@ -76,7 +78,11 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -130,24 +136,24 @@ class BrushPresetStore(private val context: Context) {
         val defaultPresets: List<BrushConfig> = listOf(
             BrushConfig(
                 toolType = BrushToolType.FOUNTAIN_PEN,
-                sizePt = 2.5f,
+                sizePt = 2.0f,
                 colorArgb = 0xFF14171C.toInt(),
                 opacity = 1.0f,
                 stabilizationPercent = 25f
             ),
             BrushConfig(
-                toolType = BrushToolType.BALLPOINT_PEN,
-                sizePt = 1.8f,
+                toolType = BrushToolType.FOUNTAIN_PEN,
+                sizePt = 1.0f,
                 colorArgb = 0xFF1A56DB.toInt(),
                 opacity = 1.0f,
                 stabilizationPercent = 15f
             ),
             BrushConfig(
-                toolType = BrushToolType.PENCIL,
-                sizePt = 3.0f,
+                toolType = BrushToolType.FOUNTAIN_PEN,
+                sizePt = 4.0f,
                 colorArgb = 0xFF334155.toInt(),
-                opacity = 0.85f,
-                stabilizationPercent = 20f
+                opacity = 1.0f,
+                stabilizationPercent = 25f
             ),
             BrushConfig(
                 toolType = BrushToolType.HIGHLIGHTER,
@@ -158,7 +164,7 @@ class BrushPresetStore(private val context: Context) {
             ),
             BrushConfig(
                 toolType = BrushToolType.FOUNTAIN_PEN,
-                sizePt = 2.8f,
+                sizePt = 2.0f,
                 colorArgb = 0xFFD92D20.toInt(),
                 opacity = 1.0f,
                 stabilizationPercent = 30f
@@ -219,32 +225,95 @@ private val QUICK_COLOR_PALETTE = listOf(
     0xFFFACC15.toInt()
 )
 
-private val QUICK_SIZE_PRESETS_PT = listOf(1.5f, 2.5f, 5.0f, 12.0f)
+private val QUICK_SIZE_PRESETS_PT = listOf(1.0f, 2.0f, 4.0f, 8.0f)
+private val QUICK_HIGHLIGHTER_SIZE_PRESETS_PT = listOf(8.0f, 12.0f, 16.0f, 24.0f)
 private val QUICK_ERASER_RADII_DP = listOf(12f, 20f, 32f, 44f)
 
 /**
- * Two-stage StarNote side-tab popover (IMG_2728).
+ * Computes an anchored viewport offset placing the popover adjacent to [anchorBoundsPx]
+ * while keeping the entire popup inside [viewportSize].
+ */
+fun computeAnchoredPopoverOffsetPx(
+    anchorBoundsPx: Rect,
+    popoverSizePx: IntSize,
+    viewportSize: IntSize,
+    marginPx: Int = 16,
+    gapPx: Int = 12
+): IntOffset {
+    if (viewportSize.width <= 0 || viewportSize.height <= 0 || popoverSizePx.width <= 0 || popoverSizePx.height <= 0) {
+        return IntOffset(marginPx, marginPx)
+    }
+    val maxX = (viewportSize.width - popoverSizePx.width - marginPx).coerceAtLeast(marginPx)
+    val maxY = (viewportSize.height - popoverSizePx.height - marginPx).coerceAtLeast(marginPx)
+    if (anchorBoundsPx.width <= 0f || anchorBoundsPx.height <= 0f) {
+        return IntOffset(maxX, ((viewportSize.height - popoverSizePx.height) / 2).coerceIn(marginPx, maxY))
+    }
+
+    val isHorizontalDock = anchorBoundsPx.width >= anchorBoundsPx.height
+    return if (isHorizontalDock) {
+        val centeredX = (anchorBoundsPx.center.x - popoverSizePx.width / 2f).roundToInt()
+        val resolvedX = centeredX.coerceIn(marginPx, maxX)
+        val spaceBelow = viewportSize.height - anchorBoundsPx.bottom - marginPx - gapPx
+        val spaceAbove = anchorBoundsPx.top - marginPx - gapPx
+        val rawY = if (spaceBelow >= popoverSizePx.height || spaceBelow >= spaceAbove) {
+            (anchorBoundsPx.bottom + gapPx).roundToInt()
+        } else {
+            (anchorBoundsPx.top - gapPx - popoverSizePx.height).roundToInt()
+        }
+        IntOffset(resolvedX, rawY.coerceIn(marginPx, maxY))
+    } else {
+        val spaceLeft = anchorBoundsPx.left - marginPx - gapPx
+        val spaceRight = viewportSize.width - anchorBoundsPx.right - marginPx - gapPx
+        val rawX = if (spaceLeft >= popoverSizePx.width || spaceLeft >= spaceRight) {
+            (anchorBoundsPx.left - gapPx - popoverSizePx.width).roundToInt()
+        } else {
+            (anchorBoundsPx.right + gapPx).roundToInt()
+        }
+        val rawY = anchorBoundsPx.top.roundToInt()
+        IntOffset(rawX.coerceIn(marginPx, maxX), rawY.coerceIn(marginPx, maxY))
+    }
+}
+
+/**
+ * Two-stage StarNote side-tab popover anchored near [anchorBoundsPx].
  *
- * Opens compact with only the most frequently adjusted essentials (quick sizes, swatches, opacity,
- * or eraser radius) and expands smoothly to the full studio (presets, HSV wheel/HEX, 1-Euro
- * stabilization, pressure curves, Hold-to-Snap) when dragged horizontally wider or toggled.
- * Closes via both ESC key press and backdrop tap (UX Rule 11).
+ * Opens compact with quick sizes and colors (or eraser radius) and expands smoothly to the full
+ * studio (presets, HSV wheel/HEX, opacity, 1-Euro stabilization, pressure curves, Hold-to-Snap)
+ * when dragged wider or toggled. Closes via ESC key press and backdrop tap (UX Rule 11).
  */
 @Composable
 fun BrushSettingsPopover(
     currentConfig: BrushConfig,
     presets: List<BrushConfig>,
+    anchorBoundsPx: Rect = Rect.Zero,
+    viewportSize: IntSize = IntSize.Zero,
     onConfigChange: (BrushConfig) -> Unit,
     onSavePresetSlot: (Int, BrushConfig) -> Unit,
     onApplyPreset: (BrushConfig) -> Unit,
     onDismiss: () -> Unit
 ) {
     val surfacePalette = LocalStylusSurfacePalette.current
+    val density = LocalDensity.current
     var isExpandedFullStudio by remember { mutableStateOf(false) }
+    var popoverSizePx by remember { mutableStateOf(IntSize.Zero) }
     val panelWidth by animateDpAsState(
-        targetValue = if (isExpandedFullStudio) 472.dp else 312.dp,
+        targetValue = if (isExpandedFullStudio) 464.dp else 308.dp,
         label = "brushSidePanelWidth"
     )
+    val hasAnchor = anchorBoundsPx.width > 0f && viewportSize.width > 0 && viewportSize.height > 0
+    val marginPx = with(density) { 12.dp.roundToPx() }
+    val gapPx = with(density) { 10.dp.roundToPx() }
+    val resolvedPopoverOffset = if (hasAnchor && popoverSizePx.width > 0 && popoverSizePx.height > 0) {
+        computeAnchoredPopoverOffsetPx(
+            anchorBoundsPx = anchorBoundsPx,
+            popoverSizePx = popoverSizePx,
+            viewportSize = viewportSize,
+            marginPx = marginPx,
+            gapPx = gapPx
+        )
+    } else {
+        IntOffset(marginPx, marginPx)
+    }
 
     val focusRequester = remember { FocusRequester() }
     LaunchedEffect(Unit) {
@@ -287,7 +356,8 @@ fun BrushSettingsPopover(
         properties = DialogProperties(
             dismissOnBackPress = true,
             dismissOnClickOutside = true,
-            usePlatformDefaultWidth = false
+            usePlatformDefaultWidth = false,
+            decorFitsSystemWindows = false
         )
     ) {
         Box(
@@ -309,13 +379,20 @@ fun BrushSettingsPopover(
                     indication = null,
                     onClick = onDismiss
                 ),
-            contentAlignment = Alignment.CenterEnd
+            contentAlignment = if (hasAnchor) Alignment.TopStart else Alignment.CenterEnd
         ) {
             Surface(
                 modifier = Modifier
-                    .padding(end = 14.dp, top = 16.dp, bottom = 16.dp)
+                    .then(
+                        if (hasAnchor) {
+                            Modifier.offset { resolvedPopoverOffset }
+                        } else {
+                            Modifier.padding(end = 14.dp, top = 16.dp, bottom = 16.dp)
+                        }
+                    )
+                    .onSizeChanged { popoverSizePx = it }
                     .width(panelWidth)
-                    .heightIn(max = 760.dp)
+                    .heightIn(max = 680.dp)
                     .animateContentSize()
                     .border(
                         width = 1.dp,
@@ -332,7 +409,11 @@ fun BrushSettingsPopover(
                 shadowElevation = 16.dp,
                 color = MaterialTheme.colorScheme.surface
             ) {
-                Row(modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(IntrinsicSize.Min)
+                ) {
                     // Left edge drag/pull grip handle for smoothly expanding Stage 1 -> Stage 2.
                     var cumulativeDragPx by remember { mutableFloatStateOf(0f) }
                     Box(
@@ -385,8 +466,8 @@ fun BrushSettingsPopover(
                         modifier = Modifier
                             .weight(1f)
                             .verticalScroll(rememberScrollState())
-                            .padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         // Header
                         Row(
@@ -533,7 +614,12 @@ fun BrushSettingsPopover(
                                     modifier = Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                                 ) {
-                                    QUICK_SIZE_PRESETS_PT.forEach { presetPt ->
+                                    val sizePresets = if (currentConfig.toolType.isHighlighter) {
+                                        QUICK_HIGHLIGHTER_SIZE_PRESETS_PT
+                                    } else {
+                                        QUICK_SIZE_PRESETS_PT
+                                    }
+                                    sizePresets.forEach { presetPt ->
                                         val isSelected = kotlin.math.abs(currentConfig.clampedSizePt - presetPt) < 0.25f
                                         Surface(
                                             onClick = { onConfigChange(currentConfig.copy(sizePt = presetPt)) },
@@ -707,33 +793,33 @@ fun BrushSettingsPopover(
                                 }
                             }
 
-                            // Stage 1 Essential 3: Quick Opacity (+ Stage 2 Stabilization)
-                            StudioSectionCard {
-                                if (currentConfig.toolType == BrushToolType.HIGHLIGHTER) {
-                                    SettingSliderHeader(
-                                        title = "Átlátszóság",
-                                        valueBadge = "35% fix"
-                                    )
-                                    Text(
-                                        text = "Önátfedés-mentes kiemelő mód aktív.",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                } else {
-                                    SettingSliderHeader(
-                                        title = "Átlátszóság",
-                                        valueBadge = "${(currentConfig.effectiveOpacity() * 100f).roundToInt()}%"
-                                    )
-                                    Slider(
-                                        value = currentConfig.opacity.coerceIn(BrushConfig.MIN_OPACITY, 1f),
-                                        onValueChange = { nextOpacity ->
-                                            onConfigChange(currentConfig.copy(opacity = nextOpacity))
-                                        },
-                                        valueRange = BrushConfig.MIN_OPACITY..1.0f
-                                    )
-                                }
+                            // Stage 2 Only: Opacity + 1-Euro Stabilization
+                            if (isExpandedFullStudio) {
+                                StudioSectionCard {
+                                    if (currentConfig.toolType == BrushToolType.HIGHLIGHTER) {
+                                        SettingSliderHeader(
+                                            title = "Átlátszóság",
+                                            valueBadge = "35% fix"
+                                        )
+                                        Text(
+                                            text = "Önátfedés-mentes kiemelő mód aktív.",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    } else {
+                                        SettingSliderHeader(
+                                            title = "Átlátszóság",
+                                            valueBadge = "${(currentConfig.effectiveOpacity() * 100f).roundToInt()}%"
+                                        )
+                                        Slider(
+                                            value = currentConfig.opacity.coerceIn(BrushConfig.MIN_OPACITY, 1f),
+                                            onValueChange = { nextOpacity ->
+                                                onConfigChange(currentConfig.copy(opacity = nextOpacity))
+                                            },
+                                            valueRange = BrushConfig.MIN_OPACITY..1.0f
+                                        )
+                                    }
 
-                                if (isExpandedFullStudio) {
                                     HorizontalDivider(
                                         modifier = Modifier.padding(vertical = 2.dp),
                                         color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
@@ -952,30 +1038,7 @@ fun BrushSettingsPopover(
                                         )
                                     }
                                 }
-                            } else {
-                                Surface(
-                                    onClick = { isExpandedFullStudio = true },
-                                    shape = RoundedCornerShape(12.dp),
-                                    color = surfacePalette.activePillBackground,
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Text(
-                                        text = "◂ Húzd szét balra vagy bökj ide a teljes funkciókért",
-                                        style = MaterialTheme.typography.labelMedium,
-                                        fontWeight = FontWeight.SemiBold,
-                                        color = MaterialTheme.colorScheme.primary,
-                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp)
-                                    )
-                                }
                             }
-                        }
-
-                        Button(
-                            onClick = onDismiss,
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text("Kész", fontWeight = FontWeight.SemiBold)
                         }
                     }
                 }

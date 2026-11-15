@@ -3,6 +3,7 @@ package hu.bdev.stylusnote.domain.model
 import hu.bdev.stylusnote.core.hardware.StylusPointSample
 import hu.bdev.stylusnote.core.math.DocRect
 import hu.bdev.stylusnote.core.math.ShapeMeta
+import kotlin.math.atan2
 
 /**
  * Z-ordered canvas layer for persisted ink strokes (Section 3 & 9.2).
@@ -186,6 +187,87 @@ sealed interface PageObject {
             bounds = affine.transformRect(bounds),
             fontSizePt = (fontSizePt * affine.averageScaleFactor()).coerceIn(10f, 96f)
         )
+    }
+
+    /**
+     * Movable, resizable, freely rotatable vector geometric shape inserted from the toolbar Shape picker.
+     */
+    data class GeometricShapeObject(
+        override val id: String,
+        override val zOrder: Long,
+        override val bounds: DocRect,
+        val shapeType: GeometricShapeType,
+        val strokeWidthPt: Float = 1.6f,
+        val canonicalStrokeColorArgb: Int = BrushConfig.DEFAULT_INK_COLOR_ARGB,
+        val hasFill: Boolean = false,
+        val canonicalFillColorArgb: Int = 0x221E293B,
+        val rotationRadians: Float = 0f
+    ) : PageObject {
+        override fun transform(affine: AffineTransform2D): PageObject {
+            val scale = affine.averageScaleFactor()
+            val newCenter = affine.transformPoint(bounds.centerXPt, bounds.centerYPt)
+            val halfW = (bounds.widthPt * 0.5f * scale).coerceAtLeast(8f)
+            val halfH = (bounds.heightPt * 0.5f * scale).coerceAtLeast(8f)
+            val deltaRot = atan2(affine.shearY, affine.scaleX)
+            return copy(
+                bounds = DocRect(
+                    leftPt = newCenter.xPt - halfW,
+                    topPt = newCenter.yPt - halfH,
+                    rightPt = newCenter.xPt + halfW,
+                    bottomPt = newCenter.yPt + halfH
+                ),
+                rotationRadians = rotationRadians + deltaRot
+            )
+        }
+    }
+}
+
+/**
+ * Vector shape catalog ordered to match the 4x6 geometry grid + essential 2D shapes.
+ */
+enum class GeometricShapeType(
+    val displayNameHu: String,
+    val is3D: Boolean = false,
+    val catalogPage: Int = 0
+) {
+    // Page 0: 4x6 grid matching the Geometry Shapes reference panel
+    TRAPEZOID("Trapéz"),
+    PARALLELOGRAM("Paralelogramma"),
+    DIAMOND("Rombusz"),
+    PENTAGON("Ötszög"),
+    HEXAGON("Hatszög"),
+    OCTAGON("Nyolcszög"),
+    CIRCLE("Kör"),
+    ELLIPSE("Ellipszis"),
+    STAR_FIVE("Csillag"),
+    CONE("Kúp", is3D = true),
+    TETRAHEDRON("Háromoldalú gúla", is3D = true),
+    SQUARE_PYRAMID("Négyoldalú gúla", is3D = true),
+    ROOF_TRIANGULAR_PRISM("Fekvő hasáb", is3D = true),
+    OBLIQUE_PYRAMID("Ferde gúla", is3D = true),
+    UPRIGHT_TRIANGULAR_PRISM("Háromszög hasáb", is3D = true),
+    RECTANGULAR_PRISM("Téglatest", is3D = true),
+    CUBE("Kocka", is3D = true),
+    PENTAGONAL_PRISM("Ötszögű hasáb", is3D = true),
+    HEXAGONAL_PRISM("Hatszögű hasáb", is3D = true),
+    CYLINDER("Henger", is3D = true),
+    HOLLOW_CYLINDER("Üreges henger", is3D = true),
+    FRUSTUM_PYRAMID("Csonkagúla", is3D = true),
+    FRUSTUM_CONE("Csonkakúp", is3D = true),
+    HEMISPHERE("Félgömb", is3D = true),
+
+    // Page 1: Essential 2D shapes & arrows
+    RECTANGLE("Téglalap", catalogPage = 1),
+    ROUNDED_RECTANGLE("Lekerekített téglalap", catalogPage = 1),
+    TRIANGLE("Háromszög", catalogPage = 1),
+    RIGHT_TRIANGLE("Derékszögű háromszög", catalogPage = 1),
+    LINE("Egyenes szakasz", catalogPage = 1),
+    ARROW("Nyíl", catalogPage = 1),
+    DOUBLE_ARROW("Kétirányú nyíl", catalogPage = 1),
+    AXES_2D("Koordináta-rendszer", catalogPage = 1);
+
+    companion object {
+        fun forCatalogPage(page: Int): List<GeometricShapeType> = entries.filter { it.catalogPage == page }
     }
 }
 

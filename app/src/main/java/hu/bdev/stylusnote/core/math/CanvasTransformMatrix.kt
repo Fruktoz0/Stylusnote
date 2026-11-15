@@ -3,6 +3,7 @@ package hu.bdev.stylusnote.core.math
 import android.graphics.Matrix
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 /**
  * Document-space coordinates expressed in PDF points (1 pt = 1/72 inch).
@@ -31,6 +32,8 @@ data class DocRect(
 ) {
     val widthPt: Float get() = rightPt - leftPt
     val heightPt: Float get() = bottomPt - topPt
+    val centerXPt: Float get() = (leftPt + rightPt) * 0.5f
+    val centerYPt: Float get() = (topPt + bottomPt) * 0.5f
     val isEmpty: Boolean get() = rightPt <= leftPt || bottomPt <= topPt
 
     fun contains(xPt: Float, yPt: Float): Boolean =
@@ -95,6 +98,7 @@ class CanvasTransformMatrix(
     initialPanXPx: Float = 0f,
     initialPanYPx: Float = 0f
 ) {
+    private var _baseFitScale: Float = 1.0f
     private var _scale: Float = clampScale(initialScale)
     private var _panXPx: Float = initialPanXPx
     private var _panYPx: Float = initialPanYPx
@@ -102,6 +106,23 @@ class CanvasTransformMatrix(
 
     val scale: Float
         @Synchronized get() = _scale
+
+    val baseFitScale: Float
+        @Synchronized get() = _baseFitScale
+
+    /**
+     * Zoom percentage normalized so the page-fit scale (`fitPageToViewport`) reads as 100%.
+     */
+    val relativeZoomPercent: Int
+        @Synchronized get() = ((_scale / _baseFitScale.coerceAtLeast(0.01f)) * 100f)
+            .roundToInt()
+            .coerceIn(10, 2000)
+
+    private fun clampInstanceScale(candidate: Float): Float {
+        val minBound = max(MIN_SCALE, _baseFitScale * 0.65f)
+        val maxBound = max(MAX_SCALE, _baseFitScale * 5.0f)
+        return candidate.coerceIn(minBound, maxBound)
+    }
 
     val panXPx: Float
         @Synchronized get() = _panXPx
@@ -122,7 +143,7 @@ class CanvasTransformMatrix(
 
     @Synchronized
     fun setTransform(scale: Float, panXPx: Float, panYPx: Float) {
-        val clamped = clampScale(scale)
+        val clamped = clampInstanceScale(scale)
         if (clamped == _scale && panXPx == _panXPx && panYPx == _panYPx) return
         _scale = clamped
         _panXPx = panXPx
@@ -153,7 +174,7 @@ class CanvasTransformMatrix(
         if (zoomFactor <= 0f || !zoomFactor.isFinite()) return
 
         val oldScale = _scale
-        val newScale = clampScale(oldScale * zoomFactor)
+        val newScale = clampInstanceScale(oldScale * zoomFactor)
 
         // Anchor document coordinate under the focal point before applying the new scale.
         val docX = (focalXPx - _panXPx) / oldScale
@@ -189,11 +210,13 @@ class CanvasTransformMatrix(
 
         val availWidth = viewportWidthPx - paddingPx * 2f
         val availHeight = viewportHeightPx - paddingPx * 2f
-        val targetScale = clampScale(min(availWidth / pageWidthPt, availHeight / pageHeightPt))
+        val targetScale = min(availWidth / pageWidthPt, availHeight / pageHeightPt)
+            .coerceIn(MIN_SCALE, MAX_SCALE * 2.0f)
 
         val scaledWidth = pageWidthPt * targetScale
         val scaledHeight = pageHeightPt * targetScale
 
+        _baseFitScale = targetScale.coerceAtLeast(0.1f)
         _scale = targetScale
         _panXPx = (viewportWidthPx - scaledWidth) * 0.5f
         _panYPx = (viewportHeightPx - scaledHeight) * 0.5f

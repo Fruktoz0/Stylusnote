@@ -32,6 +32,8 @@ import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.DragIndicator
 import androidx.compose.material.icons.filled.FitScreen
+import androidx.compose.material.icons.filled.Fullscreen
+import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.SwapVert
@@ -60,6 +62,8 @@ import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.boundsInParent
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
@@ -69,6 +73,7 @@ import hu.bdev.stylusnote.domain.model.BrushConfig
 import hu.bdev.stylusnote.domain.model.BrushToolType
 import hu.bdev.stylusnote.ui.theme.LocalStylusSurfacePalette
 import hu.bdev.stylusnote.ui.theme.StylusIcons
+import kotlin.math.roundToInt
 
 /**
  * Globally positioned, freely draggable floating tool dock shared across all notebooks.
@@ -89,6 +94,7 @@ fun FloatingToolDock(
     canRedo: Boolean,
     isDarkTheme: Boolean,
     showDebugOverlay: Boolean,
+    isFullScreen: Boolean = false,
     onUpdateDockPrefs: (ToolDockPrefs) -> Unit,
     onSelectTool: (BrushToolType) -> Unit,
     onOpenSettings: () -> Unit,
@@ -98,6 +104,11 @@ fun FloatingToolDock(
     onFitPage: () -> Unit,
     onToggleTheme: () -> Unit,
     onToggleDebugOverlay: () -> Unit,
+    onToggleFullScreen: () -> Unit = {},
+    onOpenShapes: () -> Unit = {},
+    onTriggerNotebookOcr: () -> Unit = {},
+    isOcrRunning: Boolean = false,
+    onDockBoundsChanged: (Rect) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var dockSizePx by remember { mutableStateOf(IntSize.Zero) }
@@ -174,6 +185,7 @@ fun FloatingToolDock(
             modifier = Modifier
                 .offset { IntOffset(resolvedOrigin.x, resolvedOrigin.y) }
                 .onSizeChanged { dockSizePx = it }
+                .onGloballyPositioned { coords -> onDockBoundsChanged(coords.boundsInParent()) }
                 .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
                 .animateContentSize(),
             shape = RoundedCornerShape(22.dp),
@@ -228,12 +240,17 @@ fun FloatingToolDock(
                         canRedo = canRedo,
                         isDarkTheme = isDarkTheme,
                         showDebugOverlay = showDebugOverlay,
+                        isFullScreen = isFullScreen,
+                        isOcrRunning = isOcrRunning,
                         onUndo = onUndo,
                         onRedo = onRedo,
                         onFitPage = onFitPage,
+                        onOpenShapes = onOpenShapes,
+                        onTriggerNotebookOcr = onTriggerNotebookOcr,
                         onOpenPaperSettings = onOpenPaperSettings,
                         onToggleTheme = onToggleTheme,
-                        onToggleDebugOverlay = onToggleDebugOverlay
+                        onToggleDebugOverlay = onToggleDebugOverlay,
+                        onToggleFullScreen = onToggleFullScreen
                     )
                     IconButton(
                         onClick = { onUpdateDockPrefs(dockPrefs.copy(isVertical = false)) },
@@ -284,12 +301,17 @@ fun FloatingToolDock(
                         canRedo = canRedo,
                         isDarkTheme = isDarkTheme,
                         showDebugOverlay = showDebugOverlay,
+                        isFullScreen = isFullScreen,
+                        isOcrRunning = isOcrRunning,
                         onUndo = onUndo,
                         onRedo = onRedo,
                         onFitPage = onFitPage,
+                        onOpenShapes = onOpenShapes,
+                        onTriggerNotebookOcr = onTriggerNotebookOcr,
                         onOpenPaperSettings = onOpenPaperSettings,
                         onToggleTheme = onToggleTheme,
-                        onToggleDebugOverlay = onToggleDebugOverlay
+                        onToggleDebugOverlay = onToggleDebugOverlay,
+                        onToggleFullScreen = onToggleFullScreen
                     )
                     IconButton(
                         onClick = { onUpdateDockPrefs(dockPrefs.copy(isVertical = true)) },
@@ -335,12 +357,11 @@ private fun CollapsedDockContent(
     onUndo: () -> Unit,
     onExpand: () -> Unit
 ) {
-    val activePenTool = if (!brushConfig.toolType.isEraser && brushConfig.toolType != BrushToolType.LASSO) {
-        brushConfig.toolType
-    } else if (!lastDrawingTool.isEraser && lastDrawingTool != BrushToolType.LASSO) {
-        lastDrawingTool
-    } else {
-        BrushToolType.FOUNTAIN_PEN
+    val activePenTool = when {
+        brushConfig.toolType == BrushToolType.HIGHLIGHTER -> BrushToolType.HIGHLIGHTER
+        !brushConfig.toolType.isEraser && brushConfig.toolType != BrushToolType.LASSO -> BrushToolType.FOUNTAIN_PEN
+        lastDrawingTool == BrushToolType.HIGHLIGHTER -> BrushToolType.HIGHLIGHTER
+        else -> BrushToolType.FOUNTAIN_PEN
     }
     val activeEraser = if (brushConfig.toolType.isEraser) {
         brushConfig.toolType
@@ -459,8 +480,6 @@ private fun ToolButtonsGroup(
 
     val toolOrder = listOf(
         BrushToolType.FOUNTAIN_PEN,
-        BrushToolType.BALLPOINT_PEN,
-        BrushToolType.PENCIL,
         BrushToolType.HIGHLIGHTER,
         BrushToolType.VECTOR_ERASER,
         BrushToolType.PRECISION_ERASER,
@@ -516,7 +535,11 @@ private fun ToolButtonsGroup(
                         .border(1.5.dp, MaterialTheme.colorScheme.onSurface.copy(alpha = 0.25f), CircleShape)
                 )
                 Text(
-                    text = "${"%.0f".format(brushConfig.clampedSizePt)}pt",
+                    text = if (brushConfig.toolType.isEraser) {
+                        "${brushConfig.eraserRadiusDp.roundToInt()}dp"
+                    } else {
+                        "${"%.0f".format(brushConfig.clampedSizePt)}pt"
+                    },
                     style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -536,7 +559,11 @@ private fun ToolButtonsGroup(
                         .border(1.5.dp, MaterialTheme.colorScheme.onSurface.copy(alpha = 0.25f), CircleShape)
                 )
                 Text(
-                    text = "${"%.1f".format(brushConfig.clampedSizePt)} pt",
+                    text = if (brushConfig.toolType.isEraser) {
+                        "${brushConfig.eraserRadiusDp.roundToInt()} dp"
+                    } else {
+                        "${"%.1f".format(brushConfig.clampedSizePt)} pt"
+                    },
                     style = MaterialTheme.typography.labelMedium,
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onSurface
@@ -558,12 +585,17 @@ private fun ActionButtonsGroup(
     canRedo: Boolean,
     isDarkTheme: Boolean,
     showDebugOverlay: Boolean,
+    isFullScreen: Boolean,
+    isOcrRunning: Boolean,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
     onFitPage: () -> Unit,
+    onOpenShapes: () -> Unit,
+    onTriggerNotebookOcr: () -> Unit,
     onOpenPaperSettings: () -> Unit,
     onToggleTheme: () -> Unit,
-    onToggleDebugOverlay: () -> Unit
+    onToggleDebugOverlay: () -> Unit,
+    onToggleFullScreen: () -> Unit
 ) {
     IconButton(
         onClick = onUndo,
@@ -587,6 +619,20 @@ private fun ActionButtonsGroup(
             modifier = Modifier.size(20.dp)
         )
     }
+    DockToolIconButton(
+        icon = StylusIcons.ShapesTool,
+        contentDescription = "Alakzatok beszúrása",
+        selected = false,
+        onClick = onOpenShapes,
+        onLongClick = onOpenShapes
+    )
+    DockToolIconButton(
+        icon = StylusIcons.OcrText,
+        contentDescription = "Füzet OCR felismerés",
+        selected = isOcrRunning,
+        onClick = { if (!isOcrRunning) onTriggerNotebookOcr() },
+        onLongClick = { if (!isOcrRunning) onTriggerNotebookOcr() }
+    )
     IconButton(
         onClick = onFitPage,
         modifier = Modifier.size(36.dp)
@@ -617,6 +663,13 @@ private fun ActionButtonsGroup(
             modifier = Modifier.size(20.dp)
         )
     }
+    DockToolIconButton(
+        icon = if (isFullScreen) Icons.Filled.FullscreenExit else Icons.Filled.Fullscreen,
+        contentDescription = if (isFullScreen) "Kilépés a teljes képernyőből" else "Teljes képernyő",
+        selected = isFullScreen,
+        onClick = onToggleFullScreen,
+        onLongClick = onToggleFullScreen
+    )
     DockToolIconButton(
         icon = Icons.Filled.BugReport,
         contentDescription = "FPS Overlay",

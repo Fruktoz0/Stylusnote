@@ -298,4 +298,83 @@ object StylusIcons {
             }
         }.build()
     }
+
+    /**
+     * Geometric shapes tool icon (overlapping square and circle) for inserting 2D/3D primitives.
+     */
+    val ShapesTool: ImageVector by lazy {
+        ImageVector.Builder(
+            name = "ShapesTool",
+            defaultWidth = 24.dp,
+            defaultHeight = 24.dp,
+            viewportWidth = 24f,
+            viewportHeight = 24f
+        ).apply {
+            path(
+                fill = null,
+                stroke = strokeBrush,
+                strokeLineWidth = 1.75f,
+                strokeLineCap = StrokeCap.Round,
+                strokeLineJoin = StrokeJoin.Round
+            ) {
+                // Top triangle
+                moveTo(12f, 3.2f)
+                lineTo(17.2f, 11.4f)
+                lineTo(6.8f, 11.4f)
+                close()
+                // Bottom-left square
+                moveTo(4f, 13.6f)
+                lineTo(10.8f, 13.6f)
+                lineTo(10.8f, 20.4f)
+                lineTo(4f, 20.4f)
+                close()
+                // Bottom-right circle (4 quadrant arcs)
+                moveTo(20.6f, 17f)
+                arcTo(3.6f, 3.6f, 0f, isMoreThanHalf = true, isPositiveArc = false, 13.4f, 17f)
+                arcTo(3.6f, 3.6f, 0f, isMoreThanHalf = true, isPositiveArc = false, 20.6f, 17f)
+                close()
+            }
+        }.build()
+    }
+
+    /**
+     * Whole-notebook handwriting-to-text OCR icon (`A` + scan corner brackets).
+     */
+    val OcrText: ImageVector by lazy {
+        ImageVector.Builder(
+            name = "OcrText",
+            defaultWidth = 24.dp,
+            defaultHeight = 24.dp,
+            viewportWidth = 24f,
+            viewportHeight = 24f
+        ).apply {
+            path(
+                fill = null,
+                stroke = strokeBrush,
+                strokeLineWidth = 1.75f,
+                strokeLineCap = StrokeCap.Round,
+                strokeLineJoin = StrokeJoin.Round
+            ) {
+                // Corner viewfinder brackets
+                moveTo(3.5f, 7.5f)
+                lineTo(3.5f, 4f)
+                lineTo(7f, 4f)
+                moveTo(17f, 4f)
+                lineTo(20.5f, 4f)
+                lineTo(20.5f, 7.5f)
+                moveTo(3.5f, 16.5f)
+                lineTo(3.5f, 20f)
+                lineTo(7f, 20f)
+                moveTo(17f, 20f)
+                lineTo(20.5f, 20f)
+                lineTo(20.5f, 16.5f)
+                // Central stylized 'A' glyph
+                moveTo(8.5f, 16.5f)
+                lineTo(12f, 7.5f)
+                lineTo(15.5f, 16.5f)
+                moveTo(9.7f, 13.6f)
+                lineTo(14.3f, 13.6f)
+            }
+        }.build()
+    }
 }

@@ -45,6 +45,7 @@ object StrokeBinarySerializer {
     private const val OBJECT_TAG_DERIVATION_CARD: Int = 3
     private const val OBJECT_TAG_PDF_PAGE_REF: Int = 4
     private const val OBJECT_TAG_FORMATTED_TEXT: Int = 5
+    private const val OBJECT_TAG_GEOMETRIC_SHAPE: Int = 6
 
     fun encodeStrokeRecord(record: PersistedStrokeRecord): ByteArray {
         val baos = ByteArrayOutputStream(256)
@@ -264,6 +265,7 @@ object StrokeBinarySerializer {
             is PageObject.DerivationCardObject -> OBJECT_TAG_DERIVATION_CARD
             is PageObject.PdfPageRefObject -> OBJECT_TAG_PDF_PAGE_REF
             is PageObject.FormattedTextObject -> OBJECT_TAG_FORMATTED_TEXT
+            is PageObject.GeometricShapeObject -> OBJECT_TAG_GEOMETRIC_SHAPE
         }
         out.writeByte(tag)
         writeIdentifier(out, obj.id)
@@ -317,6 +319,14 @@ object StrokeBinarySerializer {
                 for (srcId in obj.sourceStrokeIds) {
                     writeIdentifier(out, srcId)
                 }
+            }
+            is PageObject.GeometricShapeObject -> {
+                writeUtfString(out, obj.shapeType.name)
+                out.writeFloat(obj.strokeWidthPt)
+                out.writeInt(obj.canonicalStrokeColorArgb)
+                out.writeBoolean(obj.hasFill)
+                out.writeInt(obj.canonicalFillColorArgb)
+                out.writeFloat(obj.rotationRadians)
             }
         }
 
@@ -413,6 +423,28 @@ object StrokeBinarySerializer {
                     canonicalColorArgb = color,
                     rotationRadians = rotation,
                     sourceStrokeIds = srcIds
+                )
+            }
+            OBJECT_TAG_GEOMETRIC_SHAPE -> {
+                val shapeName = readUtfString(input)
+                val shapeType = runCatching {
+                    hu.bdev.stylusnote.domain.model.GeometricShapeType.valueOf(shapeName)
+                }.getOrDefault(hu.bdev.stylusnote.domain.model.GeometricShapeType.RECTANGLE)
+                val strokeWidthPt = input.readFloat()
+                val canonicalStrokeColorArgb = input.readInt()
+                val hasFill = input.readBoolean()
+                val canonicalFillColorArgb = input.readInt()
+                val rotationRadians = input.readFloat()
+                PageObject.GeometricShapeObject(
+                    id = id,
+                    zOrder = zOrder,
+                    bounds = bounds,
+                    shapeType = shapeType,
+                    strokeWidthPt = strokeWidthPt,
+                    canonicalStrokeColorArgb = canonicalStrokeColorArgb,
+                    hasFill = hasFill,
+                    canonicalFillColorArgb = canonicalFillColorArgb,
+                    rotationRadians = rotationRadians
                 )
             }
             else -> throw IOException("Unknown PageObject tag: $tag")

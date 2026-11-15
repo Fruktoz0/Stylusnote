@@ -16,6 +16,7 @@ enum class CanvasMode(val displayName: String) {
 enum class PaperTemplateType(val displayName: String) {
     BLANK("Üres"),
     DOTTED_5MM("Pontozott (5 mm)"),
+    GRID_SIMPLE_5MM("Sima négyzethálós"),
     GRID_5MM("Négyzethálós (5 mm)"),
     RULED_8MM("Vonalas (8 mm)"),
     CORNELL("Cornell"),

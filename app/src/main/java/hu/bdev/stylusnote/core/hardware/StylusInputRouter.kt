@@ -288,7 +288,9 @@ class StylusInputRouter<TEvent>(
     internal val predictorBridge: MotionPredictorBridge<TEvent>? = null,
     private val onTransformChanged: () -> Unit = {},
     private val onHoverStateChanged: (HoverCursorState) -> Unit = {},
-    private val onTogglePenEraser: () -> Unit = {}
+    private val onTogglePenEraser: () -> Unit = {},
+    private val onCanvasTouchStart: () -> Unit = {},
+    private val onNavigationGestureEnd: () -> Unit = {}
 ) {
     var allowFingerDrawing: Boolean = false
     var pressureCurve: PressureCurve = PressureCurve.LINEAR
@@ -297,6 +299,13 @@ class StylusInputRouter<TEvent>(
     private var activeStrokeStartTimeMs: Long = 0L
     private var activeStrokeIsStylus: Boolean = false
     private var activeStrokeToolType: InputToolType = InputToolType.STYLUS
+
+    private var singleFingerPanActive: Boolean = false
+    private var singleFingerMoved: Boolean = false
+    private var prevSinglePointerId: Int = -1
+    private var prevSingleXPx: Float = 0f
+    private var prevSingleYPx: Float = 0f
+    private var stylusSeenInGesture: Boolean = false
 
     private var twoFingerNavActive: Boolean = false
     private var prevNavPointerId0: Int = -1
@@ -343,21 +352,31 @@ class StylusInputRouter<TEvent>(
         val isCanceled = frame.action == StylusAction.CANCEL ||
             (frame.flags and MotionEvent.FLAG_CANCELED) != 0
         if (isCanceled) {
-            val hadState = activeStrokePointerId != null || twoFingerNavActive
+            val hadState = activeStrokePointerId != null || twoFingerNavActive || singleFingerMoved
             cancelAllActiveGestures()
             return hadState
+        }
+
+        if (frame.action == StylusAction.DOWN) {
+            onCanvasTouchStart()
         }
 
         // Check if a stylus/eraser pointer is initiating a new stroke (even mid-pan).
         if (frame.action == StylusAction.DOWN || frame.action == StylusAction.POINTER_DOWN) {
             val actionPointer = frame.pointers.getOrNull(frame.actionIndex)
+            if (actionPointer != null &&
+                (actionPointer.toolType == MotionEvent.TOOL_TYPE_STYLUS ||
+                    actionPointer.toolType == MotionEvent.TOOL_TYPE_ERASER)
+            ) {
+                stylusSeenInGesture = true
+            }
             if (actionPointer != null && isAcceptedDrawingPointer(actionPointer, frame.pointers.size)) {
                 val isStylusOrEraser = actionPointer.toolType == MotionEvent.TOOL_TYPE_STYLUS ||
                     actionPointer.toolType == MotionEvent.TOOL_TYPE_ERASER
 
-                // Abort any ongoing two-finger pan/zoom when stylus takes priority.
+                // Abort any ongoing finger pan/zoom when stylus takes priority.
                 if (isStylusOrEraser) {
-                    twoFingerNavActive = false
+                    resetFingerNavigationState()
                 }
 
                 // If no stroke is currently active, begin a new one.
@@ -387,6 +406,7 @@ class StylusInputRouter<TEvent>(
                 }
                 StylusAction.UP -> {
                     finishStrokeForPointer(frame, activePointer)
+                    stylusSeenInGesture = false
                     true
                 }
                 StylusAction.POINTER_UP -> {
@@ -654,7 +674,7 @@ class StylusInputRouter<TEvent>(
 
     private fun handleTwoFingerNavigation(frame: StylusMotionFrame<TEvent>): Boolean {
         if (isStylusStrokeActive) {
-            twoFingerNavActive = false
+            resetFingerNavigationState()
             return false
         }
 
@@ -667,13 +687,57 @@ class StylusInputRouter<TEvent>(
             !isLifting && !isStylusOrEraser
         }
 
-        if (activeFingers.size < 2) {
-            val wasActive = twoFingerNavActive
-            twoFingerNavActive = false
-            prevNavPointerId0 = -1
-            prevNavPointerId1 = -1
-            return wasActive
+        if (activeFingers.isEmpty()) {
+            val wasNavigating = twoFingerNavActive || singleFingerMoved
+            resetFingerNavigationState()
+            if (frame.action == StylusAction.UP) {
+                stylusSeenInGesture = false
+            }
+            if (wasNavigating) {
+                onNavigationGestureEnd()
+            }
+            return wasNavigating
         }
+
+        if (activeFingers.size == 1) {
+            val f = activeFingers[0]
+            if (twoFingerNavActive) {
+                // Seamless downgrade from 2-finger pinch to 1-finger pan without coordinate jumps.
+                twoFingerNavActive = false
+                prevNavPointerId0 = -1
+                prevNavPointerId1 = -1
+                singleFingerPanActive = true
+                singleFingerMoved = true
+                prevSinglePointerId = f.pointerId
+                prevSingleXPx = f.xPx
+                prevSingleYPx = f.yPx
+                return true
+            }
+            if (allowFingerDrawing || stylusSeenInGesture) {
+                return false
+            }
+            if (!singleFingerPanActive || prevSinglePointerId != f.pointerId) {
+                singleFingerPanActive = true
+                singleFingerMoved = false
+                prevSinglePointerId = f.pointerId
+                prevSingleXPx = f.xPx
+                prevSingleYPx = f.yPx
+                return false
+            }
+            val dx = f.xPx - prevSingleXPx
+            val dy = f.yPx - prevSingleYPx
+            prevSingleXPx = f.xPx
+            prevSingleYPx = f.yPx
+            if (dx != 0f || dy != 0f) {
+                singleFingerMoved = true
+                transformMatrix.panBy(dx, dy)
+                onTransformChanged()
+            }
+            return singleFingerMoved
+        }
+
+        singleFingerPanActive = false
+        prevSinglePointerId = -1
 
         val p0 = activeFingers[0]
         val p1 = activeFingers[1]
@@ -707,6 +771,15 @@ class StylusInputRouter<TEvent>(
         prevNavCentroidYPx = centroidY
         twoFingerNavActive = true
         return true
+    }
+
+    private fun resetFingerNavigationState() {
+        singleFingerPanActive = false
+        singleFingerMoved = false
+        prevSinglePointerId = -1
+        twoFingerNavActive = false
+        prevNavPointerId0 = -1
+        prevNavPointerId1 = -1
     }
 
     private fun isAcceptedDrawingPointer(
@@ -751,7 +824,8 @@ class StylusInputRouter<TEvent>(
 
     private fun cancelAllActiveGestures() {
         cancelActiveStrokeOnly()
-        twoFingerNavActive = false
+        resetFingerNavigationState()
+        stylusSeenInGesture = false
     }
 }
 

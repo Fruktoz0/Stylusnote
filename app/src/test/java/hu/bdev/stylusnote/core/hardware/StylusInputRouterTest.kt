@@ -459,5 +459,62 @@ class StylusInputRouterTest {
         assertTrue(router.processTouchFrame(finger1Up))
         assertFalse(router.isStrokeActive)
     }
+
+    @Test
+    fun singleFingerPansWithoutZoomingWhenFingerDrawingDisabled() {
+        val transform = CanvasTransformMatrix(initialScale = 2.0f, initialPanXPx = 10f, initialPanYPx = 20f)
+        val sink = FakeWetStrokeSink()
+        var transformChanges = 0
+        var gestureEndedCount = 0
+        val router = StylusInputRouter(
+            transformMatrix = transform,
+            oneEuroFilter = OneEuroFilter(0f),
+            wetStrokeSink = sink,
+            onTransformChanged = { transformChanges++ },
+            onNavigationGestureEnd = { gestureEndedCount++ }
+        )
+
+        val down = StylusMotionFrame(
+            action = StylusAction.DOWN,
+            actionIndex = 0,
+            flags = 0,
+            buttonState = 0,
+            eventTimeMs = 10L,
+            eventTimeNanos = 10_000_000L,
+            pointers = listOf(StylusPointerSnapshot(0, MotionEvent.TOOL_TYPE_FINGER, 200f, 300f, 1f, 0f, 0f)),
+            rawEvent = FakeEvent("down")
+        )
+        assertFalse(router.processTouchFrame(down))
+
+        val move = StylusMotionFrame(
+            action = StylusAction.MOVE,
+            actionIndex = 0,
+            flags = 0,
+            buttonState = 0,
+            eventTimeMs = 18L,
+            eventTimeNanos = 18_000_000L,
+            pointers = listOf(StylusPointerSnapshot(0, MotionEvent.TOOL_TYPE_FINGER, 260f, 220f, 1f, 0f, 0f)),
+            rawEvent = FakeEvent("move")
+        )
+        assertTrue(router.processTouchFrame(move))
+        assertEquals(0, sink.rawStartCount)
+        assertEquals(1, transformChanges)
+        assertEquals(2.0f, transform.scale, 1e-6f)
+        assertEquals(70f, transform.panXPx, 1e-4f)
+        assertEquals(-60f, transform.panYPx, 1e-4f)
+
+        val up = StylusMotionFrame(
+            action = StylusAction.UP,
+            actionIndex = 0,
+            flags = 0,
+            buttonState = 0,
+            eventTimeMs = 26L,
+            eventTimeNanos = 26_000_000L,
+            pointers = listOf(StylusPointerSnapshot(0, MotionEvent.TOOL_TYPE_FINGER, 260f, 220f, 1f, 0f, 0f)),
+            rawEvent = FakeEvent("up")
+        )
+        assertTrue(router.processTouchFrame(up))
+        assertEquals(1, gestureEndedCount)
+    }
 }
 

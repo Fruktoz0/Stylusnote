@@ -7,6 +7,7 @@ import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.IOException
+import java.util.concurrent.TimeUnit
 
 /**
  * Pure-Kotlin RFC-8259 JSON parser and string escaper for Gemini REST payloads so all catalog
@@ -230,6 +231,15 @@ data class GeminiModelInfo(
     val isPreviewOrExperimental: Boolean
         get() = id.contains("preview", ignoreCase = true) ||
             id.contains("exp", ignoreCase = true)
+
+    /** Filters out specialized non-JSON/text variants (TTS, native-audio, image-gen, live dialog) from auto failover. */
+    val isSpecializedMediaVariant: Boolean
+        get() = id.contains("-tts", ignoreCase = true) ||
+            id.contains("audio", ignoreCase = true) ||
+            id.contains("dialog", ignoreCase = true) ||
+            id.contains("-live", ignoreCase = true) ||
+            id.contains("-image", ignoreCase = true) ||
+            id.contains("image-generation", ignoreCase = true)
 }
 
 data class ModelResolutionResult(
@@ -248,7 +258,7 @@ class ModelCatalogException(
  * deprecated model names (Section 0 & Section 2: handles `gemini-2.5-flash` retirement and 404).
  */
 class ModelCatalog(
-    private val httpClient: OkHttpClient = OkHttpClient(),
+    private val httpClient: OkHttpClient = defaultCatalogHttpClient(),
     private val baseUrl: String = DEFAULT_BASE_URL,
     private val clockNowMs: () -> Long = { System.currentTimeMillis() },
     private val cacheTtlMs: Long = DEFAULT_CACHE_TTL_MS
@@ -310,13 +320,61 @@ class ModelCatalog(
                 refreshCatalog(apiKey)
                 mutex.withLock { cachedModels }
             } catch (e: IOException) {
-                if (snapshot.first.isNotEmpty()) snapshot.first else throw e
+                if (snapshot.first.isNotEmpty()) snapshot.first else emptyList()
             }
         } else {
             snapshot.first
         }
 
         return selectBestFlashModel(models, normalizedOverride, snapshot.third)
+    }
+
+    /**
+     * Builds an ordered deduplicated failover chain of Flash models for Automatic / resilient
+     * execution. Never throws on offline or slow `/v1beta/models` catalog fetches.
+     */
+    suspend fun buildCandidateFlashModelChain(
+        apiKey: String,
+        userOverrideId: String? = null,
+        forceRefresh: Boolean = false
+    ): Pair<List<String>, String?> {
+        val resolution = resolveActiveFlashModel(
+            apiKey = apiKey,
+            userOverrideId = userOverrideId,
+            forceRefresh = forceRefresh
+        )
+        val retiredSnapshot = mutex.withLock { dynamicallyRetiredIds.toSet() }
+        val allRetired = (KNOWN_RETIRED_MODEL_IDS + retiredSnapshot).map(::normalizeModelId).toSet()
+
+        val chain = LinkedHashSet<String>()
+        if (resolution.selectedModelId.isNotBlank() && resolution.selectedModelId !in allRetired) {
+            chain += resolution.selectedModelId
+        }
+        for (discovered in resolution.availableFlashModels) {
+            if (!discovered.isRetired &&
+                !discovered.isSpecializedMediaVariant &&
+                discovered.id !in allRetired
+            ) {
+                chain += discovered.id
+            }
+        }
+        for (fallback in FALLBACK_FLASH_MODEL_CHAIN) {
+            val norm = normalizeModelId(fallback)
+            if (norm !in allRetired) {
+                chain += norm
+            }
+        }
+        return chain.toList() to resolution.retiredModelNoticeHu
+    }
+
+    suspend fun markModelRetiredLocally(modelId: String) {
+        val normalized = normalizeModelId(modelId)
+        mutex.withLock {
+            dynamicallyRetiredIds += normalized
+            cachedModels = cachedModels.map { m ->
+                if (m.id.equals(normalized, ignoreCase = true)) m.copy(isRetired = true) else m
+            }
+        }
     }
 
     /**
@@ -364,18 +422,29 @@ class ModelCatalog(
 
     companion object {
         const val DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com"
-        const val DEFAULT_FALLBACK_FLASH_MODEL = "gemini-3.8-flash"
+        const val DEFAULT_FALLBACK_FLASH_MODEL = "gemini-2.5-flash"
         const val DEFAULT_CACHE_TTL_MS = 6 * 60 * 60 * 1000L
 
-        /** Models known to be retired per Section 0 (`gemini-2.5-flash` shut down 2026-10-16). */
-        val KNOWN_RETIRED_MODEL_IDS: Set<String> = setOf(
-            "gemini-1.5-flash",
-            "gemini-1.5-flash-latest",
-            "gemini-1.5-pro",
-            "gemini-2.0-flash",
+        val FALLBACK_FLASH_MODEL_CHAIN: List<String> = listOf(
             "gemini-2.5-flash",
-            "gemini-2.5-flash-preview"
+            "gemini-2.0-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-1.5-flash"
         )
+
+        /** Legacy genuinely shut-down Gemini 1.0 model IDs. Active 1.5/2.0/2.5 Flash models remain enabled for auto failover. */
+        val KNOWN_RETIRED_MODEL_IDS: Set<String> = setOf(
+            "gemini-1.0-pro",
+            "gemini-1.0-pro-001",
+            "gemini-1.0-pro-vision",
+            "gemini-pro-vision"
+        )
+
+        internal fun defaultCatalogHttpClient(): OkHttpClient = OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .callTimeout(40, TimeUnit.SECONDS)
+            .build()
 
         fun normalizeModelId(raw: String): String =
             raw.trim().removePrefix("models/").lowercase()
@@ -431,13 +500,14 @@ class ModelCatalog(
                     !model.isRetired &&
                         model.id !in allRetired &&
                         model.isFlashFamily &&
-                        model.supportsGenerateContent
+                        model.supportsGenerateContent &&
+                        !model.isSpecializedMediaVariant
                 }
                 .sortedWith(FLASH_RANK_COMPARATOR)
 
             val bestAutoId = usableFlashModels.firstOrNull()?.id
                 ?: DEFAULT_FALLBACK_FLASH_MODEL.takeIf { it !in allRetired }
-                ?: "gemini-3.8-flash"
+                ?: "gemini-2.5-flash"
 
             val overrideId = normalizeModelIdOrNull(userOverrideId)
             if (overrideId != null) {

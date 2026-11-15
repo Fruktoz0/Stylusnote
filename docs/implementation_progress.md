@@ -6,14 +6,32 @@ Ez a dokumentum a `stylusnote_rendszerterv_v2.txt` alapján készült **17 lép�
 
 ## 1. Aktuális Átadási Állapot (Current Handoff State)
 
-- **Utolsó befejezett lépés:** `Lépés 24 (II. Ütem Lezárása: Végleges Tesztek, 144 Hz Benchmark, Dokumentáció & APK Telepítés)`
+- **Utolsó befejezett lépés:** `Lépés 31 (Befejezve — Phase III teljesítve)`
 - **Befejezés dátuma:** `2026-11-14`
 - **Aktuális projektállapot:**
-  - Mind a **I. Ütem (`Lépés 0–17`)**, mind a **II. Ütem (`Lépés 18–24` — StarNote UI/UX, Könyvespolc Drag & Drop, Szelektív PDF/NotebookLM, Globális Eszköztár, 2 lépcsős Ecsetfül, Szellemképmentes Lasszó `✨ AI` és 2 módú AI Formázó)** elkészült és ellenőrizve lett Xiaomi `25097RP43G` (Android 16 / SDK 36) táblagépen:
-    - JVM JUnit 4 egységtesztek (`testDebugUnitTest`): **16 tesztosztály, 64 teszt, 0 hiba, 0 kihagyás** ✅
-    - Műszerezett tesztek (`:app:connectedDebugAndroidTest`): **8/8 teszt sikeres (`0` hiba, `0` kihagyás)** ✅ (`25097RP43G - 16`)
-    - Macrobenchmark (`:benchmark:connectedBenchmarkAndroidTest`, `panAndZoom10kStrokesCanvasFrameTiming`, 5 iteráció, median `frameCount = 117,0`, `CV = 0,47%`): **`frameDurationCpuMs` P50 = `3,74 ms`, P90 = `5,04 ms`, P95 = `5,48 ms`, P99 = `6,88 ms`; `frameOverrunMs` P50 = `-7,95 ms`, P90 = `-6,79 ms`, P95 = `-6,23 ms`, P99 = `-4,35 ms`** ✅ (**P95 ≤ 6,94 ms teljesítve!**)
-- **Következő végrehajtandó lépés:** `Nincs — a II. Ütem (Lépés 18–24) minden lépése lezárva és verifikálva.`
+  - Mind a **I. Ütem (`Lépés 0–17`)**, a **II. Ütem (`Lépés 18–24`)**, és a **III. Ütem (`Lépés 25–31`)** elkészült és ellenőrizve lett (`25097RP43G`).
+    - **`Lépés 25` `[x]`**: 1 ujjas pan zoom nélkül, normalizált `100%` nagyítás (`relativeZoomPercent`), bal felső sarokba simuló `CanvasTopToolbar`, és `Teljes képernyő` mód kapcsoló az eszköztáron (`CanvasTransformMatrixTest` + `StylusInputRouterTest` ✅).
+    - **`Lépés 26` `[x]`**: 60s `OkHttpClient` olvasási időtúllépés + többlépcsős automatikus Flash modell-váltó sorozat (`gemini-2.5-flash` -> `gemini-2.0-flash` -> `gemini-2.5-flash-lite` -> `gemini-1.5-flash`), valamint a formázott szövegblokkok sticky kijelölésének megszüntetése és DPI-helyes betűméretezés (`GeminiClientAndCatalogTest` ✅).
+    - **`Lépés 27` `[x]`**: Golyóstoll/Ceruza eltávolítva az eszköztárról, `ToolDockPreferencesStore` független eszközönkénti vastagság/szín memória (`perToolConfigs`), Töltőtoll `1, 2, 4, 8 pt` gyorsméretek, eszköztárhoz rögzített `BrushSettingsPopover`, felesleges alsó térközök és "Húzd szét..." csík eltávolítása, Átlátszóság csak a teljes stúdió nézetben (`ToolDockPlacementTest` ✅).
+    - **`Lépés 28` `[x]`**: Oldal létrehozás és azonnali hiányzó 1. oldal perzisztálása (`AppDatabase.PageDao.getPagesForNotebook`), függőleges többoldalas lapelőnézet (`drawAdjacentFixedPagesIfVisible`) és 1 ujjas átgördülés (`onNavigationGestureEnd`), függőlegesen húzható `LeftPagePullTab`, Drag & Drop oldalátrendezés (`reorderPagesInNotebook`) és alsó oldalléptető sáv (`ToolDockPlacementTest` ✅).
+    - **`Lépés 29` `[x]`**: `PaperTemplateType.GRID_SIMPLE_5MM` (5x5 erősített vonalak nélküli sima négyzetháló), vizuális miniatűr előnézetes `PaperSettingsDialog` aktív jelöléssel, és a Könyvespolc `"PDF import"` gomb elrendezésének javítása (`ToolDockPlacementTest` ✅).
+    - **`Lépés 30` `[x]`**: Lasszó sarok-forgatás fogantyú (`StylusDrawingSurface`), Eszköztár `OCR` gomb (teljes füzet még nem formázott kézírásaira `ocrLanguage` alapján, `HandwritingToLatexConverter.formatUnformattedStrokesInPage`), és `Alakzatok` menü (`ShapePickerPopover`) + 24+8 2D/3D `GeometricShapeObject` + átméretezés/forgatás + SNOT `tag=6` + PDF export (`StrokeJournalRoundTripTest`, `testDebugUnitTest` ✅).
+    - **`Lépés 31` `[x]`**: Perfetto-trace elemzéssel feltárt aktív gesztus alatti Compose zoom-állapot / offscreen layer és `HintSession` Binder IPC kivezetése (`StylusDrawingSurface.kt`, `BookshelfScreen.kt`), teljes JVM + műszerezett tesztek (`69/69` unit + `8/8` androidTest ✅), 144 Hz Xiaomi Pad 8 (`25097RP43G`) Macrobenchmark (`P95 = 6,05 ms ≤ 6,94 ms` ✅), dokumentáció frissítése és debug APK telepítése.
+- **Következő végrehajtandó lépés:** `Phase III befejezve — eszközre telepítve és tesztekkel verifikálva`
+
+---
+
+## III. Ütem: Vászonfinomítás, Független Eszközmemória, Többoldalas Navigáció, Alakzatok & Füzet OCR (Lépés 25 – Lépés 31)
+
+| Lépés | Leírás | Státusz | Érintett főbb fájlok |
+|---|---|---|---|
+| **Lépés 25** | 1 ujjas pan, normalizált `100%` nagyítás, bal felső sarokba zárt `CanvasTopToolbar` & Teljes képernyő kapcsoló | `[x]` Kész | `StylusInputRouter.kt`, `CanvasTransformMatrix.kt`, `BookshelfScreen.kt`, `FloatingToolDock.kt` |
+| **Lépés 26** | AI 60s olvasási timeout + multi-Flash failover, nem-sticky `FormattedTextObject` kijelölés & DPI-helyes szövegméretezés | `[x]` Kész | `GeminiClient.kt`, `ModelCatalog.kt`, `LatexOverlayNode.kt`, `BookshelfScreen.kt` |
+| **Lépés 27** | Golyóstoll/Ceruza elrejtése, eszközönkénti memória (`perToolConfigs`), Töltőtoll `1/2/4/8 pt` & rögzített kompakt `BrushSettingsPopover` | `[x]` Kész | `ToolDockPreferencesStore.kt`, `FloatingToolDock.kt`, `BrushSettingsPopover.kt`, `BookshelfScreen.kt` |
+| **Lépés 28** | Többoldalas függőleges lapelőnézet + 1 ujjas átgördülés, függőlegesen húzható `LeftPagePullTab`, Drag & Drop oldalátrendezés | `[x]` Kész | `PaperBackgroundLayer.kt`, `LeftPageDrawer.kt`, `AppDatabase.kt`, `BookshelfScreen.kt` |
+| **Lépés 29** | `GRID_SIMPLE_5MM` négyzetháló, vizuális előnézetes `PaperSettingsDialog` & `"PDF import"` gomb elrendezés javítása | `[x]` Kész | `PaperTemplate.kt`, `PaperBackgroundLayer.kt`, `PaperSettingsDialog.kt`, `BookshelfScreen.kt` |
+| **Lépés 30** | Lasszó sarok-forgatás, füzet-szintű inkrementális `OCR` gomb, `ShapePickerPopover` + `GeometricShapeObject` (2D/3D, SNOT `tag=6`, PDF export) | `[x]` Kész | `StylusDrawingSurface.kt`, `PageObject.kt`, `GeometricShapeRenderer.kt`, `ShapePickerPopover.kt`, `LatexOverlayNode.kt`, `StrokeBinarySerializer.kt`, `PdfExportManager.kt` |
+| **Lépés 31** | Perfetto-alapú 144 Hz finomhangolás, `69/69` unit + `8/8` androidTest, Macrobenchmark (`P95 = 6,05 ms`), docs & APK telepítés | `[x]` Kész | `StylusDrawingSurface.kt`, `PaperBackgroundLayer.kt`, `BookshelfScreen.kt`, `docs/*` |
 
 ---
 
@@ -146,27 +164,27 @@ Ez a dokumentum a `stylusnote_rendszerterv_v2.txt` alapján készült **17 lép�
 
 ## 3. Elfogadási Kritériumok (11. Fejezet)
 
-- [x] **Frame time:** p95 ≤ 6,94 ms pan/zoom közben 10 000 vonalas oldalon Xiaomi Pad 8-on *(Mérve `25097RP43G` tableten a `panAndZoom10kStrokesCanvasFrameTiming` 5-iterációs 10 000 vonalas benchmarkkal a II. ütem lezárásakor: `frameDurationCpuMs` **P50 = `3,74 ms`**, **P90 = `5,04 ms`**, **P95 = `5,48 ms`**, **P99 = `6,88 ms`**; `frameOverrunMs` **P50 = `-7,95 ms`**, **P95 = `-6,23 ms`**, **P99 = `-4,35 ms`**, 0 eldobott képkocka ✅)*
+- [x] **Frame time:** p95 ≤ 6,94 ms pan/zoom közben 10 000 vonalas oldalon Xiaomi Pad 8-on *(Mérve `25097RP43G` tableten a `panAndZoom10kStrokesCanvasFrameTiming` 5-iterációs 10 000 vonalas benchmarkkal a III. ütem lezárásakor: `frameDurationCpuMs` **P50 = `4,37 ms`**, **P90 = `5,51 ms`**, **P95 = `6,05 ms`**, **P99 = `8,42 ms`**; `frameOverrunMs` **P50 = `-7,31 ms`**, **P90 = `-5,80 ms`**, **P95 = `-4,98 ms`**, **P99 = `-3,25 ms`**, medián `120,0` képkocka ✅)*
 - [ ] **Pontosság:** Tollhegy–tinta eltérés 400%-os nagyításnál ≤ 1 px *(Alap: `CanvasTransformMatrix` 400% teszt 8/8 `connectedDebugAndroidTest`-ben sikeres, `concat(matrix)` csempejavítás alkalmazva; kézi stylus / vizuális próba hátravan)*
 - [ ] **Memória:** 50 000 vonallal sincs OOM; raszter cache ≤ 192 MB *(Készüléken ellenőrzendő)*
 - [ ] **Betöltés:** 10 000 vonalas oldal megnyitása ≤ 1 s *(Készüléken ellenőrzendő)*
 - [ ] **Adatbiztonság:** Automatizált process-kill teszt rajzolás közben ≤ 1 s adatvesztéssel, hibátlan journal visszajátszás *(`StrokeJournal` truncated-tail recovery `connectedDebugAndroidTest`-ben sikeres; élő UI process-kill próba hátravan)*
 - [ ] **Round-trip:** Serializer, journal és backup/restore után azonos vonalak *(JVM `StrokeJournalRoundTripTest` 6/6 és `BackupAndExportTest` 3/3 sikeres; eszközön történő integrációs ellenőrzés hátravan)*
-- [x] **JVM Unit tesztek (`testDebugUnitTest` — 16 osztály, 64 teszt, 0 hiba, 0 kihagyás):**
-  - [x] `CanvasTransformMatrixTest` (6)
+- [x] **JVM Unit tesztek (`testDebugUnitTest` — 16 osztály, 69 teszt, 0 hiba, 0 kihagyás):**
+  - [x] `CanvasTransformMatrixTest` (7)
   - [x] `OneEuroFilterTest` (6)
   - [x] `SpatialIndexTest` (4, brute-force összevetés)
-  - [x] `StylusInputRouterTest` (7)
+  - [x] `StylusInputRouterTest` (8)
   - [x] `DryInkRasterCacheTest` (3)
   - [x] `ShapeRecognizerTest` (5)
   - [x] `CanvasStateHolderTest` (4 tiszta Kotlin teszt; az 5 natív `libink.so` JNI teszt áthelyezve `StylusNoteInstrumentedValidationTest`-be)
   - [x] `StrokeJournalRoundTripTest` (6)
   - [x] `FtsAccentInsensitiveTest` (3)
   - [x] `BackupAndExportTest` (3)
-  - [x] `GeminiClientAndCatalogTest` (3)
+  - [x] `GeminiClientAndCatalogTest` (4)
   - [x] `OcrLineSegmenterTest` (2)
   - [x] `FunctionEvaluatorTest` (3)
   - [x] `AiCopilotExamParserTest` (2)
-  - [x] `ToolDockPlacementTest` (3)
+  - [x] `ToolDockPlacementTest` (5)
   - [x] `PageSelectionParserTest` (4)
 - [x] **Műszerezett (`androidTest`) tesztek (`:app:connectedDebugAndroidTest`):** 8/8 teszt sikeres (`25097RP43G - Android 16`, `0` hiba, `0` kihagyás, benne az 5 natív `libink.so` Ink JNI teszttel)

@@ -373,6 +373,9 @@ interface PageDao {
     @Query("SELECT * FROM pages WHERE notebookId = :notebookId ORDER BY pageIndexInNotebook ASC")
     fun observePagesForNotebook(notebookId: String): Flow<List<PageEntity>>
 
+    @Query("SELECT * FROM pages WHERE notebookId = :notebookId ORDER BY pageIndexInNotebook ASC")
+    suspend fun getPagesForNotebook(notebookId: String): List<PageEntity>
+
     @Query("SELECT * FROM pages WHERE id = :pageId LIMIT 1")
     suspend fun getPageById(pageId: String): PageEntity?
 
@@ -384,6 +387,30 @@ interface PageDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertPage(page: PageEntity)
+
+    @Transaction
+    suspend fun reorderPagesInNotebook(
+        notebookId: String,
+        orderedPageIds: List<String>,
+        updatedAtMs: Long
+    ) {
+        val currentPages = getPagesForNotebook(notebookId).associateBy { it.id }
+        var nextIndex = 0
+        val visited = HashSet<String>(orderedPageIds.size)
+        for (pageId in orderedPageIds) {
+            val page = currentPages[pageId] ?: continue
+            if (visited.add(pageId)) {
+                upsertPage(page.copy(pageIndexInNotebook = nextIndex, updatedAtEpochMs = updatedAtMs))
+                nextIndex++
+            }
+        }
+        for ((pageId, page) in currentPages) {
+            if (!visited.contains(pageId)) {
+                upsertPage(page.copy(pageIndexInNotebook = nextIndex, updatedAtEpochMs = updatedAtMs))
+                nextIndex++
+            }
+        }
+    }
 
     @Query("UPDATE pages SET needsOcrSync = :needsSync, updatedAtEpochMs = :updatedAtMs WHERE id = :pageId")
     suspend fun markOcrSyncState(pageId: String, needsSync: Boolean, updatedAtMs: Long)

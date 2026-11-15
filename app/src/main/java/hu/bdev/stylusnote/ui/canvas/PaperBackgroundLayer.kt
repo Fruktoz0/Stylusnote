@@ -3,6 +3,7 @@ package hu.bdev.stylusnote.ui.canvas
 import android.graphics.Canvas
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.Typeface
 import androidx.compose.ui.graphics.toArgb
 import hu.bdev.stylusnote.core.math.CanvasTransformMatrix
 import hu.bdev.stylusnote.core.math.DocRect
@@ -44,6 +45,10 @@ object PaperBackgroundRenderer {
     private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
+    }
+    private val adjacentLabelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
     }
 
     private var minorLinesBuffer = FloatArray(512)
@@ -133,6 +138,124 @@ object PaperBackgroundRenderer {
         }
 
         canvas.restore()
+    }
+
+    /**
+     * Lightweight preview sheets drawn strictly when a fixed-page user scrolls past the top or
+     * bottom margin (`currentPageIndexOneBased +/- 1`). Immediately returns in O(1) when viewing
+     * inside the active sheet so 144 Hz pan/zoom performance inside a page is completely unaffected.
+     */
+    @Synchronized
+    fun drawAdjacentFixedPagesIfVisible(
+        canvas: Canvas,
+        viewportWidthPx: Int,
+        viewportHeightPx: Int,
+        transformMatrix: CanvasTransformMatrix,
+        paperConfig: PagePaperConfig,
+        palette: StylusSurfacePalette,
+        currentPageIndexOneBased: Int,
+        totalPages: Int
+    ) {
+        if (
+            paperConfig.canvasMode != CanvasMode.FIXED_PAGE ||
+            totalPages <= 1 ||
+            viewportWidthPx <= 0 ||
+            viewportHeightPx <= 0
+        ) {
+            return
+        }
+        val visibleDocRect = transformMatrix.screenRectToDocRect(
+            leftPx = 0f,
+            topPx = 0f,
+            rightPx = viewportWidthPx.toFloat(),
+            bottomPx = viewportHeightPx.toFloat()
+        )
+        val pageW = paperConfig.pageDimensions.widthPt
+        val pageH = paperConfig.pageDimensions.heightPt
+        val gapPt = 28f
+
+        val showPrev = currentPageIndexOneBased > 1 && visibleDocRect.topPt < -72f
+        val showNext = currentPageIndexOneBased < totalPages && visibleDocRect.bottomPt > pageH + 72f
+        if (!showPrev && !showNext) return
+
+        val scale = transformMatrix.snapshot().scale.coerceAtLeast(0.05f)
+        transformMatrix.populateDocToScreenMatrix(docToScreenMatrix)
+        configurePaints(scale = scale, palette = palette)
+
+        val fullSheet = DocRect(0f, 0f, pageW, pageH)
+        val prevLabelScreen = if (showPrev) {
+            transformMatrix.docToScreen(pageW * 0.5f, -(gapPt + 14f))
+        } else {
+            null
+        }
+        val nextLabelScreen = if (showNext) {
+            transformMatrix.docToScreen(pageW * 0.5f, pageH + gapPt + 26f)
+        } else {
+            null
+        }
+
+        canvas.save()
+        canvas.concat(docToScreenMatrix)
+
+        if (showPrev) {
+            val prevClipped = DocRect(
+                leftPt = max(0f, visibleDocRect.leftPt),
+                topPt = max(0f, visibleDocRect.topPt + pageH + gapPt),
+                rightPt = min(pageW, visibleDocRect.rightPt),
+                bottomPt = min(pageH, visibleDocRect.bottomPt + pageH + gapPt)
+            )
+            canvas.save()
+            canvas.translate(0f, -(pageH + gapPt))
+            drawFixedSheetBackgroundAndTemplate(
+                canvas = canvas,
+                drawBounds = fullSheet,
+                clippedRect = prevClipped,
+                scale = scale,
+                paperConfig = paperConfig
+            )
+            canvas.restore()
+        }
+
+        if (showNext) {
+            val nextClipped = DocRect(
+                leftPt = max(0f, visibleDocRect.leftPt),
+                topPt = max(0f, visibleDocRect.topPt - (pageH + gapPt)),
+                rightPt = min(pageW, visibleDocRect.rightPt),
+                bottomPt = min(pageH, visibleDocRect.bottomPt - (pageH + gapPt))
+            )
+            canvas.save()
+            canvas.translate(0f, pageH + gapPt)
+            drawFixedSheetBackgroundAndTemplate(
+                canvas = canvas,
+                drawBounds = fullSheet,
+                clippedRect = nextClipped,
+                scale = scale,
+                paperConfig = paperConfig
+            )
+            canvas.restore()
+        }
+
+        canvas.restore()
+
+        // Draw labels in screen space at constant font size to avoid Skia glyph atlas churn during zoom.
+        adjacentLabelPaint.color = palette.pageBorder.toArgb()
+        adjacentLabelPaint.textSize = 28f
+        if (prevLabelScreen != null) {
+            canvas.drawText(
+                "${currentPageIndexOneBased - 1}. oldal",
+                prevLabelScreen.xPx,
+                prevLabelScreen.yPx,
+                adjacentLabelPaint
+            )
+        }
+        if (nextLabelScreen != null) {
+            canvas.drawText(
+                "${currentPageIndexOneBased + 1}. oldal",
+                nextLabelScreen.xPx,
+                nextLabelScreen.yPx,
+                adjacentLabelPaint
+            )
+        }
     }
 
     /**
@@ -245,6 +368,11 @@ object PaperBackgroundRenderer {
                 spacingPt = CanvasTransformMatrix.GRID_5MM_PT,
                 dotRadiusPt = (1.15f / scale).coerceIn(0.6f, 2.0f)
             )
+            PaperTemplateType.GRID_SIMPLE_5MM -> drawSimpleSquareGrid(
+                canvas = canvas,
+                bounds = clippedRect,
+                spacingPt = CanvasTransformMatrix.GRID_5MM_PT
+            )
             PaperTemplateType.GRID_5MM -> drawSquareGrid(
                 canvas = canvas,
                 bounds = clippedRect,
@@ -355,6 +483,44 @@ object PaperBackgroundRenderer {
         }
         if (majorOffset > 0) {
             canvas.drawLines(majorLinesBuffer, 0, majorOffset, majorRulePaint)
+        }
+    }
+
+    private fun drawSimpleSquareGrid(
+        canvas: Canvas,
+        bounds: DocRect,
+        spacingPt: Float
+    ) {
+        val startXIdx = floor(bounds.leftPt / spacingPt).toInt()
+        val endXIdx = ceil(bounds.rightPt / spacingPt).toInt()
+        val startYIdx = floor(bounds.topPt / spacingPt).toInt()
+        val endYIdx = ceil(bounds.bottomPt / spacingPt).toInt()
+
+        val xCount = (endXIdx - startXIdx + 1).coerceAtLeast(0)
+        val yCount = (endYIdx - startYIdx + 1).coerceAtLeast(0)
+        val maxFloats = (xCount + yCount) * 4
+        if (maxFloats <= 0) return
+
+        minorLinesBuffer = ensureCapacity(minorLinesBuffer, maxFloats)
+        var minorOffset = 0
+
+        for (xi in startXIdx..endXIdx) {
+            val x = xi * spacingPt
+            minorLinesBuffer[minorOffset++] = x
+            minorLinesBuffer[minorOffset++] = bounds.topPt
+            minorLinesBuffer[minorOffset++] = x
+            minorLinesBuffer[minorOffset++] = bounds.bottomPt
+        }
+        for (yi in startYIdx..endYIdx) {
+            val y = yi * spacingPt
+            minorLinesBuffer[minorOffset++] = bounds.leftPt
+            minorLinesBuffer[minorOffset++] = y
+            minorLinesBuffer[minorOffset++] = bounds.rightPt
+            minorLinesBuffer[minorOffset++] = y
+        }
+
+        if (minorOffset > 0) {
+            canvas.drawLines(minorLinesBuffer, 0, minorOffset, minorRulePaint)
         }
     }
 

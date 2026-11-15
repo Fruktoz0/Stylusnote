@@ -9,36 +9,38 @@ Ez a dokumentum rögzíti a rendszer rétegezett architektúráját és a jóvá
 ```mermaid
 flowchart TD
     subgraph UI["UI Réteg (Jetpack Compose StarNote UI + AndroidView / FrameLayout)"]
-        MA["MainActivity (144 Hz Lock + Immerzív Teljes Képernyő + ADPF Hint)"]
+        MA["MainActivity (144 Hz Lock + Immerzív Teljes Képernyő)"]
         BS["BookshelfScreen (2 Panel, Drag&Drop Kategória, FTS4, ... Menü, NotebookLM PDF)"]
-        CTB["CanvasTopToolbar (Bal Felső, Füzetnév + Zoom -/%/+ + AI Pill)"]
-        FTD["FloatingToolDock (Globális (x,y), 3 Gomb Összecsukva, 2 Lépcsős Ecsetfül)"]
-        LPD["LeftPageDrawer (Fix Oldal Kihúzható Bal Oldalsáv)"]
+        CTB["CanvasTopToolbar (Bal Felső Sarokhoz Csatolva, Zoom -/%/+ + AI Pill)"]
+        FTD["FloatingToolDock (Globális (x,y), Eszközmemória, Alakzatok, OCR, Teljes Képernyő)"]
+        SPP["ShapePickerPopover + GeometricShapeObject (24+8 2D/3D alakzat, tag=6)"]
+        LPD["LeftPageDrawer (Függőlegesen Húzható Fül + Drag&Drop Oldalátrendezés)"]
         AIC["AiCopilotSheet (Beállítások + Hatókör + 2 Formázó Mód)"]
-        SDS["StylusDrawingSurface (Lasszó ✨ AI + Szellemkép-mentes Mozgatás)"]
+        SDS["StylusDrawingSurface (Lasszó Sarok-Forgatás & ✨ AI + Szellemkép-mentes Mozgatás)"]
         DCV["DryCanvasView (Hardware View Host)"]
-        PBL["PaperBackgroundLayer (1. réteg)"]
+        PBL["PaperBackgroundLayer (1. réteg, többoldalas lapelőnézet + GRID_SIMPLE_5MM)"]
         DIRC["DryInkRasterCache (GPU Kompozit + 512x512 LRU + excludedStrokeIds)"]
         IPS["InProgressStrokesView (4. wet front-buffer)"]
         HCO["HoverCursorOverlay (7. réteg)"]
     end
 
     subgraph CORE["Core Réteg (Matematika, Hardver, AI)"]
-        CTM["CanvasTransformMatrix (PDF pt 1/72 in, 0.65x-5.0x)"]
-        SIR["StylusInputRouter (Palm Rejection, Predictor vs. 1€)"]
+        CTM["CanvasTransformMatrix (PDF pt 1/72 in, 0.65x-5.0x, Fit-100%)"]
+        SIR["StylusInputRouter (Palm Rejection, 1-ujjas Pan, Pinch-Zoom, Predictor vs. 1€)"]
         OEF["OneEuroFilter (0-100%)"]
         SI["SpatialIndex (R-fa / QuadTree)"]
         CLI["ColorLuminanceInverter (OLED HSL)"]
+        GSR["GeometricShapeRenderer (Thread-safe 2D/3D Vector Engine)"]
     end
 
     subgraph DOMAIN["Domain Réteg"]
-        CSH["CanvasStateHolder (Rétegek, Radírok, Lasszó, FormattedTextObject, Delta Undo/Redo)"]
+        CSH["CanvasStateHolder (Rétegek, Radírok, Lasszó, FormattedTextObject, GeometricShapeObject, Undo/Redo)"]
         BC["BrushConfig & CanvasAction"]
     end
 
     subgraph DATA["Data Réteg"]
-        SJ["StrokeJournal + PageFileFormat (SNOT + CRC32 + ATOMIC_MOVE)"]
-        DB["AppDatabase (Room + FTS4)"]
+        SJ["StrokeJournal + PageFileFormat (SNOT tag 1..6 + CRC32 + ATOMIC_MOVE)"]
+        DB["AppDatabase (Room + FTS4 + reorderPagesInNotebook)"]
         PDF["PdfTileRenderer (Szelektív) & PdfExportManager & NotebookLM FileProvider"]
     end
 
@@ -46,6 +48,7 @@ flowchart TD
     BS --> SDS
     BS --> CTB
     BS --> FTD
+    BS --> SPP
     BS --> LPD
     BS --> AIC
     SDS --> DCV
@@ -61,6 +64,8 @@ flowchart TD
     CSH --> SI
     CSH --> SJ
     CSH --> CLI
+    SPP --> GSR
+    GSR --> PDF
 ```
 
 ---
@@ -181,3 +186,23 @@ flowchart TD
   - `testDebugUnitTest`: **64/64** teszt sikeres (16 osztály, 0 hiba, 0 kihagyás).
   - `:app:connectedDebugAndroidTest`: **8/8** teszt sikeres (0 hiba, 0 kihagyás).
   - `:benchmark:connectedBenchmarkAndroidTest` (`panAndZoom10kStrokesCanvasFrameTiming`, 5 iteráció, median `frameCount = 117,0`, `CV = 0,47%`): **`frameDurationCpuMs` P50 = `3,74 ms`, P90 = `5,04 ms`, P95 = `5,48 ms` (≤ `6,94 ms` teljesítve ✅), P99 = `6,88 ms`**; **`frameOverrunMs` P50 = `-7,95 ms`, P90 = `-6,79 ms`, P95 = `-6,23 ms`, P99 = `-4,35 ms`** (0 eldobott képkocka).
+
+---
+
+### [2026-11-14] — III. Ütem (Lépés 25–31): Vászonfinomítás, Független Eszközmemória, Többoldalas D&D Navigáció, Geometriai Alakzatok, Füzet-OCR és Perfetto-vezérelt 144 Hz Optimalizáció
+
+- **Lépés 25 (`1 ujjas Pan, Normalizált Zoom & Teljes Képernyő Mód`):** `StylusInputRouter` 1 ujjas szabad pan zoom nélkül (`allowFingerDrawing = false`), `CanvasTransformMatrix.relativeZoomPercent` az oldalbefoglaló skálához viszonyított `100%` nagyítás-kijelzéshez, bal felső sarokba simuló (`RoundedCornerShape(bottomEnd = 10.dp)`) `CanvasTopToolbar`, valamint `FloatingToolDock` `Fullscreen` kapcsoló a felső fejléc elrejtéséhez és azonnali teljes kijelzős igazításhoz.
+- **Lépés 26 (`AI Timeout/Failover & Nem-sticky Formázott Szövegblokk`):** `GeminiClient` 60 mp-es `OkHttpClient` olvasási időtúllépéssel és többlépcsős automatikus Flash modell-sorozattal (`gemini-2.5-flash` → `gemini-2.0-flash` → `gemini-2.5-flash-lite` → `gemini-1.5-flash`); `FormattedTextObject` kijelölés megszüntetése formázás és vászonérintés után, továbbá DPI-helyes betűméretezés az eredeti kézírás méretéhez igazodva.
+- **Lépés 27 (`Golyóstoll/Ceruza Kivezetése, Eszközmemória & Kompakt Ecsetfül`):** Töltőtoll + Kiemelő fókusz (`1, 2, 4, 8 pt` gyorsméretek), `ToolDockPreferencesStore` független eszközönkénti vastagság/szín/átlátszóság memóriával (`perToolConfigs`), valamint az eszköztár mellé igazított, felesleges térközök nélküli `BrushSettingsPopover` (átlátszóság csúszka kizárólag a teljes stúdió nézetben).
+- **Lépés 28 (`Többoldalas Görgetés, Húzható Oldalfül & Drag & Drop Átrendezés`):** Hiányzó 1. oldal automatikus Room perzisztálása új oldal létrehozásakor, függőlegesen látható előző/következő lapok és 1 ujjas átgördülés (`onNavigationGestureEnd`), függőlegesen pozicionálható `LeftPagePullTab` (`leftTabYFraction`), `LeftPageDrawer` Drag & Drop oldalátrendezés (`PageDao.reorderPagesInNotebook`) és alsó oldalléptető sáv.
+- **Lépés 29 (`GRID_SIMPLE_5MM`, Vizuális Sablonválasztó & Könyvespolc PDF Import Fix`):** Új `PaperTemplateType.GRID_SIMPLE_5MM` sablon (5×5 erősített segédvonalak nélküli egyenletes négyzetrács), miniatűr papír-előnézeti kártyás `PaperSettingsDialog`, valamint a Könyvespolc `"PDF import"` gomb elrendezésének javítása.
+- **Lépés 30 (`Lasszó Sarok-Forgatás, Geometriai Alakzatok & Füzet OCR`):**
+  - **Lasszó sarok-forgatás:** Kör alakú sarok-forgató fogantyú a `LassoSelectionCanvasOverlay` keretén, élő `preRotate` vektoros előnézet `DryInkRasterCache` szellemkép-kizárással és `AffineTransform2D.rotationAround` véglegesítéssel.
+  - **2D/3D Alakzatok (`ShapePickerPopover`, `GeometricShapeObject`, `GeometricShapeRenderer`):** Kétoldalas vizuális alakzatválasztó (24 teljes + 8 alap 2D/3D alakzat, vastagság, 5 színminta, kitöltés; ESC/backdrop zárás), szálbiztos vektorgrafikus rajzmotor szaggatott rejtett hátsó élekkel, 4-sarkos arány/szabad skálázás + felső szabad forgató fogantyú, SNOT `OBJECT_TAG_GEOMETRIC_SHAPE = 6` bináris perzisztencia és natív `PdfExportManager` rajzolás.
+  - **Füzet-szintű inkrementális `OCR` gomb:** `FloatingToolDock` `OCR` gomb (`HandwritingToLatexConverter.formatUnformattedStrokesInPage`), amely csak a még nem formázott kézírásos vonásokat (kiemelők és meglévő `FormattedTextObject`/`LatexObject` régiók kihagyásával) alakítja át a füzet `ocrLanguage` nyelvén az összes oldalon.
+- **Lépés 31 (`Perfetto-vezérelt 144 Hz Pan/Zoom Optimalizálás & Végső Verifikáció`):**
+  - A `trace_processor_shell` elemzés feltárta, hogy `109/118` képkockán az aktív `ACTION_MOVE` alatti `currentZoomPercent` mutáció `CanvasTopToolbar` (`CompositingStrategy.Offscreen`) offscreen FBO újrarajzolást és `Recomposer`/`TextLayout` munkát okozott, míg `DryCanvasView.onDraw` szinkron `HintSession` Binder IPC-je (`~0,97 ms`) lassította a UI-szálat. Kivezetésükkel (`onNavigationGestureEnd` gesztusvégi szinkron, `Offscreen` réteg és `HintSession` eltávolítása) a 144 Hz keretidő stabilan küszöb alá került.
+- **Lépés 31 mért eredményei Xiaomi `25097RP43G` (Android 16 / SDK 36) táblagépen:**
+  - `testDebugUnitTest`: **69/69** teszt sikeres (16 osztály, 0 hiba, 0 kihagyás).
+  - `:app:connectedDebugAndroidTest`: **8/8** teszt sikeres (`TEST-25097RP43G - 16-_app-.xml`, 0 hiba, 0 kihagyás).
+  - `:benchmark:connectedBenchmarkAndroidTest` (`panAndZoom10kStrokesCanvasFrameTiming`, 5 iteráció, median `frameCount = 120,0`): **`frameDurationCpuMs` P50 = `4,37 ms`, P90 = `5,51 ms`, P95 = `6,05 ms` (≤ `6,94 ms` teljesítve ✅), P99 = `8,42 ms`**; **`frameOverrunMs` P50 = `-7,31 ms`, P90 = `-5,80 ms`, P95 = `-4,98 ms`, P99 = `-3,25 ms`** (0 eldobott képkocka).
