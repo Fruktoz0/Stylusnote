@@ -21,11 +21,11 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.RotateRight
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.FormatColorFill
-import androidx.compose.material.icons.filled.RotateRight
 import androidx.compose.material.icons.filled.ZoomIn
 import androidx.compose.material.icons.filled.ZoomOut
 import androidx.compose.material3.ButtonDefaults
@@ -39,6 +39,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -90,6 +91,7 @@ import hu.bdev.stylusnote.domain.model.AffineTransform2D
 import hu.bdev.stylusnote.domain.model.BrushConfig
 import hu.bdev.stylusnote.domain.model.BrushToolType
 import hu.bdev.stylusnote.domain.model.CanvasMode
+import hu.bdev.stylusnote.domain.model.PageObject
 import hu.bdev.stylusnote.domain.model.PagePaperConfig
 import hu.bdev.stylusnote.domain.repository.CanvasStateHolder
 import hu.bdev.stylusnote.ui.theme.LocalStylusSurfacePalette
@@ -131,6 +133,9 @@ interface JournalCommitSink {
     fun onStrokesTransformed(strokeIds: List<String>, affine: AffineTransform2D) = Unit
     fun onStrokesRecolored(strokeIds: List<String>, canonicalColorArgb: Int) = Unit
     fun onStrokesDeleted(strokeIds: List<String>) = Unit
+    fun onObjectsAdded(objects: List<PageObject>) = Unit
+    fun onObjectsUpdated(objects: List<PageObject>) = Unit
+    fun onObjectsDeleted(objectIds: List<String>) = Unit
 }
 
 object NoOpJournalCommitSink : JournalCommitSink {
@@ -175,6 +180,7 @@ private data class WetStrokeMeta(
 private class LassoSelectionRuntime {
     var activePolygon: MutableList<DocPoint> = ArrayList()
     var selectedIds: Set<String> = emptySet()
+    var selectedObjectIds: Set<String> = emptySet()
     var selectionBounds: DocRect? = null
     var isDraggingSelection: Boolean = false
     var dragOriginDoc: DocPoint? = null
@@ -271,8 +277,17 @@ fun StylusDrawingSurface(
     onCanvasTouchStart: () -> Unit = {},
     onNavigationGestureEnd: () -> Unit = {},
     onAiAutoFormatLassoSelection: (selectedIds: Set<String>, onFormatted: (clearSelection: Boolean) -> Unit) -> Unit = { _, _ -> },
+    onLassoSelectedObject: (String) -> Unit = {},
+    onLassoObjectPreviewChanged: (
+        selectedObjectIds: Set<String>,
+        deltaXPt: Float,
+        deltaYPt: Float,
+        rotationRadians: Float,
+        rotationCenter: DocPoint?
+    ) -> Unit = { _, _, _, _, _ -> },
     currentPageIndexOneBased: Int = 1,
     totalPages: Int = 1,
+    initialPagePaddingPx: Float = 48f,
     externalDrawVersionTick: Long = 0L,
     modifier: Modifier = Modifier
 ) {
@@ -400,6 +415,9 @@ fun StylusDrawingSurface(
             var onLiveViewportTransformChangedCallback: () -> Unit = onLiveViewportTransformChanged
             var onCanvasTouchStartCallback: () -> Unit = onCanvasTouchStart
             var onNavigationGestureEndCallback: () -> Unit = onNavigationGestureEnd
+            var onLassoSelectedObjectCallback: (String) -> Unit = onLassoSelectedObject
+            var onLassoObjectPreviewChangedCallback: (Set<String>, Float, Float, Float, DocPoint?) -> Unit =
+                onLassoObjectPreviewChanged
         }
     }.apply {
         config = brushConfig
@@ -421,8 +439,30 @@ fun StylusDrawingSurface(
         onNavigationGestureEndCallback = onNavigationGestureEnd
     }
 
+    fun emitLiveLassoObjectPreview() {
+        val objIds = lassoRuntime.selectedObjectIds
+        if (objIds.isEmpty()) return
+        val center = if (lassoRuntime.isRotatingSelection) {
+            DocPoint(lassoRuntime.rotationCenterXPt, lassoRuntime.rotationCenterYPt)
+        } else {
+            null
+        }
+        routerConfigHolder.onLassoObjectPreviewChangedCallback(
+            objIds,
+            lassoRuntime.liveDeltaXPt,
+            lassoRuntime.liveDeltaYPt,
+            lassoRuntime.liveRotationRadians,
+            center
+        )
+    }
+
+    fun clearLassoObjectPreview() {
+        routerConfigHolder.onLassoObjectPreviewChangedCallback(emptySet(), 0f, 0f, 0f, null)
+    }
+
     fun startLassoInteraction(firstPt: DocPoint) {
         val bounds = lassoRuntime.selectionBounds
+        val hasSelection = lassoRuntime.selectedIds.isNotEmpty() || lassoRuntime.selectedObjectIds.isNotEmpty()
         val distToRotateHandlePx = if (bounds != null) {
             hypot(
                 (firstPt.xPt - bounds.rightPt) * transformMatrix.scale,
@@ -432,7 +472,7 @@ fun StylusDrawingSurface(
             Float.MAX_VALUE
         }
         val rotateHandleHitPx = with(density) { 28.dp.toPx() }
-        if (bounds != null && lassoRuntime.selectedIds.isNotEmpty() && distToRotateHandlePx <= rotateHandleHitPx) {
+        if (bounds != null && hasSelection && distToRotateHandlePx <= rotateHandleHitPx) {
             val cx = bounds.centerXPt
             val cy = bounds.centerYPt
             lassoRuntime.isRotatingSelection = true
@@ -445,7 +485,7 @@ fun StylusDrawingSurface(
             lassoRuntime.liveDeltaXPt = 0f
             lassoRuntime.liveDeltaYPt = 0f
             dryCanvasViewRef?.invalidate()
-        } else if (bounds != null && lassoRuntime.selectedIds.isNotEmpty() && bounds.inflate(18f).contains(firstPt.xPt, firstPt.yPt)) {
+        } else if (bounds != null && hasSelection && bounds.inflate(18f).contains(firstPt.xPt, firstPt.yPt)) {
             lassoRuntime.isDraggingSelection = true
             lassoRuntime.dragOriginDoc = firstPt
             lassoRuntime.liveDeltaXPt = 0f
@@ -455,10 +495,12 @@ fun StylusDrawingSurface(
             dryCanvasViewRef?.invalidate()
         } else {
             lassoRuntime.selectedIds = emptySet()
+            lassoRuntime.selectedObjectIds = emptySet()
             lassoRuntime.selectionBounds = null
             lassoRuntime.isDraggingSelection = false
             lassoRuntime.isRotatingSelection = false
             lassoRuntime.liveRotationRadians = 0f
+            clearLassoObjectPreview()
             lassoRuntime.activePolygon = ArrayList<DocPoint>(64).apply { add(firstPt) }
         }
         lassoSelectionVersion.longValue++
@@ -474,12 +516,14 @@ fun StylusDrawingSurface(
                 last.xPt - lassoRuntime.rotationCenterXPt
             )
             lassoRuntime.liveRotationRadians = currentAngle - lassoRuntime.rotationStartAngleRad
+            emitLiveLassoObjectPreview()
             dryCanvasViewRef?.invalidate()
         } else if (lassoRuntime.isDraggingSelection) {
             val origin = lassoRuntime.dragOriginDoc ?: return
             val last = points.last()
             lassoRuntime.liveDeltaXPt = last.xPt - origin.xPt
             lassoRuntime.liveDeltaYPt = last.yPt - origin.yPt
+            emitLiveLassoObjectPreview()
             dryCanvasViewRef?.invalidate()
         } else {
             lassoRuntime.activePolygon.addAll(points)
@@ -501,23 +545,33 @@ fun StylusDrawingSurface(
             val angleRad = lassoRuntime.liveRotationRadians
             val cx = lassoRuntime.rotationCenterXPt
             val cy = lassoRuntime.rotationCenterYPt
-            val selected = lassoRuntime.selectedIds
+            val selectedStrokes = lassoRuntime.selectedIds
+            val selectedObjects = lassoRuntime.selectedObjectIds
             val oldBounds = lassoRuntime.selectionBounds
             lassoRuntime.isRotatingSelection = false
             lassoRuntime.rotationStartAngleRad = 0f
             lassoRuntime.liveRotationRadians = 0f
+            clearLassoObjectPreview()
 
-            if (stateHolder != null && selected.isNotEmpty() && abs(angleRad) > 0.005f) {
+            if (stateHolder != null && (selectedStrokes.isNotEmpty() || selectedObjects.isNotEmpty()) && abs(angleRad) > 0.005f) {
                 val rotation = AffineTransform2D.rotationAround(angleRad, cx, cy)
-                val dirty = stateHolder.transformStrokes(selected, rotation)
-                if (dirty != null) {
-                    for (id in selected) {
+                val res = stateHolder.transformSelection(selectedStrokes, selectedObjects, rotation)
+                if (res.affectedBounds != null) {
+                    for (id in selectedStrokes) {
                         oledStrokeCache.invalidate(id)
                     }
                     oldBounds?.let { dryInkRasterCache.invalidateDocRect(it) }
-                    dryInkRasterCache.invalidateDocRect(dirty)
-                    lassoRuntime.selectionBounds = stateHolder.computeSelectionBounds(selected)
-                    journalCommitSink.onStrokesTransformed(selected.toList(), rotation)
+                    dryInkRasterCache.invalidateDocRect(res.affectedBounds)
+                    lassoRuntime.selectionBounds = stateHolder.computeCombinedSelectionBounds(
+                        selectedStrokes,
+                        selectedObjects
+                    )
+                    if (selectedStrokes.isNotEmpty()) {
+                        journalCommitSink.onStrokesTransformed(selectedStrokes.toList(), rotation)
+                    }
+                    if (res.updatedObjects.isNotEmpty()) {
+                        journalCommitSink.onObjectsUpdated(res.updatedObjects)
+                    }
                     dryDrawTick.longValue++
                     routerConfigHolder.onMutatedCallback()
                 }
@@ -532,25 +586,35 @@ fun StylusDrawingSurface(
             }
             val dx = lassoRuntime.liveDeltaXPt
             val dy = lassoRuntime.liveDeltaYPt
-            val selected = lassoRuntime.selectedIds
+            val selectedStrokes = lassoRuntime.selectedIds
+            val selectedObjects = lassoRuntime.selectedObjectIds
             val oldBounds = lassoRuntime.selectionBounds
             lassoRuntime.isDraggingSelection = false
             lassoRuntime.dragOriginDoc = null
             lassoRuntime.liveDeltaXPt = 0f
             lassoRuntime.liveDeltaYPt = 0f
+            clearLassoObjectPreview()
 
-            // Rebuild immutable Stroke instances ONLY on ACTION_UP if actually moved.
-            if (stateHolder != null && selected.isNotEmpty() && hypot(dx, dy) > 0.5f) {
+            // Rebuild immutable Stroke & PageObject instances ONLY on ACTION_UP if actually moved.
+            if (stateHolder != null && (selectedStrokes.isNotEmpty() || selectedObjects.isNotEmpty()) && hypot(dx, dy) > 0.5f) {
                 val translation = AffineTransform2D.translation(dx, dy)
-                val dirty = stateHolder.transformStrokes(selected, translation)
-                if (dirty != null) {
-                    for (id in selected) {
+                val res = stateHolder.transformSelection(selectedStrokes, selectedObjects, translation)
+                if (res.affectedBounds != null) {
+                    for (id in selectedStrokes) {
                         oledStrokeCache.invalidate(id)
                     }
                     oldBounds?.let { dryInkRasterCache.invalidateDocRect(it) }
-                    dryInkRasterCache.invalidateDocRect(dirty)
-                    lassoRuntime.selectionBounds = stateHolder.computeSelectionBounds(selected)
-                    journalCommitSink.onStrokesTransformed(selected.toList(), translation)
+                    dryInkRasterCache.invalidateDocRect(res.affectedBounds)
+                    lassoRuntime.selectionBounds = stateHolder.computeCombinedSelectionBounds(
+                        selectedStrokes,
+                        selectedObjects
+                    )
+                    if (selectedStrokes.isNotEmpty()) {
+                        journalCommitSink.onStrokesTransformed(selectedStrokes.toList(), translation)
+                    }
+                    if (res.updatedObjects.isNotEmpty()) {
+                        journalCommitSink.onObjectsUpdated(res.updatedObjects)
+                    }
                     dryDrawTick.longValue++
                     routerConfigHolder.onMutatedCallback()
                 }
@@ -560,11 +624,29 @@ fun StylusDrawingSurface(
             lassoRuntime.activePolygon.addAll(finalPoints)
             val poly = lassoRuntime.activePolygon
             if (stateHolder != null && poly.size >= 3) {
-                val hits = stateHolder.selectStrokesByLasso(poly)
-                lassoRuntime.selectedIds = hits.map { it.id }.toSet()
-                lassoRuntime.selectionBounds = stateHolder.computeSelectionBounds(lassoRuntime.selectedIds)
+                val strokeHits = stateHolder.selectStrokesByLasso(poly)
+                val objectHits = stateHolder.selectPageObjectsByLasso(poly)
+                if (strokeHits.isEmpty() && objectHits.size == 1) {
+                    // Single selected object activates full corner resize/rotate + restore controls immediately.
+                    lassoRuntime.selectedIds = emptySet()
+                    lassoRuntime.selectedObjectIds = emptySet()
+                    lassoRuntime.selectionBounds = null
+                    lassoRuntime.activePolygon = ArrayList()
+                    clearLassoObjectPreview()
+                    routerConfigHolder.onLassoSelectedObjectCallback(objectHits.first().id)
+                    lassoSelectionVersion.longValue++
+                    lassoDrawTick.longValue++
+                    return
+                }
+                lassoRuntime.selectedIds = strokeHits.map { it.id }.toSet()
+                lassoRuntime.selectedObjectIds = objectHits.map { it.id }.toSet()
+                lassoRuntime.selectionBounds = stateHolder.computeCombinedSelectionBounds(
+                    lassoRuntime.selectedIds,
+                    lassoRuntime.selectedObjectIds
+                )
             } else {
                 lassoRuntime.selectedIds = emptySet()
+                lassoRuntime.selectedObjectIds = emptySet()
                 lassoRuntime.selectionBounds = null
             }
             lassoRuntime.activePolygon = ArrayList()
@@ -583,6 +665,7 @@ fun StylusDrawingSurface(
         lassoRuntime.rotationStartAngleRad = 0f
         lassoRuntime.liveRotationRadians = 0f
         lassoRuntime.activePolygon = ArrayList()
+        clearLassoObjectPreview()
         if (wasTransforming) {
             dryCanvasViewRef?.invalidate()
         }
@@ -924,9 +1007,13 @@ fun StylusDrawingSurface(
         inputRouter?.allowFingerDrawing = allowFingerDrawing
     }
     LaunchedEffect(brushConfig.toolType) {
-        if (brushConfig.toolType != BrushToolType.LASSO && lassoRuntime.selectedIds.isNotEmpty()) {
+        if (brushConfig.toolType != BrushToolType.LASSO &&
+            (lassoRuntime.selectedIds.isNotEmpty() || lassoRuntime.selectedObjectIds.isNotEmpty())
+        ) {
             lassoRuntime.selectedIds = emptySet()
+            lassoRuntime.selectedObjectIds = emptySet()
             lassoRuntime.selectionBounds = null
+            onLassoObjectPreviewChanged(emptySet(), 0f, 0f, 0f, null)
             lassoSelectionVersion.longValue++
             lassoDrawTick.longValue++
         }
@@ -946,7 +1033,8 @@ fun StylusDrawingSurface(
                 pageWidthPt = paperConfig.pageDimensions.widthPt,
                 pageHeightPt = paperConfig.pageDimensions.heightPt,
                 viewportWidthPx = vp.width.toFloat(),
-                viewportHeightPx = vp.height.toFloat()
+                viewportHeightPx = vp.height.toFloat(),
+                paddingPx = initialPagePaddingPx
             )
             dryInkRasterCache.syncInitialScale(transformMatrix.scale)
             val initPaperConfig = routerConfigHolder.latestPaperConfig
@@ -1110,7 +1198,8 @@ fun StylusDrawingSurface(
                         pageWidthPt = paperConfig.pageDimensions.widthPt,
                         pageHeightPt = paperConfig.pageDimensions.heightPt,
                         viewportWidthPx = size.width.toFloat(),
-                        viewportHeightPx = size.height.toFloat()
+                        viewportHeightPx = size.height.toFloat(),
+                        paddingPx = initialPagePaddingPx
                     )
                     dryInkRasterCache.syncInitialScale(transformMatrix.scale)
                     val initPaperConfig = routerConfigHolder.latestPaperConfig
@@ -1145,6 +1234,7 @@ fun StylusDrawingSurface(
             }
     ) {
         // Layers 1-4a (DryCanvasView) + Layer 4b (InProgressStrokesView wet front-buffer)
+        key(transformMatrix, dryStrokeStore, dryInkRasterCache, journalCommitSink) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { context ->
@@ -1160,6 +1250,7 @@ fun StylusDrawingSurface(
                         FrameLayout.LayoutParams.MATCH_PARENT
                     )
                     motionEventToViewTransform = Matrix()
+                    eagerInit()
                     val predictorBridge = AndroidMotionEventPredictorBridge(this)
                     val settleRunnable = Runnable {
                         val currentScale = transformMatrix.scale
@@ -1295,7 +1386,6 @@ fun StylusDrawingSurface(
                             )
                         }
                         if (
-                            !usedComposite &&
                             paperCfg.canvasMode == CanvasMode.FIXED_PAGE &&
                             routerConfigHolder.latestTotalPages > 1
                         ) {
@@ -1368,6 +1458,7 @@ fun StylusDrawingSurface(
                 }
             }
         )
+        }
 
         // Layer 6: Lasso trace & selection marquee
         lassoSelectionVersion.longValue
@@ -1381,22 +1472,26 @@ fun StylusDrawingSurface(
 
         // Layer 7: Hover cursor outline intentionally disabled while stylus proximity & barrel button stay active.
 
-        // Floating selection actions bar when Lasso has active strokes selected
+        // Floating selection actions bar when Lasso has active strokes and/or objects selected
         lassoSelectionVersion.longValue
-        val selectedCount = lassoRuntime.selectedIds.size
+        val selectedCount = lassoRuntime.selectedIds.size + lassoRuntime.selectedObjectIds.size
         val stateHolder = dryStrokeStore as? CanvasStateHolder
         if (selectedCount > 0 && stateHolder != null && !lassoRuntime.isInteractingWithSelection) {
             LassoSelectionActionBar(
                 selectedCount = selectedCount,
+                canAiAutoFormat = lassoRuntime.selectedIds.isNotEmpty(),
                 onAiAutoFormatSelection = {
                     val activeSelectedIds = lassoRuntime.selectedIds.toSet()
+                    if (activeSelectedIds.isEmpty()) return@LassoSelectionActionBar
                     val previousBounds = lassoRuntime.selectionBounds
                     onAiAutoFormatLassoSelection(activeSelectedIds) { clearSelection ->
                         if (clearSelection) {
                             for (id in activeSelectedIds) oledStrokeCache.invalidate(id)
                             previousBounds?.let { dryInkRasterCache.invalidateDocRect(it) }
                             lassoRuntime.selectedIds = emptySet()
+                            lassoRuntime.selectedObjectIds = emptySet()
                             lassoRuntime.selectionBounds = null
+                            clearLassoObjectPreview()
                             dryCanvasViewRef?.invalidate()
                             dryDrawTick.longValue++
                             lassoSelectionVersion.longValue++
@@ -1406,12 +1501,24 @@ fun StylusDrawingSurface(
                     }
                 },
                 onTransformSelection = { transform ->
-                    val dirty = stateHolder.transformStrokes(lassoRuntime.selectedIds, transform)
-                    if (dirty != null) {
+                    val res = stateHolder.transformSelection(
+                        strokeIds = lassoRuntime.selectedIds,
+                        objectIds = lassoRuntime.selectedObjectIds,
+                        transform = transform
+                    )
+                    if (res.affectedBounds != null) {
                         for (id in lassoRuntime.selectedIds) oledStrokeCache.invalidate(id)
-                        dryInkRasterCache.invalidateDocRect(dirty)
-                        lassoRuntime.selectionBounds = stateHolder.computeSelectionBounds(lassoRuntime.selectedIds)
-                        journalCommitSink.onStrokesTransformed(lassoRuntime.selectedIds.toList(), transform)
+                        dryInkRasterCache.invalidateDocRect(res.affectedBounds)
+                        lassoRuntime.selectionBounds = stateHolder.computeCombinedSelectionBounds(
+                            lassoRuntime.selectedIds,
+                            lassoRuntime.selectedObjectIds
+                        )
+                        if (lassoRuntime.selectedIds.isNotEmpty()) {
+                            journalCommitSink.onStrokesTransformed(lassoRuntime.selectedIds.toList(), transform)
+                        }
+                        if (res.updatedObjects.isNotEmpty()) {
+                            journalCommitSink.onObjectsUpdated(res.updatedObjects)
+                        }
                         dryDrawTick.longValue++
                         lassoSelectionVersion.longValue++
                         lassoDrawTick.longValue++
@@ -1420,25 +1527,43 @@ fun StylusDrawingSurface(
                 },
                 onRecolorSelection = {
                     val targetColor = brushConfig.effectiveColorArgb()
-                    val dirty = stateHolder.recolorStrokes(
+                    val res = stateHolder.recolorSelection(
                         strokeIds = lassoRuntime.selectedIds,
+                        objectIds = lassoRuntime.selectedObjectIds,
                         newColorArgb = targetColor
                     )
-                    if (dirty != null) {
+                    if (res.affectedBounds != null) {
                         for (id in lassoRuntime.selectedIds) oledStrokeCache.invalidate(id)
-                        dryInkRasterCache.invalidateDocRect(dirty)
-                        journalCommitSink.onStrokesRecolored(lassoRuntime.selectedIds.toList(), targetColor)
+                        dryInkRasterCache.invalidateDocRect(res.affectedBounds)
+                        if (lassoRuntime.selectedIds.isNotEmpty()) {
+                            journalCommitSink.onStrokesRecolored(lassoRuntime.selectedIds.toList(), targetColor)
+                        }
+                        if (res.updatedObjects.isNotEmpty()) {
+                            journalCommitSink.onObjectsUpdated(res.updatedObjects)
+                        }
                         dryDrawTick.longValue++
                         onCanvasStateMutated()
                     }
                 },
                 onDuplicateSelection = {
-                    val copies = stateHolder.duplicateStrokes(lassoRuntime.selectedIds)
-                    if (copies.isNotEmpty()) {
-                        for (copy in copies) dryInkRasterCache.invalidateDocRect(copy.bounds)
-                        journalCommitSink.onStrokesCommitted(copies)
-                        lassoRuntime.selectedIds = copies.map { it.id }.toSet()
-                        lassoRuntime.selectionBounds = stateHolder.computeSelectionBounds(lassoRuntime.selectedIds)
+                    val res = stateHolder.duplicateSelection(
+                        strokeIds = lassoRuntime.selectedIds,
+                        objectIds = lassoRuntime.selectedObjectIds
+                    )
+                    if (res.duplicatedStrokes.isNotEmpty() || res.duplicatedObjects.isNotEmpty()) {
+                        res.affectedBounds?.let { dryInkRasterCache.invalidateDocRect(it) }
+                        if (res.duplicatedStrokes.isNotEmpty()) {
+                            journalCommitSink.onStrokesCommitted(res.duplicatedStrokes)
+                        }
+                        if (res.duplicatedObjects.isNotEmpty()) {
+                            journalCommitSink.onObjectsAdded(res.duplicatedObjects)
+                        }
+                        lassoRuntime.selectedIds = res.duplicatedStrokes.map { it.id }.toSet()
+                        lassoRuntime.selectedObjectIds = res.duplicatedObjects.map { it.id }.toSet()
+                        lassoRuntime.selectionBounds = stateHolder.computeCombinedSelectionBounds(
+                            lassoRuntime.selectedIds,
+                            lassoRuntime.selectedObjectIds
+                        )
                         dryDrawTick.longValue++
                         lassoSelectionVersion.longValue++
                         lassoDrawTick.longValue++
@@ -1446,15 +1571,19 @@ fun StylusDrawingSurface(
                     }
                 },
                 onDeleteSelection = {
-                    val toDelete = lassoRuntime.selectedIds.toList()
-                    val dirty = stateHolder.deleteStrokes(lassoRuntime.selectedIds)
+                    val toDeleteStrokes = lassoRuntime.selectedIds.toList()
+                    val toDeleteObjects = lassoRuntime.selectedObjectIds.toList()
+                    val dirty = stateHolder.deleteSelection(lassoRuntime.selectedIds, lassoRuntime.selectedObjectIds)
                     if (dirty != null) {
-                        for (id in lassoRuntime.selectedIds) oledStrokeCache.invalidate(id)
+                        for (id in toDeleteStrokes) oledStrokeCache.invalidate(id)
                         dryInkRasterCache.invalidateDocRect(dirty)
-                        journalCommitSink.onStrokesDeleted(toDelete)
+                        if (toDeleteStrokes.isNotEmpty()) journalCommitSink.onStrokesDeleted(toDeleteStrokes)
+                        if (toDeleteObjects.isNotEmpty()) journalCommitSink.onObjectsDeleted(toDeleteObjects)
                     }
                     lassoRuntime.selectedIds = emptySet()
+                    lassoRuntime.selectedObjectIds = emptySet()
                     lassoRuntime.selectionBounds = null
+                    clearLassoObjectPreview()
                     dryDrawTick.longValue++
                     lassoSelectionVersion.longValue++
                     lassoDrawTick.longValue++
@@ -1462,7 +1591,9 @@ fun StylusDrawingSurface(
                 },
                 onClearSelection = {
                     lassoRuntime.selectedIds = emptySet()
+                    lassoRuntime.selectedObjectIds = emptySet()
                     lassoRuntime.selectionBounds = null
+                    clearLassoObjectPreview()
                     lassoSelectionVersion.longValue++
                     lassoDrawTick.longValue++
                 },
@@ -1505,7 +1636,7 @@ private fun LassoSelectionCanvasOverlay(
         }
 
         val bounds = lassoRuntime.selectionBounds
-        if (bounds != null && lassoRuntime.selectedIds.isNotEmpty()) {
+        if (bounds != null && (lassoRuntime.selectedIds.isNotEmpty() || lassoRuntime.selectedObjectIds.isNotEmpty())) {
             val dx = if (lassoRuntime.isDraggingSelection) lassoRuntime.liveDeltaXPt else 0f
             val dy = if (lassoRuntime.isDraggingSelection) lassoRuntime.liveDeltaYPt else 0f
             val shifted = DocRect(
@@ -1586,6 +1717,7 @@ private fun LassoSelectionCanvasOverlay(
 @Composable
 private fun LassoSelectionActionBar(
     selectedCount: Int,
+    canAiAutoFormat: Boolean,
     selectionBoundsProvider: () -> DocRect?,
     onAiAutoFormatSelection: () -> Unit,
     onTransformSelection: (AffineTransform2D) -> Unit,
@@ -1612,22 +1744,24 @@ private fun LassoSelectionActionBar(
                 style = MaterialTheme.typography.labelSmall,
                 modifier = Modifier.padding(end = 4.dp)
             )
-            FilledTonalButton(
-                onClick = onAiAutoFormatSelection,
-                shape = RoundedCornerShape(14.dp),
-                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                colors = ButtonDefaults.filledTonalButtonColors(
-                    containerColor = MaterialTheme.colorScheme.primaryContainer,
-                    contentColor = MaterialTheme.colorScheme.onPrimaryContainer
-                )
-            ) {
-                Icon(
-                    imageVector = StylusIcons.StarFourPoint,
-                    contentDescription = "AI felismerés és formázás",
-                    modifier = Modifier.size(16.dp)
-                )
-                Spacer(modifier = Modifier.width(4.dp))
-                Text("AI", style = MaterialTheme.typography.labelMedium)
+            if (canAiAutoFormat) {
+                FilledTonalButton(
+                    onClick = onAiAutoFormatSelection,
+                    shape = RoundedCornerShape(14.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                    colors = ButtonDefaults.filledTonalButtonColors(
+                        containerColor = MaterialTheme.colorScheme.primaryContainer,
+                        contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                ) {
+                    Icon(
+                        imageVector = StylusIcons.StarFourPoint,
+                        contentDescription = "AI felismerés és formázás",
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("AI", style = MaterialTheme.typography.labelMedium)
+                }
             }
             IconButton(
                 onClick = {
@@ -1659,7 +1793,7 @@ private fun LassoSelectionActionBar(
                     )
                 }
             ) {
-                Icon(Icons.Filled.RotateRight, contentDescription = "Forgatás +15°")
+                Icon(Icons.AutoMirrored.Filled.RotateRight, contentDescription = "Forgatás +15°")
             }
             IconButton(onClick = onRecolorSelection) {
                 Icon(Icons.Filled.FormatColorFill, contentDescription = "Átszínezés")

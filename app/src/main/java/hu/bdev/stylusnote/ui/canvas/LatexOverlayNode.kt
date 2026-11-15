@@ -1091,6 +1091,11 @@ fun PageObjectsOverlayLayer(
     onDeleteObject: (String) -> Unit,
     onRequestStepByStep: (PageObject.LatexObject) -> Unit,
     onRestoreOriginalStrokes: (PageObject) -> Unit = {},
+    lassoPreviewObjectIds: Set<String> = emptySet(),
+    lassoPreviewDeltaXPt: Float = 0f,
+    lassoPreviewDeltaYPt: Float = 0f,
+    lassoPreviewRotationRadians: Float = 0f,
+    lassoPreviewRotationCenter: DocPoint? = null,
     viewportTransformTick: Long = 0L,
     modifier: Modifier = Modifier
 ) {
@@ -1106,8 +1111,32 @@ fun PageObjectsOverlayLayer(
             .fillMaxSize()
             .onGloballyPositioned { overlayCoords = it }
     ) {
-        for (obj in pageObjects) {
-            if (obj is PageObject.PdfPageRefObject) continue
+        val liveLassoAffine = remember(
+            lassoPreviewDeltaXPt,
+            lassoPreviewDeltaYPt,
+            lassoPreviewRotationRadians,
+            lassoPreviewRotationCenter
+        ) {
+            when {
+                abs(lassoPreviewRotationRadians) > 1e-4f && lassoPreviewRotationCenter != null ->
+                    AffineTransform2D.rotationAround(
+                        lassoPreviewRotationRadians,
+                        lassoPreviewRotationCenter.xPt,
+                        lassoPreviewRotationCenter.yPt
+                    )
+                abs(lassoPreviewDeltaXPt) > 1e-4f || abs(lassoPreviewDeltaYPt) > 1e-4f ->
+                    AffineTransform2D.translation(lassoPreviewDeltaXPt, lassoPreviewDeltaYPt)
+                else -> null
+            }
+        }
+
+        for (rawObj in pageObjects) {
+            if (rawObj is PageObject.PdfPageRefObject) continue
+            val obj = if (liveLassoAffine != null && rawObj.id in lassoPreviewObjectIds) {
+                rawObj.transform(liveLassoAffine)
+            } else {
+                rawObj
+            }
 
             val screenTopLeft = transformMatrix.docToScreen(obj.bounds.leftPt, obj.bounds.topPt)
             val widthPx = (obj.bounds.widthPt * scale).coerceAtLeast(36f)
@@ -1128,25 +1157,26 @@ fun PageObjectsOverlayLayer(
                         )
                     }
                     .size(width = widthDp, height = heightDp)
-                    .pointerInput(obj.id) {
-                        detectDragGestures(
-                            onDragStart = { onSelectObject(latestObj.id) },
-                            onDrag = { change, dragAmount ->
-                                change.consume()
-                                val dxDoc = dragAmount.x / currentScale
-                                val dyDoc = dragAmount.y / currentScale
-                                onUpdateObject(
-                                    latestObj.transform(AffineTransform2D.translation(dxDoc, dyDoc))
+                    // Unselected objects pass all stylus/touch input directly through to the canvas below;
+                    // objects only accept drag gestures while explicitly selected (post-insert or via Lasso).
+                    .then(
+                        if (isSelected) {
+                            Modifier.pointerInput(obj.id) {
+                                detectDragGestures(
+                                    onDrag = { change, dragAmount ->
+                                        change.consume()
+                                        val dxDoc = dragAmount.x / currentScale
+                                        val dyDoc = dragAmount.y / currentScale
+                                        onUpdateObject(
+                                            latestObj.transform(AffineTransform2D.translation(dxDoc, dyDoc))
+                                        )
+                                    }
                                 )
                             }
-                        )
-                    }
-                    .clickable(
-                        interactionSource = remember { MutableInteractionSource() },
-                        indication = null
-                    ) {
-                        onSelectObject(if (isSelected) null else obj.id)
-                    }
+                        } else {
+                            Modifier
+                        }
+                    )
             ) {
                 when (obj) {
                     is PageObject.LatexObject -> LatexOverlayNode(
@@ -1489,6 +1519,11 @@ fun LatexOverlayNode(
                 }
             )
             .padding(2.dp)
+            .graphicsLayer {
+                if (abs(latexObject.rotationRadians) > 1e-4f) {
+                    rotationZ = (latexObject.rotationRadians * 180.0 / PI).toFloat()
+                }
+            }
     ) {
         Box(
             modifier = Modifier
@@ -1601,13 +1636,12 @@ fun DerivationCardNode(
     val fgColor = if (isOledMode) Color(0xFFE6EDF3) else Color(0xFF1F2328)
     val borderColor = if (isSelected) MaterialTheme.colorScheme.primary else Color(0xFF8B949E)
 
-    Surface(
+    Box(
         modifier = Modifier
             .fillMaxSize()
-            .border(1.2.dp, borderColor, RoundedCornerShape(12.dp)),
-        shape = RoundedCornerShape(12.dp),
-        color = bgColor,
-        tonalElevation = 2.dp
+            .clip(RoundedCornerShape(12.dp))
+            .background(bgColor, RoundedCornerShape(12.dp))
+            .border(1.2.dp, borderColor, RoundedCornerShape(12.dp))
     ) {
         Column(modifier = Modifier.padding(10.dp)) {
             Row(
@@ -1622,14 +1656,14 @@ fun DerivationCardNode(
                     color = fgColor,
                     modifier = Modifier.weight(1f)
                 )
-                IconButton(onClick = onToggleCollapse, modifier = Modifier.size(24.dp)) {
-                    Icon(
-                        imageVector = if (card.isCollapsed) Icons.Default.ExpandMore else Icons.Default.ExpandLess,
-                        contentDescription = null,
-                        tint = fgColor
-                    )
-                }
                 if (isSelected) {
+                    IconButton(onClick = onToggleCollapse, modifier = Modifier.size(24.dp)) {
+                        Icon(
+                            imageVector = if (card.isCollapsed) Icons.Default.ExpandMore else Icons.Default.ExpandLess,
+                            contentDescription = null,
+                            tint = fgColor
+                        )
+                    }
                     IconButton(onClick = onDelete, modifier = Modifier.size(24.dp)) {
                         Icon(
                             imageVector = Icons.Default.Delete,

@@ -11,6 +11,7 @@ import androidx.room.FtsOptions
 import androidx.room.Index
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
+import androidx.room.Upsert
 import androidx.room.PrimaryKey
 import androidx.room.Query
 import androidx.room.Room
@@ -20,6 +21,7 @@ import androidx.room.TypeConverter
 import androidx.room.TypeConverters
 import androidx.room.Update
 import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import hu.bdev.stylusnote.domain.model.CanvasMode
 import hu.bdev.stylusnote.domain.model.CoverLabelLayout
 import hu.bdev.stylusnote.domain.model.CoverTexture
@@ -163,6 +165,7 @@ data class PageEntity(
     val notebookId: String,
     val chapterId: String? = null,
     val pageIndexInNotebook: Int,
+    val title: String? = null,
     val canvasMode: CanvasMode = CanvasMode.FIXED_PAGE,
     val pageSizePreset: PageSizePreset = PageSizePreset.A4_PORTRAIT,
     val templateType: PaperTemplateType = PaperTemplateType.GRID_5MM,
@@ -328,7 +331,7 @@ interface FolderDao {
     @Query("SELECT * FROM folders WHERE id = :folderId LIMIT 1")
     suspend fun getFolderById(folderId: String): FolderEntity?
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Upsert
     suspend fun upsertFolder(folder: FolderEntity)
 
     @Query("DELETE FROM folders WHERE id = :folderId")
@@ -346,7 +349,7 @@ interface NotebookDao {
     @Query("SELECT * FROM notebooks WHERE id = :notebookId LIMIT 1")
     suspend fun getNotebookById(notebookId: String): NotebookEntity?
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Upsert
     suspend fun upsertNotebook(notebook: NotebookEntity)
 
     @Update
@@ -361,7 +364,7 @@ interface ChapterDao {
     @Query("SELECT * FROM chapters WHERE notebookId = :notebookId ORDER BY sortOrder ASC")
     fun observeChapters(notebookId: String): Flow<List<ChapterEntity>>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Upsert
     suspend fun upsertChapter(chapter: ChapterEntity)
 
     @Query("DELETE FROM chapters WHERE id = :chapterId")
@@ -385,8 +388,11 @@ interface PageDao {
     @Query("SELECT DISTINCT notebookId FROM pages WHERE pdfAssetId IS NOT NULL")
     fun observePdfNotebookIds(): Flow<List<String>>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Upsert
     suspend fun upsertPage(page: PageEntity)
+
+    @Query("UPDATE pages SET title = :title, updatedAtEpochMs = :updatedAtMs WHERE id = :pageId")
+    suspend fun renamePage(pageId: String, title: String?, updatedAtMs: Long)
 
     @Transaction
     suspend fun reorderPagesInNotebook(
@@ -435,7 +441,7 @@ interface TagDao {
     @Query("SELECT * FROM notebook_tag_cross_ref")
     fun observeAllNotebookTagLinks(): Flow<List<NotebookTagCrossRef>>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Upsert
     suspend fun upsertTag(tag: TagEntity)
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
@@ -456,7 +462,7 @@ interface BookmarkDao {
     @Query("SELECT * FROM bookmarks ORDER BY createdAtEpochMs DESC")
     fun observeAllBookmarks(): Flow<List<BookmarkEntity>>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Upsert
     suspend fun upsertBookmark(bookmark: BookmarkEntity)
 
     @Query("DELETE FROM bookmarks WHERE id = :bookmarkId")
@@ -522,7 +528,7 @@ interface PageTextSearchDao {
         BookmarkEntity::class,
         PageTextFtsEntity::class
     ],
-    version = 1,
+    version = 2,
     exportSchema = true
 )
 @TypeConverters(StylusNoteDatabaseConverters::class)
@@ -539,9 +545,18 @@ abstract class AppDatabase : RoomDatabase() {
         const val DATABASE_NAME: String = "stylusnote.db"
 
         /**
+         * Adds optional per-page custom [PageEntity.title] without touching user rows.
+         */
+        val MIGRATION_1_2: Migration = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE pages ADD COLUMN title TEXT")
+            }
+        }
+
+        /**
          * Explicit forward migration registry (`v1 -> v2`, etc.). Destructive fallback is never enabled.
          */
-        val ALL_MIGRATIONS: Array<Migration> = emptyArray()
+        val ALL_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_1_2)
 
         @Volatile
         private var instance: AppDatabase? = null

@@ -224,3 +224,44 @@ flowchart TD
   - `.\gradlew :app:connectedDebugAndroidTest`: **8/8** műszerezett teszt sikeres (`TEST-25097RP43G - 16-_app-.xml`, `0` hiba, `0` kihagyás).
   - `.\gradlew :benchmark:connectedBenchmarkAndroidTest` (`panAndZoom10kStrokesCanvasFrameTiming`, 5 iteráció, median `frameCount = 120,0`, `CV = 0,95%`): **`frameDurationCpuMs` P50 = `4,30 ms`, P90 = `5,51 ms`, P95 = `5,95 ms` (≤ `6,94 ms` teljesítve ✅), P99 = `8,64 ms`**; **`frameOverrunMs` P50 = `-7,41 ms`, P90 = `-6,15 ms`, P95 = `-5,66 ms`, P99 = `-3,32 ms`** (0 eldobott képkocka).
   - `.\gradlew :app:installDebug` + `am start -n hu.bdev.stylusnote/.MainActivity`: A friss `app-debug.apk` telepítve és elindítva a `25097RP43G` táblagépen.
+
+---
+
+### [2026-11-15] — Lépés 39: Többoldalas Lapváltás, Új Oldal Létrehozás és Függőleges Görgetés Javítása
+
+- **Kötött `AndroidView` és oldalkomponens kulcsozás (`BookshelfScreen.kt`, `StylusDrawingSurface.kt`):**
+  - A `NotebookPagePane` (`key(target.notebookId, target.pageId)`) és a belső `AndroidView` (`key(transformMatrix, dryStrokeStore, dryInkRasterCache, journalCommitSink)`) kulcsozásával új oldal létrehozásakor vagy oldalváltáskor a `DryCanvasView` és az `InProgressStrokesView` lambda-kötei többé nem maradnak az 1. oldal bezárt példányaira rögzítve.
+  - A füzetszintű eszközbeállítások (`brushConfig`, `perToolConfigs`, `lastDrawingTool`, `lastEraserTool`), az alakzat-alapértelmezések, a `isFullScreenCanvas` (tiszteletben tartva az `initialPagePaddingPx` kezdő margót) és a `showLeftPageDrawer` kiemelődtek a `NotebookWorkspaceScreen` szintjére (`remember(target.notebookId)`), míg az oldalfiókból indított `+ Új oldal hozzáadása` (`createAndOpenNextPage`, FK-védelemmel `nb == null` esetre) megnyitás után tisztán bezárja a fiókot.
+  - Az `openDefaultPageForNotebook` ellenőriz `database.pageDao().getPagesForNotebook(nb.id)` meglévő oldalakat elavult `lastOpenedPageId` esetén, elkerülve a duplikált `pageIndexInNotebook = 0` sorokat.
+- **Kompozit-kompatibilis szomszédos oldal-előnézet és skálafüggő lapozás (`StylusDrawingSurface.kt`, `BookshelfScreen.kt`, `FixedPageScrollNavigationTest.kt`):**
+  - Eltávolítottuk a `!usedComposite &&` korlátozást a `PaperBackgroundRenderer.drawAdjacentFixedPagesIfVisible(...)` elől (`StylusDrawingSurface.kt`), így aktív `CompositePageSnapshot` mellett is láthatóvá válnak a szomszédos (`N-1. oldal`, `N+1. oldal`) lapok, ha a látható dokumentumsáv átlépi a `±72 pt` határt.
+  - Bevezettük a tiszta `resolveFixedPageScrollNavigation(...)` (`FixedPageScrollNavigationAction`) függvényt skálafüggő túlgörgetési küszöbbel (`switchRevealThresholdPt = max(96f, visibleHeightPt * 0.28f)` + középpont-irány ellenőrzés), amely `65%`-os kizoomolásnál nem vált véletlenül oldalt, míg normál függőleges görgetésnél simán átlép a következő/előző oldalra vagy túlhúzásnál új oldalt nyit.
+- **Lépés 39 verifikációs eredményei (`25097RP43G` Xiaomi Pad 8 — Android 16 / SDK 36):**
+  - `.\gradlew testDebugUnitTest`: **79/79** JVM unit teszt sikeres (`17` osztály, `0` hiba, `0` kihagyás — benne a 8 új `FixedPageScrollNavigationTest` teszttel).
+  - `.\gradlew :app:connectedDebugAndroidTest`: **8/8** műszerezett teszt sikeres (`0` hiba, `0` kihagyás).
+  - `.\gradlew :benchmark:connectedBenchmarkAndroidTest` (`panAndZoom10kStrokesCanvasFrameTiming`, 5 iteráció, median `frameCount = 118,0`, `CV = 0,71%`): **`frameDurationCpuMs` P50 = `4,29 ms`, P90 = `5,46 ms`, P95 = `6,04 ms` (≤ `6,94 ms` teljesítve ✅), P99 = `7,62 ms`**; **`frameOverrunMs` P50 = `-7,38 ms`, P90 = `-6,07 ms`, P95 = `-5,66 ms`, P99 = `-3,73 ms`** (0 eldobott képkocka).
+  - `.\gradlew :app:installDebug` + `am start -n hu.bdev.stylusnote/.MainActivity`: Friss `app-debug.apk` telepítve és elindítva a `25097RP43G` táblagépen.
+
+---
+
+### [2026-11-15] — V. Ütem (Lépés 40–47): Adatbázis `@Upsert` & Oldal-Átnevezés, `FLAG_CANCELED` Tenyérvédelem & Azonnali Nedves Tinta, Átrajzolható Pass-through Objektumok, Lasszó Objektum-Kijelölés, Folyamatos Széthúzható Paletta és Vektoros App Ikon
+
+- **Lépés 40–41 (`AppDatabase.kt`, `LeftPageDrawer.kt`, `BookshelfScreen.kt`, `StylusNoteInstrumentedValidationTest.kt`):**
+  - `@Insert(OnConflictStrategy.REPLACE)` → `@Upsert` (`FolderEntity`, `NotebookEntity`, `ChapterEntity`, `PageEntity`) a szülősor frissítésekor (`lastOpenedPageId`) kiváltódó `ON DELETE CASCADE` oldaltörlési hiba megszüntetésére.
+  - `AppDatabase` `version = 2` (`PageEntity.title: String?`, `MIGRATION_1_2` `ALTER TABLE pages ADD COLUMN title TEXT`, `PageDao.renamePage`, `2.json` Room séma), `LeftPageDrawer` oldalonkénti átnevezési dialógus, `workspaceBannerHu` oldal-létrehozási visszajelzés, valamint `Room` v1→v2 és `@Upsert` kaszkád-védelmi `androidTest`-ek (`kotlinx-serialization-bom:1.8.1` összehangolással a `room-testing` osztálybetöltéshez).
+- **Lépés 42 (`StylusInputRouter.kt`, `StylusDrawingSurface.kt`, `StylusInputRouterTest.kt`):**
+  - `wetView.eagerInit()` a vászon felcsatolásakor a legelső tollvonás késleltetésének / késő megjelenésének megszüntetésére, `FLAG_CANCELED` (`0x20`) kezelése `ACTION_POINTER_UP` eseményen, `TOOL_TYPE_PALM_COMPAT = 5` szűrés, `850 ms` post-stylus kegyelmi zár, valamint pan-visszagörgetés tenyérátvétel (`isOngoingPalmTakeover`) esetén.
+- **Lépés 43 (`LatexOverlayNode.kt`):**
+  - `PageObjectsOverlayLayer`: kijelöletlen objektumokról (`isSelected == false`) eltávolítva a `.pointerInput` és `.clickable`, így a beszúrt alakzatok, képek és AI-szöveg/képlet kártyák teljes mértékben átrajzolhatók tollal; `DerivationCardNode` `Surface`-mentes (`Box` + `.background`/`.border`) pass-through konténerre cserélve, a bezárás/törlés gombok kizárólag kijelölt állapotban látszanak; `LatexOverlayNode` elforgatás (`graphicsLayer { rotationZ }`) támogatva.
+- **Lépés 44 (`PageObject.kt`, `StrokeJournal.kt`, `CanvasStateHolder.kt`, `StylusDrawingSurface.kt`, `LatexOverlayNode.kt`, `BookshelfScreen.kt`, `CanvasStateHolderTest.kt`):**
+  - `CanvasStateHolder` egyesített `selectPageObjectsByLasso` (9-pontos elforgatott kontúr-metszés, `PdfPageRefObject` kizárásával), `computeCombinedSelectionBounds`, `transformSelection`, `duplicateSelection`, `deleteSelection` és `recolorSelection` műveletek `CompositeAction` atomikus Undo/Redo támogatással; `JournalCommitSink` kiterjesztve `onObjectsAdded` / `onObjectsUpdated` / `onObjectsDeleted` horgokkal.
+  - `StylusDrawingSurface` lasszó futásidő élő `onLassoObjectPreviewChanged` előnézettel, szűrt `"✨ AI"` / `"Átszínezés"` láthatósággal, és 1 kijelölt objektum (`0` vonás) esetén azonnali `onLassoSelectedObject` aktiválással (4-sarkos méretező/forgató fogantyúk + `"Eredeti"` gomb).
+- **Lépés 45 (`BrushSettingsPopover.kt`, `ToolDockPlacementTest.kt`):**
+  - Azonnali ugrásmentes széthúzás: kézmozgást követő `Animatable(312f..472f)` szélesség (`POPOVER_COMPACT_WIDTH_DP..POPOVER_FULL_WIDTH_DP`) és `progressiveStudioReveal(stage2RevealFraction)` folyamatos magasság/alfa átmenet; dinamikus dokkolás-oldali alsó sarok-fogantyú (`resolveBrushPopoverExpandsRightward` → `Alignment.BottomEnd` / `BottomStart`), `computeAnchoredPopoverOffsetPx` dokk-oldali rögzítéssel húzás közben.
+- **Lépés 46 (`res/drawable/ic_launcher_*.xml`, `res/mipmap-anydpi-v26/ic_launcher*.xml`, `AndroidManifest.xml`):**
+  - Az 1-es kiválasztott koncepció („Swiss Töltőtollhegy & Tintaív”) megvalósítása éles, méretezhető Android 108×108 vektoros adaptív ikonként (`ic_launcher_background.xml` lágy `#F7F8FA` papírháttér, `ic_launcher_foreground.xml` kétárnyalatú `#1E5585`/`#13385B` Swiss tollhegy áttetsző nyílással + `#2B689C` S-ívű tintavonal, `ic_launcher_monochrome.xml` Android 13+ témázott ikonokhoz).
+- **Lépés 47 végső verifikáció eredményei (`25097RP43G` Xiaomi Pad 8 — Android 16 / SDK 36):**
+  - `.\gradlew testDebugUnitTest --console=plain`: **85/85** JVM unit teszt sikeres (`17` osztály, `0` hiba, `0` kihagyás — benne `StylusInputRouterTest` `12/12`, `CanvasStateHolderTest` `6/6`, `ToolDockPlacementTest` `6/6`).
+  - `.\gradlew :app:connectedDebugAndroidTest --console=plain`: **10/10** műszerezett teszt sikeres (`TEST-25097RP43G - 16-_app-.xml`, `0` hiba, `0` kihagyás).
+  - `.\gradlew :benchmark:connectedBenchmarkAndroidTest --console=plain` (`panAndZoom10kStrokesCanvasFrameTiming`, 5 iteráció, median `frameCount = 120,0`, `CV = 0,022`): **`frameDurationCpuMs` P50 = `4,50 ms`, P90 = `5,81 ms`, P95 = `6,47 ms` (≤ `6,94 ms` teljesítve ✅), P99 = `7,58 ms`**; **`frameOverrunMs` P50 = `-7,14 ms`, P90 = `-5,77 ms`, P95 = `-5,35 ms`, P99 = `-3,85 ms`**.
+  - `.\gradlew :app:installDebug` + `am start -n hu.bdev.stylusnote/.MainActivity`: Friss APK telepítve `25097RP43G`-re, indítás (`launch_verify.png`) és adaptív launcher ikon (`home_icon.png`) vizuálisan ellenőrizve.

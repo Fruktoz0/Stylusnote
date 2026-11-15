@@ -36,17 +36,18 @@ sequenceDiagram
 
 ---
 
-## 2. Lasszó Szellemkép-mentes Mozgatás, Sarok-Forgatás és `✨ AI` Automatikus Formázás
+## 2. Lasszó Szellemkép-mentes Mozgatás (Vonások + Objektumok), Sarok-Forgatás és `✨ AI` Automatikus Formázás
 
 ```mermaid
 flowchart LR
-    A["Lasszó kijelölés (≥60% pont bent)"] --> M["Húzás / Sarok-forgatás közben excludedStrokeIds → eredeti hely üres, nincs szellemkép"]
-    M --> R["Élő preScale / preRotate előnézet → ACTION_UP: AffineTransform2D véglegesítés"]
-    A --> AI{"✨ AI gomb (LassoSelectionActionBar)"}
+    A["Lasszó kijelölés (≥60% vonás vagy ≥2 elforgatott objektumpont; PDF kihagyva)"] --> O["1 objektum + 0 vonás → azonnali sarok-méretezés/forgatás/'Eredeti' menü"]
+    A --> M["Mozgatás / Skálázás / Forgatás → excludedStrokeIds + élő lassoPreview* objektumok (nincs szellemkép)"]
+    M --> R["ACTION_UP → CanvasStateHolder egyesített CompositeAction + StrokeJournal (1 lépéses Undo/Redo)"]
+    A --> AI{"✨ AI gomb (csak ha van kijelölt vonás)"}
     AI -- 1 vonás és alakzat (<10 ms helyi) --> SH["ShapeRecognizer → vektoros vonal / kör / háromszög / téglalap / nyíl"]
     AI -- Összetett kijelölés (768 px PNG) --> G{"Gemini Flash + Multi-Flash Failover (60s timeout)"}
     G -- formula --> L["jlatexmath validálás → LatexObject"]
-    G -- text --> T["FormattedTextObject (nem-sticky kijelölés, HandwritingFontFamily)"]
+    G -- text --> T["FormattedTextObject (nem-sticky, átírható pass-through mód, HandwritingFontFamily)"]
     G -- shape --> SH2["Vektoros alakzat + ShapeMeta"]
     L & T & SH2 --> U["Atomikus CompositeAction (+ originalStrokes) + StrokeJournal → 1 lépéses Undo / 'Eredeti' gomb"]
 ```
@@ -76,10 +77,10 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    A["1-ujjas függőleges pan (650 ms tenyérvédelem + 14 px slop) vagy 2-ujjas pinch-zoom"] --> B["InProgressStrokesView: requestDisallowInterceptTouchEvent(true)"]
+    A["1-ujjas függőleges pan (850 ms grace + FLAG_CANCELED + tenyér-visszagörgetés) vagy 2-ujjas pinch-zoom"] --> B["InProgressStrokesView (eagerInit előmelegítéssel): requestDisallowInterceptTouchEvent(true)"]
     B --> C["StylusInputRouter (dx=0f 1-ujjnál; centroid + skála 2-ujjnál) → DryCanvasView.invalidate() & viewportTransformTick (PageObject esetén)"]
     C --> E{"CompositePageSnapshot érvényes?"}
-    E -- Igen (Fix oldal aktív gesztus alatt) --> F["1x GPU Hardware Bitmap TextureOp blit (4,37 ms P50 / 6,05 ms P95)"]
+    E -- Igen (Fix oldal aktív gesztus alatt) --> F["1x GPU Hardware Bitmap TextureOp blit (4,50 ms P50 / 6,47 ms P95)"]
     E -- Nem (Végtelen vászon / lasszó / többoldalas szél) --> G["PaperBackgroundRenderer kötegelt rajz + 512x512 LRU csempék"]
     C --> H["onNavigationGestureEnd + 100 ms settleRunnable → zoom-% frissítés & éles csempék"]
 ```
@@ -104,7 +105,7 @@ flowchart TD
 ```mermaid
 flowchart LR
     T1["FloatingToolDock: StarNote színes ikonok, globális (x,y), összecsukva Toll|Radír|Vissza + Teljes képernyő gomb"] --> T2["Eszközváltás → független perToolConfigs vastagság/szín/átlátszóság visszaállítás"]
-    T1 --> T3["Eszköz hosszú érintése → eszközhöz igazított 2 lépcsős BrushSettingsPopover (bal alsó '◢' sarok-fogantyú → teljes stúdió + átlátszóság)"]
+    T1 --> T3["Eszköz hosszú érintése → folyamatosan széthúzható BrushSettingsPopover (Animatable 312..472 dp + dokk-oldali külső sarok-fogantyú)"]
     A1["Bal felső sarokba simuló CanvasTopToolbar AI gomb → AiCopilotSheet"] --> A2["Hatókör: Csak adott oldal / Teljes munkafüzet"]
     A2 --> A3["1. Teljes formázás (HandwritingFontFamily szöveg + ábrák + képletek)"]
     A2 --> A4["2. Csak alakzatok és képletek (kézírásos folyószöveg érintetlen marad)"]
@@ -116,10 +117,10 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    S1["FloatingToolDock: Alakzatok gomb → animált HorizontalPager ShapePickerPopover (1. oldal 2D → 2. oldal 3D)"] --> S2["Papírhoz rögzített GeometricShapeObject (SNOT tag=6) pan/zoom szinkronnal"]
-    S2 --> S3["4 sarok méretező + felső forgató fogantyú + kitöltés/szín/törlés menü → PdfExportManager vektoros export"]
-    I1["FloatingToolDock: Kép beszúrása gomb → galériakép (ImageDecoder)"] --> I2["Papírhoz rögzített PageObject.ImageObject (SNOT tag=7, pages/<id>/images/)"]
-    I2 --> I3["4 sarok méretező + felső forgató fogantyú + zoom/forgatás/törlés menü → PdfExportManager"]
-    P1["Bal oldalon függőlegesen eltolható LeftPagePullTab → LeftPageDrawer"] --> P2["Drag & Drop oldalsorrend módosítás (reorderPagesInNotebook) & + Új oldal létrehozása"]
+    S1["FloatingToolDock: Alakzatok gomb → animált HorizontalPager ShapePickerPopover (1. oldal 2D → 2. oldal 3D)"] --> S2["Papírhoz rögzített GeometricShapeObject (SNOT tag=6, pass-through: toll átrajzol rajta)"]
+    S2 --> S3["Lasszós visszajelölésre 4 sarok méretező + szabad forgató + kitöltés/szín/törlés menü → PdfExportManager"]
+    I1["FloatingToolDock: Kép beszúrása gomb → galériakép (ImageDecoder)"] --> I2["Papírhoz rögzített PageObject.ImageObject (SNOT tag=7, pass-through: toll átrajzol rajta)"]
+    I2 --> I3["Lasszós visszajelölésre 4 sarok méretező + szabad forgató + zoom/törlés menü → PdfExportManager"]
+    P1["Bal oldalon függőlegesen eltolható LeftPagePullTab → LeftPageDrawer"] --> P2["Drag & Drop oldalsorrend, oldal átnevezése (Room v2 title) & + Új oldal létrehozása"]
 ```
 

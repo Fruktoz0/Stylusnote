@@ -108,6 +108,12 @@ sealed interface PageObject {
 
     fun transform(affine: AffineTransform2D): PageObject
 
+    /** Returns a duplicate of this object translated/transformed with a fresh [newId] and [newZOrder]. */
+    fun duplicateWith(newId: String, newZOrder: Long, affine: AffineTransform2D): PageObject
+
+    /** Returns a recolored copy if this object supports canonical ink/stroke colors, or null otherwise. */
+    fun withCanonicalColorOrNull(canonicalColorArgb: Int): PageObject? = null
+
     data class LatexObject(
         override val id: String,
         override val zOrder: Long,
@@ -119,11 +125,37 @@ sealed interface PageObject {
         val sourceStrokeIds: List<String> = emptyList(),
         val originalStrokes: List<PersistedStrokeRecord> = emptyList()
     ) : PageObject {
-        override fun transform(affine: AffineTransform2D): PageObject = copy(
-            bounds = affine.transformRect(bounds),
-            fontSizePt = (fontSizePt * affine.averageScaleFactor()).coerceIn(8f, 120f),
-            originalStrokes = originalStrokes.map { it.withTransform(affine) }
+        override fun transform(affine: AffineTransform2D): PageObject {
+            val scale = affine.averageScaleFactor()
+            val newCenter = affine.transformPoint(bounds.centerXPt, bounds.centerYPt)
+            val halfW = (bounds.widthPt * 0.5f * scale).coerceAtLeast(8f)
+            val halfH = (bounds.heightPt * 0.5f * scale).coerceAtLeast(8f)
+            val deltaRot = atan2(affine.shearY, affine.scaleX)
+            return copy(
+                bounds = DocRect(
+                    leftPt = newCenter.xPt - halfW,
+                    topPt = newCenter.yPt - halfH,
+                    rightPt = newCenter.xPt + halfW,
+                    bottomPt = newCenter.yPt + halfH
+                ),
+                fontSizePt = (fontSizePt * scale).coerceIn(8f, 120f),
+                rotationRadians = rotationRadians + deltaRot,
+                originalStrokes = originalStrokes.map { it.withTransform(affine) }
+            )
+        }
+
+        override fun duplicateWith(
+            newId: String,
+            newZOrder: Long,
+            affine: AffineTransform2D
+        ): PageObject = (transform(affine) as LatexObject).copy(
+            id = newId,
+            zOrder = newZOrder,
+            sourceStrokeIds = emptyList()
         )
+
+        override fun withCanonicalColorOrNull(canonicalColorArgb: Int): PageObject =
+            copy(canonicalColorArgb = canonicalColorArgb)
     }
 
     data class FunctionPlotObject(
@@ -142,6 +174,18 @@ sealed interface PageObject {
         override fun transform(affine: AffineTransform2D): PageObject = copy(
             bounds = affine.transformRect(bounds)
         )
+
+        override fun duplicateWith(
+            newId: String,
+            newZOrder: Long,
+            affine: AffineTransform2D
+        ): PageObject = (transform(affine) as FunctionPlotObject).copy(
+            id = newId,
+            zOrder = newZOrder
+        )
+
+        override fun withCanonicalColorOrNull(canonicalColorArgb: Int): PageObject =
+            copy(canonicalColorArgb = canonicalColorArgb)
     }
 
     data class DerivationCardObject(
@@ -156,6 +200,15 @@ sealed interface PageObject {
         override fun transform(affine: AffineTransform2D): PageObject = copy(
             bounds = affine.transformRect(bounds)
         )
+
+        override fun duplicateWith(
+            newId: String,
+            newZOrder: Long,
+            affine: AffineTransform2D
+        ): PageObject = (transform(affine) as DerivationCardObject).copy(
+            id = newId,
+            zOrder = newZOrder
+        )
     }
 
     data class PdfPageRefObject(
@@ -168,6 +221,15 @@ sealed interface PageObject {
     ) : PageObject {
         override fun transform(affine: AffineTransform2D): PageObject = copy(
             bounds = affine.transformRect(bounds)
+        )
+
+        override fun duplicateWith(
+            newId: String,
+            newZOrder: Long,
+            affine: AffineTransform2D
+        ): PageObject = (transform(affine) as PdfPageRefObject).copy(
+            id = newId,
+            zOrder = newZOrder
         )
     }
 
@@ -186,11 +248,37 @@ sealed interface PageObject {
         val sourceStrokeIds: List<String> = emptyList(),
         val originalStrokes: List<PersistedStrokeRecord> = emptyList()
     ) : PageObject {
-        override fun transform(affine: AffineTransform2D): PageObject = copy(
-            bounds = affine.transformRect(bounds),
-            fontSizePt = (fontSizePt * affine.averageScaleFactor()).coerceIn(10f, 96f),
-            originalStrokes = originalStrokes.map { it.withTransform(affine) }
+        override fun transform(affine: AffineTransform2D): PageObject {
+            val scale = affine.averageScaleFactor()
+            val newCenter = affine.transformPoint(bounds.centerXPt, bounds.centerYPt)
+            val halfW = (bounds.widthPt * 0.5f * scale).coerceAtLeast(8f)
+            val halfH = (bounds.heightPt * 0.5f * scale).coerceAtLeast(8f)
+            val deltaRot = atan2(affine.shearY, affine.scaleX)
+            return copy(
+                bounds = DocRect(
+                    leftPt = newCenter.xPt - halfW,
+                    topPt = newCenter.yPt - halfH,
+                    rightPt = newCenter.xPt + halfW,
+                    bottomPt = newCenter.yPt + halfH
+                ),
+                fontSizePt = (fontSizePt * scale).coerceIn(10f, 96f),
+                rotationRadians = rotationRadians + deltaRot,
+                originalStrokes = originalStrokes.map { it.withTransform(affine) }
+            )
+        }
+
+        override fun duplicateWith(
+            newId: String,
+            newZOrder: Long,
+            affine: AffineTransform2D
+        ): PageObject = (transform(affine) as FormattedTextObject).copy(
+            id = newId,
+            zOrder = newZOrder,
+            sourceStrokeIds = emptyList()
         )
+
+        override fun withCanonicalColorOrNull(canonicalColorArgb: Int): PageObject =
+            copy(canonicalColorArgb = canonicalColorArgb)
     }
 
     /**
@@ -223,6 +311,20 @@ sealed interface PageObject {
                 rotationRadians = rotationRadians + deltaRot
             )
         }
+
+        override fun duplicateWith(
+            newId: String,
+            newZOrder: Long,
+            affine: AffineTransform2D
+        ): PageObject = (transform(affine) as GeometricShapeObject).copy(
+            id = newId,
+            zOrder = newZOrder
+        )
+
+        override fun withCanonicalColorOrNull(canonicalColorArgb: Int): PageObject = copy(
+            canonicalStrokeColorArgb = canonicalColorArgb,
+            canonicalFillColorArgb = (canonicalColorArgb and 0x00FFFFFF) or 0x28000000
+        )
     }
 
     /**
@@ -251,6 +353,15 @@ sealed interface PageObject {
                 rotationRadians = rotationRadians + deltaRot
             )
         }
+
+        override fun duplicateWith(
+            newId: String,
+            newZOrder: Long,
+            affine: AffineTransform2D
+        ): PageObject = (transform(affine) as ImageObject).copy(
+            id = newId,
+            zOrder = newZOrder
+        )
     }
 }
 

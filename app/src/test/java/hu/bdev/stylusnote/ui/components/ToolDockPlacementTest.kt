@@ -125,4 +125,22 @@ class ToolDockPlacementTest {
         assertTrue(offset.x >= 12 && offset.x + popoverSize.width <= viewport.width - 12)
         assertTrue(offset.y + popoverSize.height <= viewport.height - 12)
     }
+
+    @Test
+    fun brushPopoverResizeHandleDirectionMatchesDockPlacementSide() {
+        val viewport = IntSize(width = 2560, height = 1600)
+        // Left vertical dock opens popover to its right -> resize corner sits at bottom-right (expands rightward)
+        val leftDockBounds = Rect(left = 16f, top = 300f, right = 88f, bottom = 900f)
+        assertTrue(resolveBrushPopoverExpandsRightward(leftDockBounds, viewport))
+
+        // Right vertical dock opens popover to its left -> resize corner sits at bottom-left (expands leftward)
+        val rightDockBounds = Rect(left = 2472f, top = 300f, right = 2544f, bottom = 900f)
+        assertFalse(resolveBrushPopoverExpandsRightward(rightDockBounds, viewport))
+
+        // Horizontal dock on left half expands rightward, on right half expands leftward
+        val bottomLeftDock = Rect(left = 200f, top = 1480f, right = 800f, bottom = 1550f)
+        val bottomRightDock = Rect(left = 1760f, top = 1480f, right = 2360f, bottom = 1550f)
+        assertTrue(resolveBrushPopoverExpandsRightward(bottomLeftDock, viewport))
+        assertFalse(resolveBrushPopoverExpandsRightward(bottomRightDock, viewport))
+    }
 }

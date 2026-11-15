@@ -1,0 +1,59 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Subtle soft paper elevation shadow under collar and nib -->
+    <group
+        android:translateX="1.1"
+        android:translateY="2.0">
+        <path
+            android:fillAlpha="0.10"
+            android:fillColor="#13385B"
+            android:pathData="M49.82,32.86 L54.42,28.27 L65.73,39.58 L61.14,44.18 Z" />
+        <path
+            android:fillAlpha="0.12"
+            android:fillColor="#13385B"
+            android:pathData="M32.5,61.5 L38.51,39.93 L48.06,34.63 L59.37,45.94 L54.07,55.49 Z" />
+    </group>
+
+    <!-- Separated geometric top collar (Swiss faceted split along axis) -->
+    <path
+        android:fillColor="#1E5585"
+        android:pathData="M49.82,32.86 L54.42,28.27 L60.32,34.17 L55.73,38.77 Z" />
+    <path
+        android:fillColor="#13385B"
+        android:pathData="M55.48,38.52 L60.08,33.92 L65.73,39.58 L61.14,44.18 Z" />
+
+    <!-- Fountain pen nib with genuinely transparent breather hole and center slit -->
+    <path
+        android:fillColor="#1E5585"
+        android:pathData="M32.5,61.5 L38.51,39.93 L48.06,34.63 L53.96,40.53 L46.96,47.53 L46.54,47.46 A2.65,2.65 0 0,0 42.35,50.63 L33.83,59.15 L33.63,60.37 L33.22,61.09 Z" />
+    <path
+        android:fillColor="#13385B"
+        android:pathData="M32.5,61.5 L33.63,60.37 L34.85,60.17 L43.37,51.65 A2.65,2.65 0 0,0 46.54,47.46 L53.71,40.29 L59.37,45.94 L54.07,55.49 Z" />
+
+    <!-- Tapered calligraphic cerulean S-curve ink stroke -->
+    <path android:pathData="M30.8,64.8 C36.2,71.2 46.2,71.4 55.8,66.4 C63.6,62.3 71.2,62.8 77.2,67.6 C71.0,65.8 64.0,65.8 57.0,70.2 C46.4,76.8 34.8,74.2 30.8,64.8 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:endX="77.2"
+                android:endY="67.2"
+                android:startX="30.8"
+                android:startY="66.0"
+                android:type="linear">
+                <item
+                    android:color="#FF1E5280"
+                    android:offset="0.0" />
+                <item
+                    android:color="#FF2B689C"
+                    android:offset="0.55" />
+                <item
+                    android:color="#FF3A7CB4"
+                    android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+</vector>

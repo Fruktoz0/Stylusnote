@@ -7,6 +7,7 @@ lifecycle = "2.9.0"
 activityCompose = "1.10.1"
 composeBom = "2025.05.00"
 coroutines = "1.10.2"
+kotlinxSerialization = "1.8.1"
 
 # Google Jetpack Ink API (1.1.0-alpha10 pinned for experimental Stroke.subtract/split and BrushFamily)
 ink = "1.1.0-alpha10"
@@ -50,6 +51,7 @@ androidx-compose-ui-test-junit4 = { group = "androidx.compose.ui", name = "ui-te
 
 kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
 kotlinx-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "coroutines" }
+kotlinx-serialization-bom = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-bom", version.ref = "kotlinxSerialization" }
 
 # Jetpack Ink Modules
 androidx-ink-authoring = { group = "androidx.ink", name = "ink-authoring", version.ref = "ink" }

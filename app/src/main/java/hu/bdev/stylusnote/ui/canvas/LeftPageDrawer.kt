@@ -32,14 +32,17 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DragIndicator
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -62,6 +65,7 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
@@ -173,6 +177,7 @@ fun LeftPageDrawerOverlay(
     onSelectPage: (String) -> Unit,
     onAddNewPage: () -> Unit,
     onReorderPages: (List<String>) -> Unit = {},
+    onRenamePage: (pageId: String, newTitle: String?) -> Unit = { _, _ -> },
     onDismiss: () -> Unit
 ) {
     val surfacePalette = LocalStylusSurfacePalette.current
@@ -183,6 +188,9 @@ fun LeftPageDrawerOverlay(
     var draggedPageId by remember { mutableStateOf<String?>(null) }
     var dragDeltaYPx by remember { mutableFloatStateOf(0f) }
     var cardHeightPx by remember { mutableIntStateOf(160) }
+    var renamingPage by remember { mutableStateOf<PageEntity?>(null) }
+    var renamingPageIndexOneBased by remember { mutableIntStateOf(1) }
+    var renameDraft by remember { mutableStateOf("") }
 
     LaunchedEffect(Unit) {
         focusRequester.requestFocus()
@@ -366,19 +374,43 @@ fun LeftPageDrawerOverlay(
                             ) {
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
+                                    val customTitle = page.title?.trim()?.takeIf { it.isNotEmpty() }
+                                    val labelText = if (customTitle != null) {
+                                        "${index + 1}. $customTitle"
+                                    } else {
+                                        "${index + 1}. oldal"
+                                    }
                                     Text(
-                                        text = "${index + 1}. oldal",
+                                        text = labelText,
                                         style = MaterialTheme.typography.labelMedium,
                                         fontWeight = if (isActive) FontWeight.Bold else FontWeight.Medium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
                                         color = if (isActive) {
                                             MaterialTheme.colorScheme.primary
                                         } else {
                                             MaterialTheme.colorScheme.onSurface
-                                        }
+                                        },
+                                        modifier = Modifier.weight(1f)
                                     )
+                                    IconButton(
+                                        onClick = {
+                                            renamingPage = page
+                                            renamingPageIndexOneBased = index + 1
+                                            renameDraft = page.title.orEmpty()
+                                        },
+                                        modifier = Modifier.size(24.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Edit,
+                                            contentDescription = "Oldal átnevezése",
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.size(14.dp)
+                                        )
+                                    }
                                     Icon(
                                         imageVector = Icons.Filled.DragIndicator,
                                         contentDescription = "Sorrend mozgatása",
@@ -434,6 +466,88 @@ fun LeftPageDrawerOverlay(
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text("Új oldal hozzáadása")
+                }
+            }
+        }
+
+        val pendingRename = renamingPage
+        if (pendingRename != null) {
+            val dialogFocusRequester = remember { FocusRequester() }
+            LaunchedEffect(pendingRename.id) {
+                dialogFocusRequester.requestFocus()
+            }
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.42f))
+                    .focusRequester(dialogFocusRequester)
+                    .focusable()
+                    .onPreviewKeyEvent { keyEvent ->
+                        if (keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.Escape) {
+                            renamingPage = null
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = { renamingPage = null }
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                Surface(
+                    modifier = Modifier
+                        .width(340.dp)
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) {},
+                    shape = RoundedCornerShape(18.dp),
+                    color = MaterialTheme.colorScheme.surface,
+                    tonalElevation = 8.dp,
+                    shadowElevation = 16.dp
+                ) {
+                    Column(
+                        modifier = Modifier.padding(20.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text(
+                            text = "${renamingPageIndexOneBased}. oldal elnevezése",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                        OutlinedTextField(
+                            value = renameDraft,
+                            onValueChange = { renameDraft = it.take(64) },
+                            singleLine = true,
+                            label = { Text("Oldal neve (üresen hagyva sorszám)") },
+                            placeholder = { Text("${renamingPageIndexOneBased}. oldal") },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.End
+                        ) {
+                            TextButton(onClick = { renamingPage = null }) {
+                                Text("Mégse")
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Button(
+                                onClick = {
+                                    val cleaned = renameDraft.trim().takeIf { it.isNotEmpty() }
+                                    onRenamePage(pendingRename.id, cleaned)
+                                    localPages = localPages.map {
+                                        if (it.id == pendingRename.id) it.copy(title = cleaned) else it
+                                    }
+                                    renamingPage = null
+                                }
+                            ) {
+                                Text("Mentés")
+                            }
+                        }
+                    }
                 }
             }
         }

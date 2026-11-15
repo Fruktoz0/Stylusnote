@@ -2,15 +2,14 @@ package hu.bdev.stylusnote.ui.components
 
 import android.content.Context
 import android.graphics.Color as AndroidColor
-import androidx.compose.animation.animateContentSize
-import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
-import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -58,10 +57,12 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
@@ -72,12 +73,14 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
@@ -97,6 +100,7 @@ import hu.bdev.stylusnote.domain.model.BrushToolType
 import hu.bdev.stylusnote.ui.theme.LocalStylusSurfacePalette
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import kotlin.math.PI
 import kotlin.math.atan2
 import kotlin.math.cos
@@ -264,7 +268,7 @@ fun computeAnchoredPopoverOffsetPx(
     } else {
         val spaceLeft = anchorBoundsPx.left - marginPx - gapPx
         val spaceRight = viewportSize.width - anchorBoundsPx.right - marginPx - gapPx
-        val rawX = if (spaceLeft >= popoverSizePx.width || spaceLeft >= spaceRight) {
+        val rawX = if (spaceLeft >= spaceRight) {
             (anchorBoundsPx.left - gapPx - popoverSizePx.width).roundToInt()
         } else {
             (anchorBoundsPx.right + gapPx).roundToInt()
@@ -274,12 +278,42 @@ fun computeAnchoredPopoverOffsetPx(
     }
 }
 
+internal fun resolveBrushPopoverExpandsRightward(
+    anchorBoundsPx: Rect,
+    viewportSize: IntSize
+): Boolean {
+    if (anchorBoundsPx.width <= 0f || viewportSize.width <= 0) return false
+    val isHorizontalDock = anchorBoundsPx.width >= anchorBoundsPx.height
+    return if (isHorizontalDock) {
+        anchorBoundsPx.center.x <= viewportSize.width * 0.5f
+    } else {
+        val spaceLeft = anchorBoundsPx.left
+        val spaceRight = viewportSize.width - anchorBoundsPx.right
+        spaceRight > spaceLeft
+    }
+}
+
+private fun Modifier.progressiveStudioReveal(fraction: Float): Modifier = this
+    .clipToBounds()
+    .graphicsLayer { alpha = fraction }
+    .layout { measurable, constraints ->
+        val placeable = measurable.measure(constraints)
+        val revealedHeight = (placeable.height * fraction).roundToInt()
+        layout(placeable.width, revealedHeight) {
+            placeable.placeRelative(0, 0)
+        }
+    }
+
+private const val POPOVER_COMPACT_WIDTH_DP = 312f
+private const val POPOVER_FULL_WIDTH_DP = 472f
+
 /**
- * Two-stage StarNote side-tab popover anchored near [anchorBoundsPx].
+ * Dynamically resizable StarNote side-tab popover anchored near [anchorBoundsPx].
  *
- * Opens compact with quick sizes and colors (or eraser radius) and expands smoothly to the full
- * studio (presets, HSV wheel/HEX, opacity, 1-Euro stabilization, pressure curves, Hold-to-Snap)
- * when dragged wider or toggled. Closes via ESC key press and backdrop tap (UX Rule 11).
+ * Opens compact (`312 dp`) with quick sizes and colors and expands continuously under the user's
+ * finger up to `472 dp` (gradually revealing the full studio: HSV wheel/HEX, opacity, 1-Euro
+ * stabilization, presets, pressure curves, Hold-to-Snap) with the corner handle positioned on the
+ * outer bottom corner matching the opening direction. Closes via ESC key and backdrop tap (Rule 11).
  */
 @Composable
 fun BrushSettingsPopover(
@@ -294,13 +328,22 @@ fun BrushSettingsPopover(
 ) {
     val surfacePalette = LocalStylusSurfacePalette.current
     val density = LocalDensity.current
-    var isExpandedFullStudio by remember { mutableStateOf(false) }
+    val coroutineScope = rememberCoroutineScope()
+    val widthAnimatable = remember { Animatable(POPOVER_COMPACT_WIDTH_DP) }
+    var dragStartExpanded by remember { mutableStateOf(false) }
     var popoverSizePx by remember { mutableStateOf(IntSize.Zero) }
-    val panelWidth by animateDpAsState(
-        targetValue = if (isExpandedFullStudio) 464.dp else 308.dp,
-        label = "brushSidePanelWidth"
-    )
+    val currentWidthDp = widthAnimatable.value.coerceIn(POPOVER_COMPACT_WIDTH_DP, POPOVER_FULL_WIDTH_DP)
+    val expansionFraction = (
+        (currentWidthDp - POPOVER_COMPACT_WIDTH_DP) /
+            (POPOVER_FULL_WIDTH_DP - POPOVER_COMPACT_WIDTH_DP)
+        ).coerceIn(0f, 1f)
+    val isExpandedFullStudio = expansionFraction >= 0.5f
+    val showFullSections = expansionFraction > 0.08f
+    val stage2RevealFraction = ((expansionFraction - 0.08f) / 0.68f).coerceIn(0f, 1f)
     val hasAnchor = anchorBoundsPx.width > 0f && viewportSize.width > 0 && viewportSize.height > 0
+    val expandsRightward = remember(anchorBoundsPx, viewportSize, hasAnchor) {
+        if (hasAnchor) resolveBrushPopoverExpandsRightward(anchorBoundsPx, viewportSize) else false
+    }
     val marginPx = with(density) { 12.dp.roundToPx() }
     val gapPx = with(density) { 10.dp.roundToPx() }
     val resolvedPopoverOffset = if (hasAnchor && popoverSizePx.width > 0 && popoverSizePx.height > 0) {
@@ -391,9 +434,8 @@ fun BrushSettingsPopover(
                         }
                     )
                     .onSizeChanged { popoverSizePx = it }
-                    .width(panelWidth)
+                    .width(currentWidthDp.dp)
                     .heightIn(max = 680.dp)
-                    .animateContentSize()
                     .border(
                         width = 1.dp,
                         color = MaterialTheme.colorScheme.outlineVariant,
@@ -462,7 +504,19 @@ fun BrushSettingsPopover(
                                 horizontalArrangement = Arrangement.spacedBy(4.dp)
                             ) {
                                 Surface(
-                                    onClick = { isExpandedFullStudio = !isExpandedFullStudio },
+                                    onClick = {
+                                        val nextTarget = if (isExpandedFullStudio) {
+                                            POPOVER_COMPACT_WIDTH_DP
+                                        } else {
+                                            POPOVER_FULL_WIDTH_DP
+                                        }
+                                        coroutineScope.launch {
+                                            widthAnimatable.animateTo(
+                                                nextTarget,
+                                                spring(dampingRatio = 0.85f, stiffness = 420f)
+                                            )
+                                        }
+                                    },
                                     shape = RoundedCornerShape(10.dp),
                                     color = surfacePalette.groupedCardBackground
                                 ) {
@@ -687,64 +741,73 @@ fun BrushSettingsPopover(
                                     }
                                 }
 
-                                if (isExpandedFullStudio) {
-                                    HorizontalDivider(
-                                        modifier = Modifier.padding(vertical = 2.dp),
-                                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
-                                    )
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.spacedBy(14.dp),
-                                        verticalAlignment = Alignment.CenterVertically
+                                if (showFullSections) {
+                                    Column(
+                                        modifier = Modifier.progressiveStudioReveal(stage2RevealFraction),
+                                        verticalArrangement = Arrangement.spacedBy(8.dp)
                                     ) {
-                                        HsvColorWheel(
-                                            hue = hue,
-                                            saturation = saturation,
-                                            value = value,
-                                            onHueSaturationChange = { nextH, nextS ->
-                                                hue = nextH
-                                                saturation = nextS
-                                                emitHsvColor(nextH, nextS, value)
-                                            },
-                                            modifier = Modifier.size(128.dp)
+                                        HorizontalDivider(
+                                            modifier = Modifier.padding(vertical = 2.dp),
+                                            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
                                         )
-
-                                        Column(
-                                            modifier = Modifier.weight(1f),
-                                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.spacedBy(14.dp),
+                                            verticalAlignment = Alignment.CenterVertically
                                         ) {
-                                            SettingSliderHeader(
-                                                title = "Fényerő",
-                                                valueBadge = "${(value * 100f).roundToInt()}%"
-                                            )
-                                            Slider(
+                                            HsvColorWheel(
+                                                hue = hue,
+                                                saturation = saturation,
                                                 value = value,
-                                                onValueChange = { nextV ->
-                                                    value = nextV
-                                                    emitHsvColor(hue, saturation, nextV)
+                                                onHueSaturationChange = { nextH, nextS ->
+                                                    hue = nextH
+                                                    saturation = nextS
+                                                    emitHsvColor(nextH, nextS, value)
                                                 },
-                                                valueRange = 0.05f..1.0f
+                                                modifier = Modifier.size(128.dp)
                                             )
-                                            OutlinedTextField(
-                                                value = hexText,
-                                                onValueChange = { candidate ->
-                                                    hexText = candidate
-                                                    parseHexColor(candidate)?.let { parsedArgb ->
-                                                        onConfigChange(currentConfig.copy(colorArgb = parsedArgb))
-                                                    }
-                                                },
-                                                label = { Text("HEX") },
-                                                singleLine = true,
-                                                shape = RoundedCornerShape(12.dp),
-                                                modifier = Modifier.fillMaxWidth()
-                                            )
+
+                                            Column(
+                                                modifier = Modifier.weight(1f),
+                                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                                            ) {
+                                                SettingSliderHeader(
+                                                    title = "Fényerő",
+                                                    valueBadge = "${(value * 100f).roundToInt()}%"
+                                                )
+                                                Slider(
+                                                    value = value,
+                                                    onValueChange = { nextV ->
+                                                        value = nextV
+                                                        emitHsvColor(hue, saturation, nextV)
+                                                    },
+                                                    valueRange = 0.05f..1.0f
+                                                )
+                                                OutlinedTextField(
+                                                    value = hexText,
+                                                    onValueChange = { candidate ->
+                                                        hexText = candidate
+                                                        parseHexColor(candidate)?.let { parsedArgb ->
+                                                            onConfigChange(currentConfig.copy(colorArgb = parsedArgb))
+                                                        }
+                                                    },
+                                                    label = { Text("HEX") },
+                                                    singleLine = true,
+                                                    shape = RoundedCornerShape(12.dp),
+                                                    modifier = Modifier.fillMaxWidth()
+                                                )
+                                            }
                                         }
                                     }
                                 }
                             }
 
-                            // Stage 2 Only: Opacity + 1-Euro Stabilization
-                            if (isExpandedFullStudio) {
+                            // Stage 2 Only: Opacity + 1-Euro Stabilization + Presets + Pressure Curve + Hold-to-Snap
+                            if (showFullSections) {
+                                Column(
+                                    modifier = Modifier.progressiveStudioReveal(stage2RevealFraction),
+                                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                                ) {
                                 StudioSectionCard {
                                     if (currentConfig.toolType == BrushToolType.HIGHLIGHTER) {
                                         SettingSliderHeader(
@@ -786,10 +849,7 @@ fun BrushSettingsPopover(
                                         valueRange = 0f..100f
                                     )
                                 }
-                            }
 
-                            // Stage 2 Only: 6 Presets + Pressure Curve Cards + Hold-to-Snap
-                            if (isExpandedFullStudio) {
                                 StudioSectionCard {
                                     Text(
                                         text = "Mentett kedvenc ecsetek",
@@ -988,13 +1048,12 @@ fun BrushSettingsPopover(
                                         )
                                     }
                                 }
+                                }
                             }
                         }
                     }
 
-                    // Bottom-left diagonal corner grip indicating Stage 1 <-> Stage 2 expansion.
-                    var cornerDragX by remember { mutableFloatStateOf(0f) }
-                    var cornerDragY by remember { mutableFloatStateOf(0f) }
+                    // Dynamic outer-bottom corner grip positioned according to opening direction.
                     val gripStrokeColor = if (isExpandedFullStudio) {
                         MaterialTheme.colorScheme.primary
                     } else {
@@ -1002,57 +1061,112 @@ fun BrushSettingsPopover(
                     }
                     Box(
                         modifier = Modifier
-                            .align(Alignment.BottomStart)
-                            .padding(start = 6.dp, bottom = 6.dp)
-                            .size(26.dp)
+                            .align(if (expandsRightward) Alignment.BottomEnd else Alignment.BottomStart)
+                            .padding(
+                                start = if (expandsRightward) 0.dp else 6.dp,
+                                end = if (expandsRightward) 6.dp else 0.dp,
+                                bottom = 6.dp
+                            )
+                            .size(28.dp)
                             .clip(RoundedCornerShape(8.dp))
-                            .pointerInput(isExpandedFullStudio) {
+                            .pointerInput(expandsRightward) {
                                 detectDragGestures(
                                     onDragStart = {
-                                        cornerDragX = 0f
-                                        cornerDragY = 0f
+                                        dragStartExpanded =
+                                            widthAnimatable.value >= (POPOVER_COMPACT_WIDTH_DP + POPOVER_FULL_WIDTH_DP) * 0.5f
+                                        coroutineScope.launch { widthAnimatable.stop() }
+                                    },
+                                    onDragCancel = {
+                                        val frac = ((widthAnimatable.value - POPOVER_COMPACT_WIDTH_DP) /
+                                            (POPOVER_FULL_WIDTH_DP - POPOVER_COMPACT_WIDTH_DP)).coerceIn(0f, 1f)
+                                        val targetDp = if (frac >= 0.5f) POPOVER_FULL_WIDTH_DP else POPOVER_COMPACT_WIDTH_DP
+                                        coroutineScope.launch {
+                                            widthAnimatable.animateTo(
+                                                targetDp,
+                                                spring(dampingRatio = 0.85f, stiffness = 420f)
+                                            )
+                                        }
+                                    },
+                                    onDragEnd = {
+                                        val frac = ((widthAnimatable.value - POPOVER_COMPACT_WIDTH_DP) /
+                                            (POPOVER_FULL_WIDTH_DP - POPOVER_COMPACT_WIDTH_DP)).coerceIn(0f, 1f)
+                                        val targetDp = if (dragStartExpanded) {
+                                            if (frac <= 0.72f) POPOVER_COMPACT_WIDTH_DP else POPOVER_FULL_WIDTH_DP
+                                        } else {
+                                            if (frac >= 0.28f) POPOVER_FULL_WIDTH_DP else POPOVER_COMPACT_WIDTH_DP
+                                        }
+                                        coroutineScope.launch {
+                                            widthAnimatable.animateTo(
+                                                targetDp,
+                                                spring(dampingRatio = 0.85f, stiffness = 420f)
+                                            )
+                                        }
                                     },
                                     onDrag = { change, dragAmount ->
                                         change.consume()
-                                        cornerDragX += dragAmount.x
-                                        cornerDragY += dragAmount.y
-                                        val outwardScore = cornerDragY - cornerDragX
-                                        if (!isExpandedFullStudio && outwardScore > 36f) {
-                                            isExpandedFullStudio = true
-                                        } else if (isExpandedFullStudio && outwardScore < -36f) {
-                                            isExpandedFullStudio = false
-                                        }
+                                        val outwardPx = if (expandsRightward) dragAmount.x else -dragAmount.x
+                                        val deltaDp = with(density) { outwardPx.toDp().value }
+                                        val nextDp = (widthAnimatable.value + deltaDp)
+                                            .coerceIn(POPOVER_COMPACT_WIDTH_DP, POPOVER_FULL_WIDTH_DP)
+                                        coroutineScope.launch { widthAnimatable.snapTo(nextDp) }
                                     }
                                 )
                             }
                             .clickable(
                                 onClickLabel = if (isExpandedFullStudio) "Kompakt nézet" else "Teljes funkciók"
                             ) {
-                                isExpandedFullStudio = !isExpandedFullStudio
+                                val nextTarget = if (isExpandedFullStudio) {
+                                    POPOVER_COMPACT_WIDTH_DP
+                                } else {
+                                    POPOVER_FULL_WIDTH_DP
+                                }
+                                coroutineScope.launch {
+                                    widthAnimatable.animateTo(
+                                        nextTarget,
+                                        spring(dampingRatio = 0.85f, stiffness = 420f)
+                                    )
+                                }
                             }
                             .padding(4.dp),
-                        contentAlignment = Alignment.BottomStart
+                        contentAlignment = if (expandsRightward) Alignment.BottomEnd else Alignment.BottomStart
                     ) {
                         Canvas(modifier = Modifier.fillMaxSize()) {
                             val strokePx = 1.8.dp.toPx()
                             val w = size.width
                             val h = size.height
-                            // Outer diagonal corner stroke
-                            drawLine(
-                                color = gripStrokeColor,
-                                start = androidx.compose.ui.geometry.Offset(w * 0.10f, h * 0.10f),
-                                end = androidx.compose.ui.geometry.Offset(w * 0.90f, h * 0.90f),
-                                strokeWidth = strokePx,
-                                cap = StrokeCap.Round
-                            )
-                            // Inner diagonal corner stroke closer to bottom-left corner
-                            drawLine(
-                                color = gripStrokeColor,
-                                start = androidx.compose.ui.geometry.Offset(w * 0.10f, h * 0.48f),
-                                end = androidx.compose.ui.geometry.Offset(w * 0.52f, h * 0.90f),
-                                strokeWidth = strokePx,
-                                cap = StrokeCap.Round
-                            )
+                            if (expandsRightward) {
+                                // Bottom-right corner grip lines
+                                drawLine(
+                                    color = gripStrokeColor,
+                                    start = Offset(w * 0.10f, h * 0.90f),
+                                    end = Offset(w * 0.90f, h * 0.10f),
+                                    strokeWidth = strokePx,
+                                    cap = StrokeCap.Round
+                                )
+                                drawLine(
+                                    color = gripStrokeColor,
+                                    start = Offset(w * 0.48f, h * 0.90f),
+                                    end = Offset(w * 0.90f, h * 0.48f),
+                                    strokeWidth = strokePx,
+                                    cap = StrokeCap.Round
+                                )
+                            } else {
+                                // Bottom-left corner grip lines
+                                drawLine(
+                                    color = gripStrokeColor,
+                                    start = Offset(w * 0.10f, h * 0.10f),
+                                    end = Offset(w * 0.90f, h * 0.90f),
+                                    strokeWidth = strokePx,
+                                    cap = StrokeCap.Round
+                                )
+                                drawLine(
+                                    color = gripStrokeColor,
+                                    start = Offset(w * 0.10f, h * 0.48f),
+                                    end = Offset(w * 0.52f, h * 0.90f),
+                                    strokeWidth = strokePx,
+                                    cap = StrokeCap.Round
+                                )
+                            }
                         }
                     }
                 }

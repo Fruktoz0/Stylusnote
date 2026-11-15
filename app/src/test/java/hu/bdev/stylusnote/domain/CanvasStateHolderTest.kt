@@ -1,12 +1,19 @@
 package hu.bdev.stylusnote.domain
 
 import hu.bdev.stylusnote.core.hardware.StylusPointSample
+import hu.bdev.stylusnote.core.math.DocPoint
+import hu.bdev.stylusnote.core.math.DocRect
 import hu.bdev.stylusnote.domain.model.AffineTransform2D
 import hu.bdev.stylusnote.domain.model.BrushConfig
 import hu.bdev.stylusnote.domain.model.BrushToolType
+import hu.bdev.stylusnote.domain.model.GeometricShapeType
+import hu.bdev.stylusnote.domain.model.PageObject
+import hu.bdev.stylusnote.domain.repository.CanvasStateHolder
 import hu.bdev.stylusnote.domain.repository.PrecisionStrokeGeometry
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.math.PI
@@ -124,6 +131,124 @@ class CanvasStateHolderTest {
         assertEquals(2, split.segments.size)
         assertEquals(40f, split.segments[0].last().xPt, 1e-2f)
         assertEquals(60f, split.segments[1].first().xPt, 1e-2f)
+    }
+
+    @Test
+    fun lassoSelectsShapesImagesAndFormattedTextWhileSkippingBackgroundPdf() {
+        val holder = CanvasStateHolder()
+        val pdfBg = PageObject.PdfPageRefObject(
+            id = "pdf-1",
+            zOrder = 1L,
+            bounds = DocRect(0f, 0f, 595f, 842f),
+            pdfAssetRelativePath = "pdfs/doc.pdf",
+            pageIndexZeroBased = 0
+        )
+        val shape = PageObject.GeometricShapeObject(
+            id = "shape-1",
+            zOrder = holder.allocateObjectZOrder(),
+            bounds = DocRect(100f, 100f, 220f, 220f),
+            shapeType = GeometricShapeType.RECTANGLE
+        )
+        val image = PageObject.ImageObject(
+            id = "img-1",
+            zOrder = holder.allocateObjectZOrder(),
+            bounds = DocRect(260f, 100f, 380f, 220f),
+            imageAssetRelativePath = "images/photo.png"
+        )
+        val formattedText = PageObject.FormattedTextObject(
+            id = "txt-1",
+            zOrder = holder.allocateObjectZOrder(),
+            bounds = DocRect(110f, 320f, 290f, 380f),
+            text = "Jegyzet blokk"
+        )
+        holder.addPageObject(pdfBg)
+        holder.addPageObject(shape)
+        holder.addPageObject(image)
+        holder.addPageObject(formattedText)
+
+        // Lasso enclosing shape + image only -> FormattedText & PdfPageRef excluded
+        val hits = holder.selectPageObjectsByLasso(
+            listOf(
+                DocPoint(80f, 80f),
+                DocPoint(400f, 80f),
+                DocPoint(400f, 250f),
+                DocPoint(80f, 250f)
+            )
+        )
+        assertEquals(listOf("shape-1", "img-1"), hits.map { it.id })
+
+        // Small lasso inside bottom-right corner of empty background must NOT grab background PDF
+        val bgHits = holder.selectPageObjectsByLasso(
+            listOf(
+                DocPoint(420f, 400f),
+                DocPoint(550f, 400f),
+                DocPoint(550f, 520f),
+                DocPoint(420f, 520f)
+            )
+        )
+        assertTrue(bgHits.isEmpty())
+    }
+
+    @Test
+    fun lassoTransformsDuplicatesRecolorsAndDeletesObjectsAtomicallyWithUndoRedo() {
+        var nextId = 1
+        val holder = CanvasStateHolder(uuidGenerator = { "gen-${nextId++}" })
+        val shape = PageObject.GeometricShapeObject(
+            id = "shape-a",
+            zOrder = holder.allocateObjectZOrder(),
+            bounds = DocRect(100f, 100f, 200f, 200f),
+            shapeType = GeometricShapeType.CIRCLE,
+            canonicalStrokeColorArgb = 0xFF111827.toInt()
+        )
+        val text = PageObject.FormattedTextObject(
+            id = "text-a",
+            zOrder = holder.allocateObjectZOrder(),
+            bounds = DocRect(240f, 100f, 360f, 160f),
+            text = "E = mc^2",
+            canonicalColorArgb = 0xFF111827.toInt()
+        )
+        holder.addPageObject(shape)
+        holder.addPageObject(text)
+
+        // Translate + rotate combined selection -> atomic undo reverts both
+        val combined = AffineTransform2D.translation(50f, 30f).then(
+            AffineTransform2D.rotationAround(
+                angleRad = (PI / 4.0).toFloat(),
+                pivotXPt = 200f,
+                pivotYPt = 150f
+            )
+        )
+        val txRes = holder.transformSelection(emptyList(), listOf("shape-a", "text-a"), combined)
+        assertEquals(2, txRes.updatedObjects.size)
+        assertTrue((holder.getPageObject("shape-a") as PageObject.GeometricShapeObject).rotationRadians > 0.7f)
+        assertTrue((holder.getPageObject("text-a") as PageObject.FormattedTextObject).rotationRadians > 0.7f)
+
+        assertNotNull(holder.undo())
+        assertEquals(0f, (holder.getPageObject("shape-a") as PageObject.GeometricShapeObject).rotationRadians, 1e-5f)
+        assertEquals(240f, holder.getPageObject("text-a")!!.bounds.leftPt, 1e-3f)
+
+        // Recolor -> atomic
+        val targetColor = 0xFFDC2626.toInt()
+        val recolorRes = holder.recolorSelection(emptyList(), listOf("shape-a", "text-a"), targetColor)
+        assertEquals(2, recolorRes.updatedObjects.size)
+        assertEquals(targetColor, (holder.getPageObject("shape-a") as PageObject.GeometricShapeObject).canonicalStrokeColorArgb)
+        assertEquals(targetColor, (holder.getPageObject("text-a") as PageObject.FormattedTextObject).canonicalColorArgb)
+
+        // Duplicate -> creates 2 offset copies, Undo removes both duplicates atomically
+        val dupRes = holder.duplicateSelection(emptyList(), listOf("shape-a", "text-a"), offsetXPt = 25f, offsetYPt = 25f)
+        assertEquals(2, dupRes.duplicatedObjects.size)
+        assertEquals(4, holder.allPageObjects().size)
+        assertNotNull(holder.undo())
+        assertEquals(2, holder.allPageObjects().size)
+
+        // Delete -> removes both atomically, Undo restores both
+        assertNotNull(holder.deleteSelection(emptyList(), listOf("shape-a", "text-a")))
+        assertTrue(holder.allPageObjects().isEmpty())
+        assertNull(holder.getPageObject("shape-a"))
+        assertNotNull(holder.undo())
+        assertEquals(2, holder.allPageObjects().size)
+        assertNotNull(holder.redo())
+        assertFalse(holder.allPageObjects().isNotEmpty())
     }
 
     private fun sample(

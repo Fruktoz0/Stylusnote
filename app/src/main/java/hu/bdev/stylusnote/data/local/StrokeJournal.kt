@@ -233,6 +233,27 @@ class StrokeJournal(
         }
     }
 
+    override fun onObjectsAdded(objects: List<PageObject>) {
+        if (objects.isEmpty()) return
+        scope.launch {
+            objects.forEach { appendAddObject(it) }
+        }
+    }
+
+    override fun onObjectsUpdated(objects: List<PageObject>) {
+        if (objects.isEmpty()) return
+        scope.launch {
+            objects.forEach { appendUpdateObject(it) }
+        }
+    }
+
+    override fun onObjectsDeleted(objectIds: List<String>) {
+        if (objectIds.isEmpty()) return
+        scope.launch {
+            objectIds.forEach { appendRemoveObject(it) }
+        }
+    }
+
     suspend fun appendAddStrokes(records: List<PersistedStrokeRecord>) {
         if (records.isEmpty()) return
         val encodedFrames = records.map { rec ->

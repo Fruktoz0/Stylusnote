@@ -624,5 +624,211 @@ class StylusInputRouterTest {
         )
         assertEquals(0f, transform.panYPx, 1e-4f)
     }
+
+    @Test
+    fun palmPointerCanceledViaPointerUpKeepsActiveStylusStrokeAlive() {
+        val transform = CanvasTransformMatrix(initialScale = 1.0f, initialPanXPx = 0f, initialPanYPx = 0f)
+        val sink = FakeWetStrokeSink()
+        val router = StylusInputRouter(transform, OneEuroFilter(0f), sink)
+
+        // Stylus starts stroke
+        assertTrue(
+            router.processTouchFrame(
+                StylusMotionFrame(
+                    action = StylusAction.DOWN,
+                    actionIndex = 0,
+                    flags = 0,
+                    buttonState = 0,
+                    eventTimeMs = 100L,
+                    eventTimeNanos = 100_000_000L,
+                    pointers = listOf(StylusPointerSnapshot(10, MotionEvent.TOOL_TYPE_STYLUS, 200f, 300f, 0.7f, 0f, 0f)),
+                    rawEvent = FakeEvent("s-down")
+                )
+            )
+        )
+        assertEquals(1, sink.rawStartCount)
+
+        // OS rejects secondary palm pointer via POINTER_UP + FLAG_CANCELED while stylus remains down
+        assertTrue(
+            router.processTouchFrame(
+                StylusMotionFrame(
+                    action = StylusAction.POINTER_UP,
+                    actionIndex = 1,
+                    flags = MotionEvent.FLAG_CANCELED,
+                    buttonState = 0,
+                    eventTimeMs = 115L,
+                    eventTimeNanos = 115_000_000L,
+                    pointers = listOf(
+                        StylusPointerSnapshot(10, MotionEvent.TOOL_TYPE_STYLUS, 210f, 310f, 0.7f, 0f, 0f),
+                        StylusPointerSnapshot(11, StylusInputRouter.TOOL_TYPE_PALM_COMPAT, 500f, 700f, 1f, 0f, 0f)
+                    ),
+                    rawEvent = FakeEvent("palm-pointer-canceled")
+                )
+            )
+        )
+        // Active stylus stroke MUST NOT be canceled!
+        assertEquals(0, sink.cancelCount)
+        assertTrue(router.isStylusStrokeActive)
+
+        // Subsequent stylus UP finishes normally
+        assertTrue(
+            router.processTouchFrame(
+                StylusMotionFrame(
+                    action = StylusAction.UP,
+                    actionIndex = 0,
+                    flags = 0,
+                    buttonState = 0,
+                    eventTimeMs = 140L,
+                    eventTimeNanos = 140_000_000L,
+                    pointers = listOf(StylusPointerSnapshot(10, MotionEvent.TOOL_TYPE_STYLUS, 230f, 320f, 0f, 0f, 0f)),
+                    rawEvent = FakeEvent("s-up")
+                )
+            )
+        )
+        assertEquals(1, sink.rawFinishCount)
+    }
+
+    @Test
+    fun stylusTakeoverOrFlagCancelRollsBackAccidentalPalmPan() {
+        val transform = CanvasTransformMatrix(initialScale = 1.0f, initialPanXPx = 12f, initialPanYPx = 34f)
+        val sink = FakeWetStrokeSink()
+        val router = StylusInputRouter(transform, OneEuroFilter(0f), sink)
+
+        // Resting palm touches first and nudges canvas 40px vertically before stylus hits
+        router.processTouchFrame(
+            StylusMotionFrame(
+                action = StylusAction.DOWN,
+                actionIndex = 0,
+                flags = 0,
+                buttonState = 0,
+                eventTimeMs = 200L,
+                eventTimeNanos = 200_000_000L,
+                pointers = listOf(StylusPointerSnapshot(1, MotionEvent.TOOL_TYPE_FINGER, 400f, 500f, 1f, 0f, 0f)),
+                rawEvent = FakeEvent("p-down")
+            )
+        )
+        assertTrue(
+            router.processTouchFrame(
+                StylusMotionFrame(
+                    action = StylusAction.MOVE,
+                    actionIndex = 0,
+                    flags = 0,
+                    buttonState = 0,
+                    eventTimeMs = 220L,
+                    eventTimeNanos = 220_000_000L,
+                    pointers = listOf(StylusPointerSnapshot(1, MotionEvent.TOOL_TYPE_FINGER, 400f, 540f, 1f, 0f, 0f)),
+                    rawEvent = FakeEvent("p-move")
+                )
+            )
+        )
+        assertEquals(74f, transform.panYPx, 1e-4f)
+
+        // Stylus lands while palm is still down -> must roll back panYPx to 34f AND start stroke immediately
+        assertTrue(
+            router.processTouchFrame(
+                StylusMotionFrame(
+                    action = StylusAction.POINTER_DOWN,
+                    actionIndex = 1,
+                    flags = 0,
+                    buttonState = 0,
+                    eventTimeMs = 235L,
+                    eventTimeNanos = 235_000_000L,
+                    pointers = listOf(
+                        StylusPointerSnapshot(1, MotionEvent.TOOL_TYPE_FINGER, 400f, 540f, 1f, 0f, 0f),
+                        StylusPointerSnapshot(2, MotionEvent.TOOL_TYPE_STYLUS, 250f, 300f, 0.6f, 0f, 0f)
+                    ),
+                    rawEvent = FakeEvent("s-pdown")
+                )
+            )
+        )
+        assertEquals(34f, transform.panYPx, 1e-4f)
+        assertEquals(1, sink.rawStartCount)
+        assertTrue(router.isStylusStrokeActive)
+    }
+
+    @Test
+    fun twoFingerPalmTouchesDuringGraceWindowDoNotZoomOrPan() {
+        val transform = CanvasTransformMatrix(initialScale = 1.0f, initialPanXPx = 0f, initialPanYPx = 0f)
+        val sink = FakeWetStrokeSink()
+        val router = StylusInputRouter(transform, OneEuroFilter(0f), sink)
+
+        // Pen lifts at t = 1000ms
+        router.processTouchFrame(
+            StylusMotionFrame(
+                action = StylusAction.DOWN,
+                actionIndex = 0,
+                flags = 0,
+                buttonState = 0,
+                eventTimeMs = 960L,
+                eventTimeNanos = 960_000_000L,
+                pointers = listOf(StylusPointerSnapshot(1, MotionEvent.TOOL_TYPE_STYLUS, 200f, 200f, 0.5f, 0f, 0f)),
+                rawEvent = FakeEvent("s-down")
+            )
+        )
+        router.processTouchFrame(
+            StylusMotionFrame(
+                action = StylusAction.UP,
+                actionIndex = 0,
+                flags = 0,
+                buttonState = 0,
+                eventTimeMs = 1000L,
+                eventTimeNanos = 1_000_000_000L,
+                pointers = listOf(StylusPointerSnapshot(1, MotionEvent.TOOL_TYPE_STYLUS, 210f, 200f, 0f, 0f, 0f)),
+                rawEvent = FakeEvent("s-up")
+            )
+        )
+
+        // Two palm knuckles land inside 850ms grace window
+        val pDown0 = StylusPointerSnapshot(2, MotionEvent.TOOL_TYPE_FINGER, 300f, 400f, 1f, 0f, 0f)
+        val pDown1 = StylusPointerSnapshot(3, MotionEvent.TOOL_TYPE_FINGER, 400f, 420f, 1f, 0f, 0f)
+        assertFalse(
+            router.processTouchFrame(
+                StylusMotionFrame(
+                    action = StylusAction.DOWN,
+                    actionIndex = 0,
+                    flags = 0,
+                    buttonState = 0,
+                    eventTimeMs = 1100L,
+                    eventTimeNanos = 1_100_000_000L,
+                    pointers = listOf(pDown0),
+                    rawEvent = FakeEvent("palm-0")
+                )
+            )
+        )
+        assertFalse(
+            router.processTouchFrame(
+                StylusMotionFrame(
+                    action = StylusAction.POINTER_DOWN,
+                    actionIndex = 1,
+                    flags = 0,
+                    buttonState = 0,
+                    eventTimeMs = 1110L,
+                    eventTimeNanos = 1_110_000_000L,
+                    pointers = listOf(pDown0, pDown1),
+                    rawEvent = FakeEvent("palm-1")
+                )
+            )
+        )
+        assertFalse(
+            router.processTouchFrame(
+                StylusMotionFrame(
+                    action = StylusAction.MOVE,
+                    actionIndex = 0,
+                    flags = 0,
+                    buttonState = 0,
+                    eventTimeMs = 1130L,
+                    eventTimeNanos = 1_130_000_000L,
+                    pointers = listOf(
+                        pDown0.copy(xPx = 260f, yPx = 380f),
+                        pDown1.copy(xPx = 460f, yPx = 460f)
+                    ),
+                    rawEvent = FakeEvent("palm-move")
+                )
+            )
+        )
+        assertEquals(1.0f, transform.scale, 1e-6f)
+        assertEquals(0f, transform.panXPx, 1e-4f)
+        assertEquals(0f, transform.panYPx, 1e-4f)
+    }
 }
 

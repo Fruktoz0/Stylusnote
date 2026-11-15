@@ -93,6 +93,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -212,6 +213,52 @@ data class OpenedPageTarget(
     val notebookId: String,
     val pageId: String
 )
+
+enum class FixedPageScrollNavigationAction {
+    NONE,
+    PREVIOUS_PAGE,
+    NEXT_PAGE,
+    CREATE_NEXT_PAGE
+}
+
+/**
+ * Scale-aware vertical scroll threshold for FIXED_PAGE multi-page navigation.
+ * Uses the visible document slice beyond top/bottom page boundaries together with
+ * viewport center position so pinch-zooming out does not flip pages, while vertical
+ * scrolling between sheets responds cleanly across 100%-250% zoom.
+ */
+internal fun resolveFixedPageScrollNavigation(
+    visibleRect: DocRect,
+    centerDocY: Float,
+    pageHeightPt: Float,
+    currentPageIndex: Int,
+    totalPages: Int
+): FixedPageScrollNavigationAction {
+    val visibleHeightPt = visibleRect.bottomPt - visibleRect.topPt
+    if (visibleHeightPt <= 0f || pageHeightPt <= 0f) {
+        return FixedPageScrollNavigationAction.NONE
+    }
+    val switchRevealThresholdPt = maxOf(96f, visibleHeightPt * 0.28f)
+    val createThresholdPt = maxOf(switchRevealThresholdPt * 1.35f, 180f)
+    val pastBottomPt = visibleRect.bottomPt - pageHeightPt
+    val pastTopPt = -visibleRect.topPt
+
+    if (pastBottomPt >= switchRevealThresholdPt && centerDocY > pageHeightPt * 0.60f) {
+        if (currentPageIndex >= 0 && currentPageIndex + 1 < totalPages) {
+            return FixedPageScrollNavigationAction.NEXT_PAGE
+        }
+        if (currentPageIndex >= 0 && pastBottomPt >= createThresholdPt && centerDocY > pageHeightPt * 0.72f) {
+            return FixedPageScrollNavigationAction.CREATE_NEXT_PAGE
+        }
+    } else if (
+        currentPageIndex > 0 &&
+        pastTopPt >= switchRevealThresholdPt &&
+        centerDocY < pageHeightPt * 0.40f
+    ) {
+        return FixedPageScrollNavigationAction.PREVIOUS_PAGE
+    }
+    return FixedPageScrollNavigationAction.NONE
+}
 
 private sealed interface ShelfSidebarSelection {
     data object All : ShelfSidebarSelection
@@ -372,6 +419,11 @@ fun BookshelfScreen(
                 val existingId = nb.lastOpenedPageId
                 if (existingId != null && database.pageDao().getPageById(existingId) != null) {
                     return@withContext existingId
+                }
+                val fallbackExisting = database.pageDao().getPagesForNotebook(nb.id).firstOrNull()
+                if (fallbackExisting != null) {
+                    database.notebookDao().upsertNotebook(nb.copy(lastOpenedPageId = fallbackExisting.id))
+                    return@withContext fallbackExisting.id
                 }
                 val firstPage = PageEntity(
                     id = UUID.randomUUID().toString(),
@@ -1811,20 +1863,142 @@ fun NotebookWorkspaceScreen(
     benchmarkStrokeCount: Int = 0,
     modifier: Modifier = Modifier
 ) {
-    NotebookPagePane(
-        database = database,
-        target = target,
-        cacheBudgetBytes = DryInkRasterCache.DEFAULT_MAX_CACHE_BYTES,
-        penButtonToggleTick = penButtonToggleTick,
-        isDarkTheme = isDarkTheme,
-        showDebugOverlay = showDebugOverlay,
-        benchmarkStrokeCount = benchmarkStrokeCount,
-        onToggleTheme = onToggleTheme,
-        onToggleDebugOverlay = onToggleDebugOverlay,
-        onSelectPageTarget = onSelectPageTarget,
-        onBackToShelf = onExitToBookshelf,
-        modifier = modifier.fillMaxSize()
-    )
+    val context = LocalContext.current
+    val workspaceScope = rememberCoroutineScope()
+    val toolDockPrefsStore = remember(context) { ToolDockPreferencesStore(context.applicationContext) }
+    val dockPrefs by toolDockPrefsStore.prefsFlow.collectAsState(initial = ToolDockPrefs())
+    var perToolConfigs by remember(target.notebookId) {
+        mutableStateOf(ToolDockPreferencesStore.decodePerToolConfigs(dockPrefs.perToolConfigsRaw))
+    }
+    var hasHydratedPerToolConfigs by remember(target.notebookId) { mutableStateOf(false) }
+    var brushConfig by remember(target.notebookId) {
+        mutableStateOf(
+            ToolDockPreferencesStore.defaultToolConfig(BrushToolType.FOUNTAIN_PEN)
+        )
+    }
+    LaunchedEffect(dockPrefs.perToolConfigsRaw, target.notebookId) {
+        if (!hasHydratedPerToolConfigs && dockPrefs.perToolConfigsRaw.isNotEmpty()) {
+            val decoded = ToolDockPreferencesStore.decodePerToolConfigs(dockPrefs.perToolConfigsRaw)
+            perToolConfigs = decoded
+            decoded[brushConfig.toolType]?.let { restored ->
+                brushConfig = restored.copy(toolType = brushConfig.toolType)
+            }
+            hasHydratedPerToolConfigs = true
+        }
+    }
+    var lastDrawingTool by remember(target.notebookId) { mutableStateOf(BrushToolType.FOUNTAIN_PEN) }
+    var lastEraserTool by remember(target.notebookId) { mutableStateOf(BrushToolType.PRECISION_ERASER) }
+    var shapeStrokeWidthPt by remember(target.notebookId) { mutableStateOf(1.6f) }
+    var shapeStrokeColorArgb by remember(target.notebookId) { mutableIntStateOf(0xFF111827.toInt()) }
+    var shapeHasFill by remember(target.notebookId) { mutableStateOf(false) }
+    var isFullScreenCanvas by remember(target.notebookId) { mutableStateOf(false) }
+    var showLeftPageDrawer by remember(target.notebookId) { mutableStateOf(false) }
+
+    fun updateActiveBrushConfig(next: BrushConfig) {
+        brushConfig = next
+        val updatedMap = perToolConfigs.toMutableMap()
+        updatedMap[next.toolType] = next
+        perToolConfigs = updatedMap
+        hasHydratedPerToolConfigs = true
+        workspaceScope.launch {
+            toolDockPrefsStore.savePerToolConfigs(updatedMap)
+        }
+    }
+
+    fun selectTool(nextTool: BrushToolType) {
+        val updatedMap = perToolConfigs.toMutableMap()
+        updatedMap[brushConfig.toolType] = brushConfig
+        val restored = (updatedMap[nextTool] ?: ToolDockPreferencesStore.defaultToolConfig(nextTool))
+            .copy(toolType = nextTool)
+        perToolConfigs = updatedMap
+        if (nextTool == BrushToolType.FOUNTAIN_PEN || nextTool == BrushToolType.HIGHLIGHTER) {
+            lastDrawingTool = nextTool
+        } else if (nextTool.isEraser) {
+            lastEraserTool = nextTool
+        }
+        brushConfig = restored
+        hasHydratedPerToolConfigs = true
+        workspaceScope.launch {
+            toolDockPrefsStore.savePerToolConfigs(updatedMap)
+        }
+    }
+
+    LaunchedEffect(penButtonToggleTick) {
+        if (penButtonToggleTick > 0L) {
+            val next = if (brushConfig.toolType.isEraser) lastDrawingTool else lastEraserTool
+            selectTool(next)
+        }
+    }
+
+    var workspaceBannerHu by remember(target.notebookId) { mutableStateOf<String?>(null) }
+    LaunchedEffect(workspaceBannerHu) {
+        if (workspaceBannerHu != null) {
+            kotlinx.coroutines.delay(2200L)
+            workspaceBannerHu = null
+        }
+    }
+
+    Box(modifier = modifier.fillMaxSize()) {
+        key(target.notebookId, target.pageId) {
+            NotebookPagePane(
+                database = database,
+                target = target,
+                cacheBudgetBytes = DryInkRasterCache.DEFAULT_MAX_CACHE_BYTES,
+                isDarkTheme = isDarkTheme,
+                showDebugOverlay = showDebugOverlay,
+                benchmarkStrokeCount = benchmarkStrokeCount,
+                brushConfig = brushConfig,
+                lastDrawingTool = lastDrawingTool,
+                lastEraserTool = lastEraserTool,
+                toolDockPrefsStore = toolDockPrefsStore,
+                dockPrefs = dockPrefs,
+                shapeStrokeWidthPt = shapeStrokeWidthPt,
+                shapeStrokeColorArgb = shapeStrokeColorArgb,
+                shapeHasFill = shapeHasFill,
+                isFullScreenCanvas = isFullScreenCanvas,
+                showLeftPageDrawer = showLeftPageDrawer,
+                onUpdateBrushConfig = ::updateActiveBrushConfig,
+                onSelectTool = ::selectTool,
+                onTogglePenEraser = {
+                    val next = if (brushConfig.toolType.isEraser) lastDrawingTool else lastEraserTool
+                    selectTool(next)
+                },
+                onUpdateShapeDefaults = { w, c, fill ->
+                    shapeStrokeWidthPt = w
+                    shapeStrokeColorArgb = c
+                    shapeHasFill = fill
+                },
+                onToggleFullScreen = { isFullScreenCanvas = !isFullScreenCanvas },
+                onShowLeftPageDrawerChange = { showLeftPageDrawer = it },
+                onShowWorkspaceBanner = { workspaceBannerHu = it },
+                onToggleTheme = onToggleTheme,
+                onToggleDebugOverlay = onToggleDebugOverlay,
+                onSelectPageTarget = onSelectPageTarget,
+                onBackToShelf = onExitToBookshelf,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+
+        workspaceBannerHu?.let { msg ->
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .safeDrawingPadding()
+                    .padding(top = 10.dp),
+                shape = RoundedCornerShape(18.dp),
+                color = MaterialTheme.colorScheme.inverseSurface.copy(alpha = 0.92f),
+                shadowElevation = 6.dp
+            ) {
+                Text(
+                    text = msg,
+                    color = MaterialTheme.colorScheme.inverseOnSurface,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp)
+                )
+            }
+        }
+    }
 }
 
 @Composable
@@ -1832,10 +2006,26 @@ private fun NotebookPagePane(
     database: AppDatabase,
     target: OpenedPageTarget,
     cacheBudgetBytes: Long,
-    penButtonToggleTick: Long,
     isDarkTheme: Boolean,
     showDebugOverlay: Boolean,
     benchmarkStrokeCount: Int,
+    brushConfig: BrushConfig,
+    lastDrawingTool: BrushToolType,
+    lastEraserTool: BrushToolType,
+    toolDockPrefsStore: ToolDockPreferencesStore,
+    dockPrefs: ToolDockPrefs,
+    shapeStrokeWidthPt: Float,
+    shapeStrokeColorArgb: Int,
+    shapeHasFill: Boolean,
+    isFullScreenCanvas: Boolean,
+    showLeftPageDrawer: Boolean,
+    onUpdateBrushConfig: (BrushConfig) -> Unit,
+    onSelectTool: (BrushToolType) -> Unit,
+    onTogglePenEraser: () -> Unit,
+    onUpdateShapeDefaults: (Float, Int, Boolean) -> Unit,
+    onToggleFullScreen: () -> Unit,
+    onShowLeftPageDrawerChange: (Boolean) -> Unit,
+    onShowWorkspaceBanner: (String) -> Unit,
     onToggleTheme: () -> Unit,
     onToggleDebugOverlay: () -> Unit,
     onSelectPageTarget: (OpenedPageTarget) -> Unit,
@@ -1856,35 +2046,9 @@ private fun NotebookPagePane(
     val presets by presetStore.presetsFlow.collectAsState(initial = BrushPresetStore.defaultPresets)
 
     var paperConfig by remember(target) { mutableStateOf(PagePaperConfig()) }
-    val toolDockPrefsStore = remember(context) { ToolDockPreferencesStore(context.applicationContext) }
-    val dockPrefs by toolDockPrefsStore.prefsFlow.collectAsState(initial = ToolDockPrefs())
-    var perToolConfigs by remember {
-        mutableStateOf(ToolDockPreferencesStore.decodePerToolConfigs(dockPrefs.perToolConfigsRaw))
-    }
-    var hasHydratedPerToolConfigs by remember { mutableStateOf(false) }
-    var brushConfig by remember(target.notebookId) {
-        mutableStateOf(
-            ToolDockPreferencesStore.defaultToolConfig(BrushToolType.FOUNTAIN_PEN)
-        )
-    }
-    LaunchedEffect(dockPrefs.perToolConfigsRaw) {
-        if (!hasHydratedPerToolConfigs && dockPrefs.perToolConfigsRaw.isNotEmpty()) {
-            val decoded = ToolDockPreferencesStore.decodePerToolConfigs(dockPrefs.perToolConfigsRaw)
-            perToolConfigs = decoded
-            decoded[brushConfig.toolType]?.let { restored ->
-                brushConfig = restored.copy(toolType = brushConfig.toolType)
-            }
-            hasHydratedPerToolConfigs = true
-        }
-    }
-    var lastDrawingTool by remember(target.notebookId) { mutableStateOf(BrushToolType.FOUNTAIN_PEN) }
-    var lastEraserTool by remember(target.notebookId) { mutableStateOf(BrushToolType.PRECISION_ERASER) }
     var dockBoundsPx by remember { mutableStateOf(Rect.Zero) }
     var showBrushSettings by remember(target) { mutableStateOf(false) }
-    var showShapePicker by remember(target.notebookId) { mutableStateOf(false) }
-    var shapeStrokeWidthPt by remember { mutableStateOf(1.6f) }
-    var shapeStrokeColorArgb by remember { mutableIntStateOf(0xFF111827.toInt()) }
-    var shapeHasFill by remember { mutableStateOf(false) }
+    var showShapePicker by remember(target) { mutableStateOf(false) }
     var notebookOcrLanguage by remember(target.notebookId) { mutableStateOf(OcrLanguageTag.HUNGARIAN) }
     var showPaperSettings by remember(target) { mutableStateOf(false) }
     var showAiCopilot by remember(target) { mutableStateOf(false) }
@@ -1899,11 +2063,9 @@ private fun NotebookPagePane(
     val notebookPages by database.pageDao()
         .observePagesForNotebook(target.notebookId)
         .collectAsState(initial = emptyList())
-    var showLeftPageDrawer by remember(target.notebookId) { mutableStateOf(false) }
     var isCreatingPage by remember { mutableStateOf(false) }
     var topToolbarBoundsPx by remember { mutableStateOf(Rect.Zero) }
-    var isFullScreenCanvas by remember(target.notebookId) { mutableStateOf(false) }
-    var hasToggledFullScreenOnce by remember(target.notebookId) { mutableStateOf(false) }
+    var observedFullScreen by remember { mutableStateOf(isFullScreenCanvas) }
     var isReadOnlyPage by remember(target) { mutableStateOf(false) }
 
     val aiConsentStore = remember(context) { AiConsentStore(context.applicationContext) }
@@ -1924,10 +2086,11 @@ private fun NotebookPagePane(
     var historyRevisionTick by remember { mutableLongStateOf(0L) }
     var viewportTransformTick by remember { mutableLongStateOf(0L) }
 
+    val latestBrushConfig by rememberUpdatedState(brushConfig)
     val strokeJournal = remember(target) {
         StrokeJournal(
             pageDirectory = File(context.filesDir, "pages/${target.pageId}"),
-            activeBrushConfigProvider = { brushConfig },
+            activeBrushConfigProvider = { latestBrushConfig },
             shapeMetaProvider = { strokeId -> canvasStateHolder.getShapeMeta(strokeId) }
         )
     }
@@ -2027,10 +2190,10 @@ private fun NotebookPagePane(
     }
 
     LaunchedEffect(isFullScreenCanvas) {
-        if (!hasToggledFullScreenOnce) {
-            hasToggledFullScreenOnce = true
+        if (isFullScreenCanvas == observedFullScreen) {
             return@LaunchedEffect
         }
+        observedFullScreen = isFullScreenCanvas
         if (isFullScreenCanvas) {
             topToolbarBoundsPx = Rect.Zero
         }
@@ -2269,35 +2432,6 @@ private fun NotebookPagePane(
     val canUndo = canvasStateHolder.canUndo
     val canRedo = canvasStateHolder.canRedo
 
-    fun updateActiveBrushConfig(next: BrushConfig) {
-        brushConfig = next
-        val updatedMap = perToolConfigs.toMutableMap()
-        updatedMap[next.toolType] = next
-        perToolConfigs = updatedMap
-        hasHydratedPerToolConfigs = true
-        coroutineScope.launch {
-            toolDockPrefsStore.savePerToolConfigs(updatedMap)
-        }
-    }
-
-    fun selectTool(nextTool: BrushToolType) {
-        val updatedMap = perToolConfigs.toMutableMap()
-        updatedMap[brushConfig.toolType] = brushConfig
-        val restored = (updatedMap[nextTool] ?: ToolDockPreferencesStore.defaultToolConfig(nextTool))
-            .copy(toolType = nextTool)
-        perToolConfigs = updatedMap
-        if (nextTool == BrushToolType.FOUNTAIN_PEN || nextTool == BrushToolType.HIGHLIGHTER) {
-            lastDrawingTool = nextTool
-        } else if (nextTool.isEraser) {
-            lastEraserTool = nextTool
-        }
-        brushConfig = restored
-        hasHydratedPerToolConfigs = true
-        coroutineScope.launch {
-            toolDockPrefsStore.savePerToolConfigs(updatedMap)
-        }
-    }
-
     fun switchToPage(nextPageId: String) {
         if (nextPageId == target.pageId) return
         coroutineScope.launch {
@@ -2316,15 +2450,15 @@ private fun NotebookPagePane(
         isCreatingPage = true
         coroutineScope.launch {
             try {
-                val newPageId = withContext(Dispatchers.IO) {
+                val createdPair = withContext(Dispatchers.IO) {
                     strokeJournal.flushAndSync()
                     val now = System.currentTimeMillis()
                     val nb = database.notebookDao().getNotebookById(target.notebookId)
+                        ?: return@withContext null
                     var existingPages = database.pageDao().getPagesForNotebook(target.notebookId)
                     if (existingPages.none { it.id == target.pageId }) {
                         val fallbackPreset = currentPageEntity?.pageSizePreset
-                            ?: nb?.defaultPageSizePreset
-                            ?: PageSizePreset.A4_PORTRAIT
+                            ?: nb.defaultPageSizePreset
                         database.pageDao().upsertPage(
                             PageEntity(
                                 id = target.pageId,
@@ -2342,10 +2476,7 @@ private fun NotebookPagePane(
                     val createdId = UUID.randomUUID().toString()
                     val nextIndex = (existingPages.maxOfOrNull { it.pageIndexInNotebook } ?: -1) + 1
                     val resolvedPreset = currentPageEntity?.pageSizePreset
-                        ?: nb?.defaultPageSizePreset
-                        ?: PageSizePreset.entries.firstOrNull {
-                            it.dimensionsPt == paperConfig.pageDimensions
-                        } ?: PageSizePreset.A4_PORTRAIT
+                        ?: nb.defaultPageSizePreset
                     database.pageDao().upsertPage(
                         PageEntity(
                             id = createdId,
@@ -2358,14 +2489,19 @@ private fun NotebookPagePane(
                             updatedAtEpochMs = now
                         )
                     )
-                    if (nb != null) {
-                        database.notebookDao().upsertNotebook(
-                            nb.copy(lastOpenedPageId = createdId, updatedAtEpochMs = now)
-                        )
-                    }
-                    createdId
+                    database.notebookDao().upsertNotebook(
+                        nb.copy(lastOpenedPageId = createdId, updatedAtEpochMs = now)
+                    )
+                    createdId to (nextIndex + 1)
                 }
-                onSelectPageTarget(OpenedPageTarget(target.notebookId, newPageId))
+                if (createdPair == null) {
+                    copilotNoticeBannerHu = "A jegyzetfüzet nem található az adatbázisban."
+                } else {
+                    val (newPageId, newPageNum) = createdPair
+                    onShowLeftPageDrawerChange(false)
+                    onShowWorkspaceBanner("${newPageNum}. oldal létrehozva")
+                    onSelectPageTarget(OpenedPageTarget(target.notebookId, newPageId))
+                }
             } finally {
                 isCreatingPage = false
             }
@@ -2376,12 +2512,11 @@ private fun NotebookPagePane(
     val currentIdxOneBased = if (activePageIdx >= 0) activePageIdx + 1 else pageNumber
     val totalPageCount = notebookPages.size.coerceAtLeast(currentIdxOneBased)
 
-    LaunchedEffect(penButtonToggleTick) {
-        if (penButtonToggleTick > 0L) {
-            val next = if (brushConfig.toolType.isEraser) lastDrawingTool else lastEraserTool
-            selectTool(next)
-        }
-    }
+    var lassoPreviewObjectIds by remember(target.pageId) { mutableStateOf<Set<String>>(emptySet()) }
+    var lassoPreviewDeltaXPt by remember(target.pageId) { mutableFloatStateOf(0f) }
+    var lassoPreviewDeltaYPt by remember(target.pageId) { mutableFloatStateOf(0f) }
+    var lassoPreviewRotationRad by remember(target.pageId) { mutableFloatStateOf(0f) }
+    var lassoPreviewRotationCenter by remember(target.pageId) { mutableStateOf<DocPoint?>(null) }
 
     Box(modifier = modifier.fillMaxSize()) {
         StylusDrawingSurface(
@@ -2393,10 +2528,7 @@ private fun NotebookPagePane(
             dryInkRasterCache = dryInkRasterCache,
             oledStrokeCache = oledStrokeCache,
             journalCommitSink = strokeJournal,
-            onTogglePenEraser = {
-                val next = if (brushConfig.toolType.isEraser) lastDrawingTool else lastEraserTool
-                selectTool(next)
-            },
+            onTogglePenEraser = onTogglePenEraser,
             onCanvasStateMutated = {
                 historyRevisionTick++
                 if (benchmarkStrokeCount == 0) {
@@ -2425,27 +2557,42 @@ private fun NotebookPagePane(
             onNavigationGestureEnd = {
                 if (paperConfig.canvasMode == CanvasMode.FIXED_PAGE &&
                     benchmarkStrokeCount == 0 &&
+                    viewportSize.width > 0 &&
                     viewportSize.height > 0
                 ) {
-                    val docCenter = transformMatrix.screenToDoc(
-                        xPx = viewportSize.width * 0.5f,
-                        yPx = viewportSize.height * 0.5f
+                    val visibleRect = transformMatrix.screenRectToDocRect(
+                        leftPx = 0f,
+                        topPx = 0f,
+                        rightPx = viewportSize.width.toFloat(),
+                        bottomPx = viewportSize.height.toFloat()
                     )
-                    val pageH = paperConfig.pageDimensions.heightPt
+                    val centerDocY = (visibleRect.topPt + visibleRect.bottomPt) * 0.5f
                     val idx = notebookPages.indexOfFirst { it.id == target.pageId }
-                    if (docCenter.yPt > pageH + 45f) {
-                        if (idx >= 0 && idx + 1 < notebookPages.size) {
-                            switchToPage(notebookPages[idx + 1].id)
-                        } else if (docCenter.yPt > pageH + 135f) {
-                            createAndOpenNextPage()
+                    when (
+                        resolveFixedPageScrollNavigation(
+                            visibleRect = visibleRect,
+                            centerDocY = centerDocY,
+                            pageHeightPt = paperConfig.pageDimensions.heightPt,
+                            currentPageIndex = idx,
+                            totalPages = notebookPages.size
+                        )
+                    ) {
+                        FixedPageScrollNavigationAction.PREVIOUS_PAGE -> {
+                            if (idx > 0) switchToPage(notebookPages[idx - 1].id)
                         }
-                    } else if (docCenter.yPt < -45f && idx > 0) {
-                        switchToPage(notebookPages[idx - 1].id)
+                        FixedPageScrollNavigationAction.NEXT_PAGE -> {
+                            if (idx >= 0 && idx + 1 < notebookPages.size) {
+                                switchToPage(notebookPages[idx + 1].id)
+                            }
+                        }
+                        FixedPageScrollNavigationAction.CREATE_NEXT_PAGE -> createAndOpenNextPage()
+                        FixedPageScrollNavigationAction.NONE -> Unit
                     }
                 }
             },
             currentPageIndexOneBased = currentIdxOneBased,
             totalPages = totalPageCount,
+            initialPagePaddingPx = if (isFullScreenCanvas) 0f else 36f,
             onAiAutoFormatLassoSelection = { selectedIds, onFormatted ->
                 if (selectedIds.isEmpty()) {
                     onFormatted(false)
@@ -2499,6 +2646,16 @@ private fun NotebookPagePane(
                         }
                     }
                 }
+            },
+            onLassoSelectedObject = { objId ->
+                selectedObjectId = objId
+            },
+            onLassoObjectPreviewChanged = { ids, dx, dy, rot, center ->
+                lassoPreviewObjectIds = ids
+                lassoPreviewDeltaXPt = dx
+                lassoPreviewDeltaYPt = dy
+                lassoPreviewRotationRad = rot
+                lassoPreviewRotationCenter = center
             },
             externalDrawVersionTick = externalDrawTick,
             modifier = Modifier.fillMaxSize()
@@ -2577,6 +2734,11 @@ private fun NotebookPagePane(
                         }
                     }
                 },
+                lassoPreviewObjectIds = lassoPreviewObjectIds,
+                lassoPreviewDeltaXPt = lassoPreviewDeltaXPt,
+                lassoPreviewDeltaYPt = lassoPreviewDeltaYPt,
+                lassoPreviewRotationRadians = lassoPreviewRotationRad,
+                lassoPreviewRotationCenter = lassoPreviewRotationCenter,
                 viewportTransformTick = viewportTransformTick,
                 modifier = Modifier.fillMaxSize()
             )
@@ -2612,7 +2774,7 @@ private fun NotebookPagePane(
                 onUpdateYFraction = { nextY ->
                     coroutineScope.launch { toolDockPrefsStore.saveLeftTabYFraction(nextY) }
                 },
-                onOpenDrawer = { showLeftPageDrawer = true },
+                onOpenDrawer = { onShowLeftPageDrawerChange(true) },
                 modifier = Modifier
                     .align(Alignment.TopStart)
                     .padding(start = 0.dp)
@@ -2650,12 +2812,23 @@ private fun NotebookPagePane(
                                 modifier = Modifier.size(18.dp)
                             )
                         }
+                        val activePageEntity = notebookPages.firstOrNull { it.id == target.pageId }
+                            ?: currentPageEntity
+                        val customPageTitle = activePageEntity?.title?.trim()?.takeIf { it.isNotEmpty() }
+                        val stepperLabel = if (customPageTitle != null) {
+                            "$customPageTitle • $currentIdxOneBased/$totalPageCount"
+                        } else {
+                            "$currentIdxOneBased / $totalPageCount"
+                        }
                         Text(
-                            text = "$currentIdxOneBased / $totalPageCount",
+                            text = stepperLabel,
                             style = MaterialTheme.typography.labelMedium,
                             fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                             modifier = Modifier
-                                .clickable { showLeftPageDrawer = true }
+                                .clickable { onShowLeftPageDrawerChange(true) }
+                                .widthIn(max = 180.dp)
                                 .padding(horizontal = 6.dp, vertical = 4.dp)
                         )
                         IconButton(
@@ -2742,25 +2915,31 @@ private fun NotebookPagePane(
             onUpdateDockPrefs = { next ->
                 coroutineScope.launch { toolDockPrefsStore.savePrefs(next) }
             },
-            onSelectTool = { selectTool(it) },
+            onSelectTool = onSelectTool,
             onOpenSettings = { showBrushSettings = true },
             onOpenPaperSettings = { showPaperSettings = true },
             onOpenShapes = { showShapePicker = true },
             onInsertImage = { insertImageLauncher.launch("image/*") },
             onUndo = {
                 canvasStateHolder.undo()?.let { dryInkRasterCache.invalidateDocRect(it) }
+                if (selectedObjectId != null && canvasStateHolder.getPageObject(selectedObjectId!!) == null) {
+                    selectedObjectId = null
+                }
                 externalDrawTick++
                 historyRevisionTick++
             },
             onRedo = {
                 canvasStateHolder.redo()?.let { dryInkRasterCache.invalidateDocRect(it) }
+                if (selectedObjectId != null && canvasStateHolder.getPageObject(selectedObjectId!!) == null) {
+                    selectedObjectId = null
+                }
                 externalDrawTick++
                 historyRevisionTick++
             },
             onFitPage = { fitPageToViewportNow() },
             onToggleTheme = onToggleTheme,
             onToggleDebugOverlay = onToggleDebugOverlay,
-            onToggleFullScreen = { isFullScreenCanvas = !isFullScreenCanvas },
+            onToggleFullScreen = onToggleFullScreen,
             onDockBoundsChanged = { next ->
                 if (rectsDifferOver1Px(dockBoundsPx, next)) {
                     dockBoundsPx = next
@@ -2775,11 +2954,11 @@ private fun NotebookPagePane(
                 presets = presets,
                 anchorBoundsPx = dockBoundsPx,
                 viewportSize = viewportSize,
-                onConfigChange = { updated -> updateActiveBrushConfig(updated) },
+                onConfigChange = onUpdateBrushConfig,
                 onSavePresetSlot = { slot, cfg ->
                     coroutineScope.launch { presetStore.savePreset(slot, cfg) }
                 },
-                onApplyPreset = { preset -> updateActiveBrushConfig(preset) },
+                onApplyPreset = onUpdateBrushConfig,
                 onDismiss = { showBrushSettings = false }
             )
         }
@@ -2792,9 +2971,7 @@ private fun NotebookPagePane(
                 anchorBoundsPx = dockBoundsPx,
                 viewportSize = viewportSize,
                 onInsertShape = { shapeType, strokeWidthPt, strokeColorArgb, hasFill ->
-                    shapeStrokeWidthPt = strokeWidthPt
-                    shapeStrokeColorArgb = strokeColorArgb
-                    shapeHasFill = hasFill
+                    onUpdateShapeDefaults(strokeWidthPt, strokeColorArgb, hasFill)
                     val centerDoc = viewportCenterDocPoint()
                     val defaultHalfW = if (
                         shapeType == GeometricShapeType.LINE ||
@@ -2845,7 +3022,17 @@ private fun NotebookPagePane(
                         )
                     }
                 },
-                onDismiss = { showLeftPageDrawer = false }
+                onRenamePage = { pageId, newTitle ->
+                    val sanitized = newTitle?.trim()?.takeIf { it.isNotEmpty() }
+                    coroutineScope.launch(Dispatchers.IO) {
+                        database.pageDao().renamePage(
+                            pageId = pageId,
+                            title = sanitized,
+                            updatedAtMs = System.currentTimeMillis()
+                        )
+                    }
+                },
+                onDismiss = { onShowLeftPageDrawerChange(false) }
             )
         }
 

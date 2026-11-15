@@ -9,6 +9,7 @@ import androidx.ink.strokes.StrokeInput
 import androidx.input.motionprediction.MotionEventPredictor
 import hu.bdev.stylusnote.core.math.CanvasTransformMatrix
 import hu.bdev.stylusnote.core.math.OneEuroFilter
+import hu.bdev.stylusnote.core.math.TransformSnapshot
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.hypot
@@ -295,9 +296,10 @@ class StylusInputRouter<TEvent>(
     private val onNavigationGestureEnd: () -> Unit = {}
 ) {
     companion object {
-        const val POST_STYLUS_PALM_GRACE_WINDOW_MS = 650L
-        const val ONE_FINGER_VERTICAL_TOUCH_SLOP_PX = 14f
+        const val POST_STYLUS_PALM_GRACE_WINDOW_MS = 850L
+        const val ONE_FINGER_VERTICAL_TOUCH_SLOP_PX = 22f
         const val MAX_FINGER_CONTACT_MAJOR_PX = 95f
+        const val TOOL_TYPE_PALM_COMPAT = 5
     }
 
     var allowFingerDrawing: Boolean = false
@@ -316,6 +318,8 @@ class StylusInputRouter<TEvent>(
     private var prevSinglePointerId: Int = -1
     private var prevSingleXPx: Float = 0f
     private var prevSingleYPx: Float = 0f
+    private var fingerNavStartSnapshot: TransformSnapshot? = null
+    private var fingerNavStartTimeMs: Long = Long.MIN_VALUE
     private var stylusSeenInGesture: Boolean = false
     private var lastStylusActivityTimeMs: Long = Long.MIN_VALUE
     private var isStylusHovering: Boolean = false
@@ -363,12 +367,24 @@ class StylusInputRouter<TEvent>(
     fun processTouchFrame(frame: StylusMotionFrame<TEvent>): Boolean {
         detectPrimaryStylusButtonEdge(frame.buttonState)
 
-        val isCanceled = frame.action == StylusAction.CANCEL ||
-            (frame.flags and MotionEvent.FLAG_CANCELED) != 0
-        if (isCanceled) {
+        val hasFlagCanceled = (frame.flags and MotionEvent.FLAG_CANCELED) != 0
+        val isFullCancel = frame.action == StylusAction.CANCEL ||
+            (hasFlagCanceled && frame.action != StylusAction.POINTER_UP)
+        if (isFullCancel) {
             val hadState = activeStrokePointerId != null || twoFingerNavActive || singleFingerMoved
             cancelAllActiveGestures()
             return hadState
+        }
+        if (frame.action == StylusAction.POINTER_UP && hasFlagCanceled) {
+            val canceledPointer = frame.pointers.getOrNull(frame.actionIndex)
+            if (canceledPointer?.pointerId == activeStrokePointerId) {
+                cancelAllActiveGestures()
+                return true
+            }
+            // OS rejected only a palm/unintentional pointer; roll back any partial palm shift while keeping an active stylus stroke alive.
+            palmRejectedInCurrentTouchGesture = true
+            resetFingerNavigationState(rollbackAppliedTransform = true)
+            return activeStrokePointerId != null
         }
 
         if (frame.action == StylusAction.DOWN) {
@@ -393,10 +409,17 @@ class StylusInputRouter<TEvent>(
                 val isStylusOrEraser = actionPointer.toolType == MotionEvent.TOOL_TYPE_STYLUS ||
                     actionPointer.toolType == MotionEvent.TOOL_TYPE_ERASER
 
-                // Abort any ongoing finger pan/zoom when stylus takes priority and lock palm rejection.
+                // Roll back any in-progress 1-finger or simultaneous-palm shift when stylus hits the glass,
+                // while preserving an already-completed 2-finger pinch/zoom across a fresh ACTION_DOWN.
                 if (isStylusOrEraser) {
-                    resetFingerNavigationState()
+                    val isOngoingPalmTakeover = frame.action == StylusAction.POINTER_DOWN ||
+                        singleFingerPanActive ||
+                        singleFingerPanUnlocked
+                    resetFingerNavigationState(rollbackAppliedTransform = isOngoingPalmTakeover)
                     palmRejectedInCurrentTouchGesture = true
+                    if (activeStrokePointerId != null && !activeStrokeIsStylus) {
+                        cancelActiveStrokeOnly()
+                    }
                 }
 
                 // If no stroke is currently active, begin a new one.
@@ -410,12 +433,14 @@ class StylusInputRouter<TEvent>(
             ) {
                 // Cancel single-finger stroke if user places a second finger to pinch-zoom.
                 cancelActiveStrokeOnly()
-            } else if (frame.action == StylusAction.DOWN && actionPointer != null) {
-                // Lock out 1-finger pan for this entire touch sequence if it begins as a palm patch or right after stylus activity.
-                if (isWithinPalmGraceWindow(frame.eventTimeMs) ||
-                    actionPointer.touchMajorPx > MAX_FINGER_CONTACT_MAJOR_PX
+            } else if (actionPointer != null) {
+                // Lock out 1-finger/2-finger pan for this touch sequence if any palm or post-stylus grace contact arrives.
+                if (actionPointer.toolType == TOOL_TYPE_PALM_COMPAT ||
+                    actionPointer.touchMajorPx > MAX_FINGER_CONTACT_MAJOR_PX ||
+                    (frame.action == StylusAction.DOWN && isWithinPalmGraceWindow(frame.eventTimeMs))
                 ) {
                     palmRejectedInCurrentTouchGesture = true
+                    resetFingerNavigationState(rollbackAppliedTransform = true)
                 }
             }
         }
@@ -582,7 +607,7 @@ class StylusInputRouter<TEvent>(
                 )
 
                 // Predicted points MUST bypass OneEuroFilter to avoid phase-lag overshoot hooks.
-                val rawPredicted = if (predictedEvent != null && predictorBridge != null) {
+                val rawPredicted = if (predictedEvent != null) {
                     predictorBridge.extractPredictedSamples(predictedEvent, activePointer.pointerId)
                 } else {
                     emptyList()
@@ -714,22 +739,30 @@ class StylusInputRouter<TEvent>(
 
     private fun handleTwoFingerNavigation(frame: StylusMotionFrame<TEvent>): Boolean {
         if (isStylusStrokeActive) {
-            resetFingerNavigationState()
+            resetFingerNavigationState(rollbackAppliedTransform = false)
             return false
         }
 
-        // Exclude lifted pointer on POINTER_UP/UP and ignore active stylus/eraser tools.
+        val hasSystemPalmTool = frame.pointers.any { it.toolType == TOOL_TYPE_PALM_COMPAT }
+        if (hasSystemPalmTool) {
+            palmRejectedInCurrentTouchGesture = true
+            resetFingerNavigationState(rollbackAppliedTransform = true)
+            return false
+        }
+
+        // Exclude lifted pointer on POINTER_UP/UP and ignore active stylus/eraser/palm tools.
         val activeFingers = frame.pointers.filterIndexed { index, pointer ->
             val isLifting = (frame.action == StylusAction.UP || frame.action == StylusAction.POINTER_UP) &&
                 index == frame.actionIndex
             val isStylusOrEraser = pointer.toolType == MotionEvent.TOOL_TYPE_STYLUS ||
-                pointer.toolType == MotionEvent.TOOL_TYPE_ERASER
+                pointer.toolType == MotionEvent.TOOL_TYPE_ERASER ||
+                pointer.toolType == TOOL_TYPE_PALM_COMPAT
             !isLifting && !isStylusOrEraser
         }
 
         if (activeFingers.isEmpty()) {
             val wasNavigating = twoFingerNavActive || singleFingerMoved
-            resetFingerNavigationState()
+            resetFingerNavigationState(rollbackAppliedTransform = false)
             if (frame.action == StylusAction.UP || frame.action == StylusAction.CANCEL) {
                 stylusSeenInGesture = false
                 palmRejectedInCurrentTouchGesture = false
@@ -743,7 +776,16 @@ class StylusInputRouter<TEvent>(
         val hasOversizedPalm = activeFingers.any { it.touchMajorPx > MAX_FINGER_CONTACT_MAJOR_PX }
         if (hasOversizedPalm) {
             palmRejectedInCurrentTouchGesture = true
-            resetFingerNavigationState()
+            resetFingerNavigationState(rollbackAppliedTransform = true)
+            return false
+        }
+
+        if (stylusSeenInGesture ||
+            palmRejectedInCurrentTouchGesture ||
+            (!twoFingerNavActive && isWithinPalmGraceWindow(frame.eventTimeMs))
+        ) {
+            palmRejectedInCurrentTouchGesture = true
+            resetFingerNavigationState(rollbackAppliedTransform = true)
             return false
         }
 
@@ -764,16 +806,16 @@ class StylusInputRouter<TEvent>(
                 prevSingleYPx = f.yPx
                 return true
             }
-            if (allowFingerDrawing ||
-                stylusSeenInGesture ||
-                palmRejectedInCurrentTouchGesture ||
-                isWithinPalmGraceWindow(frame.eventTimeMs)
-            ) {
+            if (allowFingerDrawing) {
                 palmRejectedInCurrentTouchGesture = true
-                resetFingerNavigationState()
+                resetFingerNavigationState(rollbackAppliedTransform = false)
                 return false
             }
             if (!singleFingerPanActive || prevSinglePointerId != f.pointerId) {
+                if (fingerNavStartSnapshot == null) {
+                    fingerNavStartSnapshot = transformMatrix.snapshot()
+                    fingerNavStartTimeMs = frame.eventTimeMs
+                }
                 singleFingerPanActive = true
                 singleFingerMoved = false
                 singleFingerPanUnlocked = false
@@ -844,6 +886,10 @@ class StylusInputRouter<TEvent>(
             onTransformChanged()
         }
 
+        if (fingerNavStartSnapshot == null) {
+            fingerNavStartSnapshot = transformMatrix.snapshot()
+            fingerNavStartTimeMs = frame.eventTimeMs
+        }
         prevNavPointerId0 = p0.pointerId
         prevNavPointerId1 = p1.pointerId
         prevNavSpanPx = span
@@ -860,7 +906,17 @@ class StylusInputRouter<TEvent>(
         return (eventTimeMs - last) < POST_STYLUS_PALM_GRACE_WINDOW_MS
     }
 
-    private fun resetFingerNavigationState() {
+    private fun resetFingerNavigationState(rollbackAppliedTransform: Boolean = false) {
+        val snapshot = fingerNavStartSnapshot
+        val hadAppliedMovement = singleFingerMoved || twoFingerNavActive
+        if (rollbackAppliedTransform && hadAppliedMovement && snapshot != null &&
+            transformMatrix.version != snapshot.version
+        ) {
+            transformMatrix.setTransform(snapshot.scale, snapshot.panXPx, snapshot.panYPx)
+            onTransformChanged()
+        }
+        fingerNavStartSnapshot = null
+        fingerNavStartTimeMs = Long.MIN_VALUE
         singleFingerPanActive = false
         singleFingerMoved = false
         singleFingerPanUnlocked = false
@@ -914,7 +970,7 @@ class StylusInputRouter<TEvent>(
 
     private fun cancelAllActiveGestures() {
         cancelActiveStrokeOnly()
-        resetFingerNavigationState()
+        resetFingerNavigationState(rollbackAppliedTransform = true)
         stylusSeenInGesture = false
         palmRejectedInCurrentTouchGesture = false
     }
@@ -1011,7 +1067,8 @@ fun StylusInputRouter<MotionEvent>.onTouchEvent(event: MotionEvent): Boolean {
     val hasAcceptedTool = hasAcceptedToolForPrediction(event)
     if (hasAcceptedTool &&
         event.actionMasked != MotionEvent.ACTION_CANCEL &&
-        (event.flags and MotionEvent.FLAG_CANCELED) == 0
+        ((event.flags and MotionEvent.FLAG_CANCELED) == 0 ||
+            event.actionMasked == MotionEvent.ACTION_POINTER_UP)
     ) {
         predictorBridge?.record(event)
     }

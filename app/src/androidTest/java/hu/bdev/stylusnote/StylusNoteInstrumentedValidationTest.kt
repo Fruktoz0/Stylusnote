@@ -6,6 +6,7 @@ import androidx.ink.brush.SelfOverlap
 import androidx.ink.brush.StockBrushes
 import androidx.ink.strokes.Stroke
 import androidx.room.Room
+import androidx.room.testing.MigrationTestHelper
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import hu.bdev.stylusnote.core.hardware.StylusPointSample
@@ -33,6 +34,7 @@ import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
@@ -45,6 +47,79 @@ class StylusNoteInstrumentedValidationTest {
 
     private val context: Context
         get() = InstrumentationRegistry.getInstrumentation().targetContext
+
+    @get:Rule
+    val migrationHelper = MigrationTestHelper(
+        InstrumentationRegistry.getInstrumentation(),
+        AppDatabase::class.java
+    )
+
+    @Test
+    fun migration1To2AddsNullableTitleColumnWithoutDataLoss() {
+        val dbName = "migration-v1-v2-test.db"
+        context.deleteDatabase(dbName)
+        migrationHelper.createDatabase(dbName, 1).apply {
+            execSQL(
+                """
+                INSERT INTO notebooks (id, title, isFavorite, defaultCanvasMode, defaultPageSizePreset, defaultTemplateType, ocrLanguage, createdAtEpochMs, updatedAtEpochMs, cover_texture, cover_primaryColorArgb, cover_spineColorArgb, cover_labelLayout, cover_typography, cover_subtitle)
+                VALUES ('nb-m1', 'Migrált', 0, 'FIXED_PAGE', 'A4_PORTRAIT', 'GRID_5MM', 'HU', 1000, 1000, 'SOLID_MATTE', -13936540, -14991780, 'CENTERED', 'MODERN_SANS', '')
+                """.trimIndent()
+            )
+            execSQL(
+                """
+                INSERT INTO pages (id, notebookId, pageIndexInNotebook, canvasMode, pageSizePreset, templateType, invertPdfInOledMode, snapshotRelativePath, journalRelativePath, needsOcrSync, createdAtEpochMs, updatedAtEpochMs)
+                VALUES ('pg-m1', 'nb-m1', 0, 'FIXED_PAGE', 'A4_PORTRAIT', 'GRID_5MM', 1, 'pages/pg-m1/page.snote', 'pages/pg-m1/page.journal', 0, 1000, 1000)
+                """.trimIndent()
+            )
+            close()
+        }
+        val migratedDb = migrationHelper.runMigrationsAndValidate(
+            dbName,
+            2,
+            true,
+            AppDatabase.MIGRATION_1_2
+        )
+        migratedDb.query("SELECT id, title FROM pages WHERE id = 'pg-m1'").use { c ->
+            assertTrue(c.moveToFirst())
+            assertEquals("pg-m1", c.getString(0))
+            assertTrue(c.isNull(1))
+        }
+        migratedDb.execSQL("UPDATE pages SET title = 'Bevezetés' WHERE id = 'pg-m1'")
+        migratedDb.query("SELECT title FROM pages WHERE id = 'pg-m1'").use { c ->
+            assertTrue(c.moveToFirst())
+            assertEquals("Bevezetés", c.getString(0))
+        }
+        migratedDb.close()
+        context.deleteDatabase(dbName)
+    }
+
+    /**
+     * Regression: `@Insert(REPLACE)` deletes+reinserts the parent row, which fired
+     * `ON DELETE CASCADE` and wiped every page whenever `lastOpenedPageId` was updated
+     * (the "új oldal nem jön létre" bug). Upserting a notebook must keep its pages.
+     */
+    @Test
+    fun upsertingNotebookDoesNotCascadeDeleteItsPages() = runBlocking {
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        try {
+            val now = 1_700_000_000_000L
+            val nb = NotebookEntity(id = "nb-up", title = "Teszt", createdAtEpochMs = now, updatedAtEpochMs = now)
+            db.notebookDao().upsertNotebook(nb)
+            listOf("p0", "p1").forEachIndexed { idx, id ->
+                db.pageDao().upsertPage(
+                    PageEntity(id = id, notebookId = "nb-up", pageIndexInNotebook = idx, createdAtEpochMs = now, updatedAtEpochMs = now)
+                )
+            }
+            db.notebookDao().upsertNotebook(nb.copy(lastOpenedPageId = "p1", updatedAtEpochMs = now + 1))
+            val pages = db.pageDao().getPagesForNotebook("nb-up")
+            assertEquals(listOf("p0", "p1"), pages.map { it.id })
+            assertEquals("p1", db.notebookDao().getNotebookById("nb-up")?.lastOpenedPageId)
+        } finally {
+            db.close()
+        }
+    }
 
     @Test
     fun fts4AccentInsensitiveHungarianSearchFindsPagesInRoomDatabase() = runBlocking {
