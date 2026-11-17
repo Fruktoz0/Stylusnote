@@ -86,6 +86,17 @@ data class TransformSnapshot(
 )
 
 /**
+ * Resolution- and orientation-independent anchor inside a single document page, allowing saved
+ * zoom and focal scroll sections to restore accurately across portrait/landscape rotations.
+ */
+data class SavedViewportAnchor(
+    val pageId: String,
+    val localCenterXPt: Float,
+    val localCenterYPt: Float,
+    val relativeZoomFactor: Float
+)
+
+/**
  * Synchronized mapping between PDF-point document space (1/72 in) and screen pixel space.
  *
  * All four rendering layers (PaperBackgroundLayer, DryInkRasterCache, InProgressStrokesView,
@@ -190,6 +201,24 @@ class CanvasTransformMatrix(
         _version++
     }
 
+    private fun computePageFitScale(
+        pageWidthPt: Float,
+        pageHeightPt: Float,
+        viewportWidthPx: Float,
+        viewportHeightPx: Float,
+        paddingPx: Float
+    ): Float? {
+        if (pageWidthPt <= 0f || pageHeightPt <= 0f ||
+            viewportWidthPx <= paddingPx * 2f || viewportHeightPx <= paddingPx * 2f
+        ) {
+            return null
+        }
+        val availWidth = viewportWidthPx - paddingPx * 2f
+        val availHeight = viewportHeightPx - paddingPx * 2f
+        return min(availWidth / pageWidthPt, availHeight / pageHeightPt)
+            .coerceIn(MIN_SCALE, MAX_SCALE * 2.0f)
+    }
+
     /**
      * Centers and scales a page of [pageWidthPt] x [pageHeightPt] inside a viewport of
      * [viewportWidthPx] x [viewportHeightPx] with optional [paddingPx].
@@ -202,16 +231,13 @@ class CanvasTransformMatrix(
         viewportHeightPx: Float,
         paddingPx: Float = 48f
     ) {
-        if (pageWidthPt <= 0f || pageHeightPt <= 0f ||
-            viewportWidthPx <= paddingPx * 2f || viewportHeightPx <= paddingPx * 2f
-        ) {
-            return
-        }
-
-        val availWidth = viewportWidthPx - paddingPx * 2f
-        val availHeight = viewportHeightPx - paddingPx * 2f
-        val targetScale = min(availWidth / pageWidthPt, availHeight / pageHeightPt)
-            .coerceIn(MIN_SCALE, MAX_SCALE * 2.0f)
+        val targetScale = computePageFitScale(
+            pageWidthPt = pageWidthPt,
+            pageHeightPt = pageHeightPt,
+            viewportWidthPx = viewportWidthPx,
+            viewportHeightPx = viewportHeightPx,
+            paddingPx = paddingPx
+        ) ?: return
 
         val scaledWidth = pageWidthPt * targetScale
         val scaledHeight = pageHeightPt * targetScale
@@ -221,6 +247,74 @@ class CanvasTransformMatrix(
         _panXPx = (viewportWidthPx - scaledWidth) * 0.5f
         _panYPx = (viewportHeightPx - scaledHeight) * 0.5f
         _version++
+    }
+
+    /**
+     * Re-establishes [_baseFitScale] for the target page in the current viewport, then centers the
+     * viewport onto the page-local point `(localCenterXPt, localCenterYPt)` at
+     * `baseFitScale * relativeZoomFactor`.
+     */
+    @Synchronized
+    fun applySavedPageLocalViewport(
+        pageOriginXPt: Float,
+        pageOriginYPt: Float,
+        pageWidthPt: Float,
+        pageHeightPt: Float,
+        localCenterXPt: Float,
+        localCenterYPt: Float,
+        relativeZoomFactor: Float,
+        viewportWidthPx: Float,
+        viewportHeightPx: Float,
+        paddingPx: Float = 48f
+    ): Boolean {
+        if (!pageOriginXPt.isFinite() || !pageOriginYPt.isFinite() ||
+            !localCenterXPt.isFinite() || !localCenterYPt.isFinite() ||
+            !relativeZoomFactor.isFinite() || relativeZoomFactor <= 0f
+        ) {
+            return false
+        }
+        val fitScale = computePageFitScale(
+            pageWidthPt = pageWidthPt,
+            pageHeightPt = pageHeightPt,
+            viewportWidthPx = viewportWidthPx,
+            viewportHeightPx = viewportHeightPx,
+            paddingPx = paddingPx
+        ) ?: return false
+
+        _baseFitScale = fitScale.coerceAtLeast(0.1f)
+        val targetScale = clampInstanceScale(_baseFitScale * relativeZoomFactor)
+        val wsCenterX = pageOriginXPt + localCenterXPt
+        val wsCenterY = pageOriginYPt + localCenterYPt
+        _scale = targetScale
+        _panXPx = viewportWidthPx * 0.5f - wsCenterX * targetScale
+        _panYPx = viewportHeightPx * 0.5f - wsCenterY * targetScale
+        _version++
+        return true
+    }
+
+    /**
+     * Captures the viewport center in page-local coordinates together with the current zoom
+     * multiplier relative to [_baseFitScale].
+     */
+    @Synchronized
+    fun capturePageLocalViewportAnchor(
+        pageId: String,
+        pageOriginXPt: Float,
+        pageOriginYPt: Float,
+        viewportWidthPx: Float,
+        viewportHeightPx: Float
+    ): SavedViewportAnchor? {
+        if (pageId.isBlank() || viewportWidthPx <= 0f || viewportHeightPx <= 0f) return null
+        val centerDocX = (viewportWidthPx * 0.5f - _panXPx) / _scale
+        val centerDocY = (viewportHeightPx * 0.5f - _panYPx) / _scale
+        if (!centerDocX.isFinite() || !centerDocY.isFinite()) return null
+        val relZoom = (_scale / _baseFitScale.coerceAtLeast(0.1f)).coerceIn(0.65f, 5.0f)
+        return SavedViewportAnchor(
+            pageId = pageId,
+            localCenterXPt = centerDocX - pageOriginXPt,
+            localCenterYPt = centerDocY - pageOriginYPt,
+            relativeZoomFactor = relZoom
+        )
     }
 
     /**

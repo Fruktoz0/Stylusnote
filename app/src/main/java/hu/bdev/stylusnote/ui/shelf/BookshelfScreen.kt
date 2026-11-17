@@ -2,6 +2,7 @@ package hu.bdev.stylusnote.ui.shelf
 
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
@@ -153,12 +154,14 @@ import hu.bdev.stylusnote.core.ai.NotebookSearchMatch
 import hu.bdev.stylusnote.core.ai.SearchExecutionResult
 import hu.bdev.stylusnote.core.ai.SearchIndexState
 import hu.bdev.stylusnote.core.ai.SearchTextIndexer
+import hu.bdev.stylusnote.core.hardware.StylusToggleDebouncer
 import hu.bdev.stylusnote.core.math.CanvasTransformMatrix
 import hu.bdev.stylusnote.core.math.ContinuousPageLayout
 import hu.bdev.stylusnote.core.math.DocPoint
 import hu.bdev.stylusnote.core.math.DocRect
 import hu.bdev.stylusnote.core.math.OledStrokeRenderCache
 import hu.bdev.stylusnote.core.math.PageLayoutSlot
+import hu.bdev.stylusnote.core.math.SavedViewportAnchor
 import hu.bdev.stylusnote.core.math.ShapeMeta
 import hu.bdev.stylusnote.core.math.ShapeRecognizer
 import hu.bdev.stylusnote.data.export.CloudSyncScheduler
@@ -238,7 +241,8 @@ import kotlin.math.roundToInt
 
 data class OpenedPageTarget(
     val notebookId: String,
-    val pageId: String
+    val pageId: String,
+    val restoreSavedViewport: Boolean = true
 )
 
 enum class FixedPageScrollNavigationAction {
@@ -444,13 +448,17 @@ fun BookshelfScreen(
     fun openDefaultPageForNotebook(nb: NotebookEntity) {
         scope.launch {
             val pages = withContext(Dispatchers.IO) {
+                val viewportId = nb.lastViewportPageId
+                if (viewportId != null && database.pageDao().getPageById(viewportId) != null) {
+                    return@withContext viewportId
+                }
                 val existingId = nb.lastOpenedPageId
                 if (existingId != null && database.pageDao().getPageById(existingId) != null) {
                     return@withContext existingId
                 }
                 val fallbackExisting = database.pageDao().getPagesForNotebook(nb.id).firstOrNull()
                 if (fallbackExisting != null) {
-                    database.notebookDao().upsertNotebook(nb.copy(lastOpenedPageId = fallbackExisting.id))
+                    database.notebookDao().updateLastOpenedPageId(nb.id, fallbackExisting.id)
                     return@withContext fallbackExisting.id
                 }
                 val firstPage = PageEntity(
@@ -464,10 +472,16 @@ fun BookshelfScreen(
                     updatedAtEpochMs = System.currentTimeMillis()
                 )
                 database.pageDao().upsertPage(firstPage)
-                database.notebookDao().upsertNotebook(nb.copy(lastOpenedPageId = firstPage.id))
+                database.notebookDao().updateLastOpenedPageId(nb.id, firstPage.id)
                 firstPage.id
             }
-            onOpenSinglePage(OpenedPageTarget(notebookId = nb.id, pageId = pages))
+            onOpenSinglePage(
+                OpenedPageTarget(
+                    notebookId = nb.id,
+                    pageId = pages,
+                    restoreSavedViewport = true
+                )
+            )
         }
     }
 
@@ -892,7 +906,13 @@ fun BookshelfScreen(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .clickable {
-                                        onOpenSinglePage(OpenedPageTarget(hit.notebookId, hit.pageId))
+                                        onOpenSinglePage(
+                                            OpenedPageTarget(
+                                                notebookId = hit.notebookId,
+                                                pageId = hit.pageId,
+                                                restoreSavedViewport = false
+                                            )
+                                        )
                                     }
                             ) {
                                 Column(modifier = Modifier.padding(12.dp)) {
@@ -928,7 +948,13 @@ fun BookshelfScreen(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .clickable {
-                                            onOpenSinglePage(OpenedPageTarget(bm.notebookId, bm.pageId))
+                                            onOpenSinglePage(
+                                                OpenedPageTarget(
+                                                    notebookId = bm.notebookId,
+                                                    pageId = bm.pageId,
+                                                    restoreSavedViewport = false
+                                                )
+                                            )
                                         }
                                 ) {
                                     Row(
@@ -1341,7 +1367,7 @@ fun BookshelfScreen(
             allTags = allTags,
             attachedTags = tagsByNotebookId[nb.id].orEmpty(),
             onOpenPage = { pageId ->
-                val target = OpenedPageTarget(nb.id, pageId)
+                val target = OpenedPageTarget(nb.id, pageId, restoreSavedViewport = false)
                 inspectingNotebook = null
                 onOpenSinglePage(target)
             },
@@ -1365,7 +1391,13 @@ fun BookshelfScreen(
             onImported = { notebookId, firstPageId ->
                 showPdfImportDialog = false
                 pdfImportTargetNotebook = null
-                onOpenSinglePage(OpenedPageTarget(notebookId = notebookId, pageId = firstPageId))
+                onOpenSinglePage(
+                    OpenedPageTarget(
+                        notebookId = notebookId,
+                        pageId = firstPageId,
+                        restoreSavedViewport = false
+                    )
+                )
             },
             onDismiss = {
                 showPdfImportDialog = false
@@ -2209,10 +2241,22 @@ fun NotebookWorkspaceScreen(
         }
     }
 
+    val penToggleDebouncer = remember(target.notebookId) {
+        StylusToggleDebouncer(minIntervalMs = 180L)
+    }
+    var handledPenToggleTick by remember(target.notebookId) {
+        mutableLongStateOf(penButtonToggleTick)
+    }
+    fun togglePenOrEraserIfAllowed() {
+        if (!penToggleDebouncer.tryAcquireToggle(SystemClock.uptimeMillis())) return
+        val next = if (brushConfig.toolType.isEraser) lastDrawingTool else lastEraserTool
+        selectTool(next)
+    }
+
     LaunchedEffect(penButtonToggleTick) {
-        if (penButtonToggleTick > 0L) {
-            val next = if (brushConfig.toolType.isEraser) lastDrawingTool else lastEraserTool
-            selectTool(next)
+        if (penButtonToggleTick > handledPenToggleTick) {
+            handledPenToggleTick = penButtonToggleTick
+            togglePenOrEraserIfAllowed()
         }
     }
 
@@ -2262,10 +2306,7 @@ fun NotebookWorkspaceScreen(
                 },
                 onUpdateBrushConfig = ::updateActiveBrushConfig,
                 onSelectTool = ::selectTool,
-                onTogglePenEraser = {
-                    val next = if (brushConfig.toolType.isEraser) lastDrawingTool else lastEraserTool
-                    selectTool(next)
-                },
+                onTogglePenEraser = ::togglePenOrEraserIfAllowed,
                 onUpdateShapeDefaults = { w, c, fill ->
                     shapeStrokeWidthPt = w
                     shapeStrokeColorArgb = c
@@ -2430,6 +2471,9 @@ private fun NotebookPagePane(
     var observedFullScreen by remember { mutableStateOf(isFullScreenCanvas) }
     var isReadOnlyPage by remember(sessionKey) { mutableStateOf(false) }
     var hasHydratedPageContent by remember(sessionKey) { mutableStateOf(false) }
+    var hydratedPagesList by remember(sessionKey) { mutableStateOf<List<PageEntity>>(emptyList()) }
+    var loadedSavedViewportAnchor by remember(sessionKey) { mutableStateOf<SavedViewportAnchor?>(null) }
+    var viewportSaveTick by remember(sessionKey) { mutableLongStateOf(0L) }
 
     val pdfTileRenderer = remember(context) { PdfTileRenderer(context.filesDir) }
     val pdfExportManager = remember(context, pdfTileRenderer) {
@@ -2482,6 +2526,7 @@ private fun NotebookPagePane(
     val effectiveContinuousPages: List<PageEntity> = remember(
         isContinuousMultiPage,
         notebookPages,
+        hydratedPagesList,
         currentPageEntity,
         target.pageId
     ) {
@@ -2489,6 +2534,8 @@ private fun NotebookPagePane(
             emptyList()
         } else if (notebookPages.isNotEmpty()) {
             notebookPages.sortedBy { it.pageIndexInNotebook }
+        } else if (hydratedPagesList.isNotEmpty()) {
+            hydratedPagesList.sortedBy { it.pageIndexInNotebook }
         } else {
             listOfNotNull(currentPageEntity)
         }
@@ -2622,6 +2669,7 @@ private fun NotebookPagePane(
         syncZoomPercentFromMatrix()
         bumpOverlayTransformTickIfVisible()
         externalDrawTick++
+        if (hasHydratedPageContent && benchmarkStrokeCount == 0) viewportSaveTick++
     }
 
     fun fitPageToViewportNow(overridePaddingPx: Float? = null) {
@@ -2663,6 +2711,7 @@ private fun NotebookPagePane(
         syncZoomPercentFromMatrix()
         bumpOverlayTransformTickIfVisible()
         externalDrawTick++
+        if (hasHydratedPageContent && benchmarkStrokeCount == 0) viewportSaveTick++
     }
 
     fun viewportCenterWorkspacePoint(): DocPoint = if (viewportSize.width > 0 && viewportSize.height > 0) {
@@ -2966,6 +3015,22 @@ private fun NotebookPagePane(
         if (nb != null) {
             notebookTitle = nb.title
             onNotebookOcrLanguageLoaded(nb.ocrLanguage)
+            loadedSavedViewportAnchor = if (
+                target.restoreSavedViewport &&
+                nb.lastViewportPageId != null &&
+                nb.lastViewportCenterXPt != null &&
+                nb.lastViewportCenterYPt != null &&
+                nb.lastViewportZoomFactor != null
+            ) {
+                SavedViewportAnchor(
+                    pageId = nb.lastViewportPageId,
+                    localCenterXPt = nb.lastViewportCenterXPt,
+                    localCenterYPt = nb.lastViewportCenterYPt,
+                    relativeZoomFactor = nb.lastViewportZoomFactor
+                )
+            } else {
+                null
+            }
         }
         currentPageEntity = loadedOrCreatedPage
         pageNumber = loadedOrCreatedPage.pageIndexInNotebook + 1
@@ -2979,6 +3044,7 @@ private fun NotebookPagePane(
             val allPages = withContext(Dispatchers.IO) {
                 database.pageDao().getPagesForNotebook(target.notebookId)
             }.ifEmpty { listOf(loadedOrCreatedPage) }
+            hydratedPagesList = allPages
             val activeIdx = allPages.indexOfFirst { it.id == target.pageId }.let { if (it >= 0) it else 0 }
             continuousSessionManager.updatePagesAndFocus(allPages, activeIdx)
             externalDrawTick++
@@ -3070,6 +3136,58 @@ private fun NotebookPagePane(
     var switchedWithinWorkspace by remember(sessionKey) { mutableStateOf(false) }
     var deletedActivePageId by remember(sessionKey) { mutableStateOf<String?>(null) }
 
+    fun captureCurrentViewportAnchor(): SavedViewportAnchor? {
+        if (benchmarkStrokeCount > 0 || viewportSize.width <= 0 || viewportSize.height <= 0) return null
+        val layout = continuousLayout
+        if (isContinuousMultiPage && layout != null && !layout.isEmpty) {
+            val wsCenter = transformMatrix.screenToDoc(
+                viewportSize.width * 0.5f,
+                viewportSize.height * 0.5f
+            )
+            val slot = layout.findNearestSlotForViewportCenter(wsCenter.yPt)
+                ?: layout.slotForPageId(latestTargetPageId)
+                ?: layout.slots.firstOrNull()
+                ?: return null
+            return transformMatrix.capturePageLocalViewportAnchor(
+                pageId = slot.pageId,
+                pageOriginXPt = slot.leftPt,
+                pageOriginYPt = slot.topPt,
+                viewportWidthPx = viewportSize.width.toFloat(),
+                viewportHeightPx = viewportSize.height.toFloat()
+            )
+        }
+        val pageId = currentPageEntity?.id ?: latestTargetPageId
+        return transformMatrix.capturePageLocalViewportAnchor(
+            pageId = pageId,
+            pageOriginXPt = 0f,
+            pageOriginYPt = 0f,
+            viewportWidthPx = viewportSize.width.toFloat(),
+            viewportHeightPx = viewportSize.height.toFloat()
+        )
+    }
+
+    suspend fun persistCurrentViewportNow() {
+        if (benchmarkStrokeCount > 0 || !hasHydratedPageContent) return
+        val anchor = captureCurrentViewportAnchor() ?: return
+        if (deletedActivePageId == anchor.pageId) return
+        database.notebookDao().updateNotebookViewportState(
+            notebookId = target.notebookId,
+            lastOpenedPageId = anchor.pageId,
+            viewportPageId = anchor.pageId,
+            centerXPt = anchor.localCenterXPt,
+            centerYPt = anchor.localCenterYPt,
+            zoomFactor = anchor.relativeZoomFactor
+        )
+    }
+
+    LaunchedEffect(viewportSaveTick) {
+        if (viewportSaveTick <= 0L) return@LaunchedEffect
+        kotlinx.coroutines.delay(500L)
+        withContext(Dispatchers.IO) {
+            persistCurrentViewportNow()
+        }
+    }
+
     DisposableEffect(lifecycleOwner, sessionKey, benchmarkStrokeCount) {
         if (benchmarkStrokeCount > 0) {
             return@DisposableEffect onDispose {}
@@ -3081,7 +3199,8 @@ private fun NotebookPagePane(
                     val snapshotDirty = synchronized(dirtyContinuousPageIds) {
                         dirtyContinuousPageIds.toList().also { dirtyContinuousPageIds.clear() }
                     }
-                    CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+                    CoroutineScope(SupervisorJob() + Dispatchers.IO + NonCancellable).launch {
+                        persistCurrentViewportNow()
                         manager.flushAllJournals()
                         val now = System.currentTimeMillis()
                         for (dirtyId in snapshotDirty) {
@@ -3099,7 +3218,8 @@ private fun NotebookPagePane(
                 } else {
                     val journal = strokeJournal ?: return@LifecycleEventObserver
                     val hadLocalEdits = journal.consumeLocalMutationsFlag()
-                    CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+                    CoroutineScope(SupervisorJob() + Dispatchers.IO + NonCancellable).launch {
+                        persistCurrentViewportNow()
                         journal.flushAndSync()
                         BackgroundOcrWorker.enqueueForPage(context, target.pageId)
                         if (hadLocalEdits) {
@@ -3122,6 +3242,7 @@ private fun NotebookPagePane(
                     dirtyContinuousPageIds.toList().also { dirtyContinuousPageIds.clear() }
                 }
                 CoroutineScope(SupervisorJob() + Dispatchers.IO + NonCancellable).launch {
+                    persistCurrentViewportNow()
                     manager.flushAllJournals()
                     val now = System.currentTimeMillis()
                     for (dirtyId in snapshotDirty) {
@@ -3144,6 +3265,9 @@ private fun NotebookPagePane(
                 }
                 val shouldNotifyExit = !switchedWithinWorkspace
                 CoroutineScope(SupervisorJob() + Dispatchers.IO + NonCancellable).launch {
+                    if (shouldNotifyExit) {
+                        persistCurrentViewportNow()
+                    }
                     journal.close(compactBeforeClose = !journal.isReadOnly)
                     BackgroundOcrWorker.enqueueForPage(context, closingPageId)
                     if (shouldNotifyExit) {
@@ -3176,14 +3300,16 @@ private fun NotebookPagePane(
             }
             if (nextPageId != latestTargetPageId) {
                 coroutineScope.launch(Dispatchers.IO) {
-                    database.notebookDao().getNotebookById(target.notebookId)?.let { nb ->
-                        if (nb.lastOpenedPageId != nextPageId) {
-                            database.notebookDao().upsertNotebook(nb.copy(lastOpenedPageId = nextPageId))
-                        }
-                    }
+                    database.notebookDao().updateLastOpenedPageId(target.notebookId, nextPageId)
                 }
                 CloudSyncScheduler.onPageTransition(context)
-                onSelectPageTarget(OpenedPageTarget(target.notebookId, nextPageId))
+                onSelectPageTarget(
+                    OpenedPageTarget(
+                        notebookId = target.notebookId,
+                        pageId = nextPageId,
+                        restoreSavedViewport = target.restoreSavedViewport
+                    )
+                )
             }
             return
         }
@@ -3198,12 +3324,17 @@ private fun NotebookPagePane(
                 if (hadLocalEdits) {
                     database.pageDao().touchPageTimestamp(target.pageId, now)
                 }
-                database.notebookDao().getNotebookById(target.notebookId)?.let { nb ->
-                    database.notebookDao().upsertNotebook(nb.copy(lastOpenedPageId = nextPageId))
-                }
+                database.notebookDao().updateNotebookViewportState(
+                    notebookId = target.notebookId,
+                    lastOpenedPageId = nextPageId,
+                    viewportPageId = null,
+                    centerXPt = null,
+                    centerYPt = null,
+                    zoomFactor = null
+                )
             }
             CloudSyncScheduler.onPageTransition(context)
-            onSelectPageTarget(OpenedPageTarget(target.notebookId, nextPageId))
+            onSelectPageTarget(OpenedPageTarget(target.notebookId, nextPageId, restoreSavedViewport = false))
         }
     }
 
@@ -3349,8 +3480,15 @@ private fun NotebookPagePane(
                     }
                     val now = System.currentTimeMillis()
                     val nb = database.notebookDao().getNotebookById(target.notebookId)
-                    if (nb != null && nb.lastOpenedPageId == pageIdToDelete) {
-                        database.notebookDao().upsertNotebook(nb.copy(lastOpenedPageId = nextActive.id))
+                    if (nb != null && (nb.lastOpenedPageId == pageIdToDelete || nb.lastViewportPageId == pageIdToDelete)) {
+                        database.notebookDao().updateNotebookViewportState(
+                            notebookId = target.notebookId,
+                            lastOpenedPageId = nextActive.id,
+                            viewportPageId = null,
+                            centerXPt = null,
+                            centerYPt = null,
+                            zoomFactor = null
+                        )
                     }
                     database.deleteWithTombstone(SyncTombstoneEntity.TYPE_PAGE, pageIdToDelete)
                     val remaining = database.pageDao().getPagesForNotebook(target.notebookId)
@@ -3423,6 +3561,9 @@ private fun NotebookPagePane(
             onViewportTransformChanged = {
                 syncZoomPercentFromMatrix()
                 bumpOverlayTransformTickIfVisible()
+                if (hasHydratedPageContent && benchmarkStrokeCount == 0) {
+                    viewportSaveTick++
+                }
             },
             onLiveViewportTransformChanged = {
                 bumpOverlayTransformTickIfVisible()
@@ -3549,6 +3690,12 @@ private fun NotebookPagePane(
             singlePagePdfAssetId = currentPageEntity?.pdfAssetId,
             singlePagePdfPageIndex = currentPageEntity?.pdfPageIndex ?: 0,
             liveObjectInteractionController = liveObjectController,
+            isViewportMetadataReady = benchmarkStrokeCount > 0 || (
+                hasHydratedPageContent &&
+                    (!isContinuousMultiPage || (continuousLayout != null && !continuousLayout.isEmpty))
+                ),
+            savedViewportAnchor = loadedSavedViewportAnchor,
+            restoreSavedViewportOnInit = target.restoreSavedViewport,
             scrollToPageRequestId = scrollToPageRequestId,
             scrollToPageTargetLocalRect = scrollToPageTargetLocalRect,
             scrollToPageRequestTick = scrollToPageRequestTick,
@@ -3557,13 +3704,18 @@ private fun NotebookPagePane(
                     continuousSessionManager.updateActiveFocus(slot.pageIndex)
                     if (slot.pageId != latestTargetPageId) {
                         coroutineScope.launch(Dispatchers.IO) {
-                            database.notebookDao().getNotebookById(target.notebookId)?.let { nb ->
-                                if (nb.lastOpenedPageId != slot.pageId) {
-                                    database.notebookDao().upsertNotebook(nb.copy(lastOpenedPageId = slot.pageId))
-                                }
-                            }
+                            database.notebookDao().updateLastOpenedPageId(target.notebookId, slot.pageId)
                         }
-                        onSelectPageTarget(OpenedPageTarget(target.notebookId, slot.pageId))
+                        onSelectPageTarget(
+                            OpenedPageTarget(
+                                notebookId = target.notebookId,
+                                pageId = slot.pageId,
+                                restoreSavedViewport = target.restoreSavedViewport
+                            )
+                        )
+                    }
+                    if (hasHydratedPageContent && benchmarkStrokeCount == 0) {
+                        viewportSaveTick++
                     }
                 }
             },
@@ -3764,7 +3916,14 @@ private fun NotebookPagePane(
                 notebookTitle = notebookTitle,
                 zoomPercentProvider = { currentZoomPercent },
                 searchUiState = searchUiState,
-                onBackToShelf = onBackToShelf,
+                onBackToShelf = {
+                    coroutineScope.launch {
+                        withContext(Dispatchers.IO) {
+                            persistCurrentViewportNow()
+                        }
+                        onBackToShelf()
+                    }
+                },
                 onOpenCloudBackupDialog = { showCloudBackupDialog = true },
                 onCloudQuickSyncTriggered = { msg -> onShowWorkspaceBanner(msg) },
                 onZoomOut = { applyStepZoom(0.8f) },

@@ -482,6 +482,10 @@ fun SelectivePdfImportDialog(
                                         var firstCreatedPageId = ""
                                         resolvedIndices.forEachIndexed { offset, pdfPageIdx ->
                                             val pageId = UUID.randomUUID().toString()
+                                            val pageDims = imported.dimensionsForPage(pdfPageIdx)
+                                            val pagePreset = PageSizePreset.entries.firstOrNull {
+                                                it.dimensionsPt == pageDims
+                                            } ?: preset
                                             if (offset == 0) firstCreatedPageId = pageId
                                             if (offset == 0 && targetNotebook == null) {
                                                 database.notebookDao().upsertNotebook(
@@ -491,7 +495,7 @@ fun SelectivePdfImportDialog(
                                                         title = customNotebookTitle.trim().ifBlank { "Importált PDF" },
                                                         cover = NotebookCover(),
                                                         defaultCanvasMode = CanvasMode.FIXED_PAGE,
-                                                        defaultPageSizePreset = preset,
+                                                        defaultPageSizePreset = pagePreset,
                                                         defaultTemplateType = PaperTemplateType.BLANK,
                                                         ocrLanguage = OcrLanguageTag.HUNGARIAN,
                                                         lastOpenedPageId = pageId,
@@ -506,7 +510,7 @@ fun SelectivePdfImportDialog(
                                                     notebookId = notebookId,
                                                     pageIndexInNotebook = startOrderIndex + offset,
                                                     canvasMode = CanvasMode.FIXED_PAGE,
-                                                    pageSizePreset = preset,
+                                                    pageSizePreset = pagePreset,
                                                     templateType = PaperTemplateType.BLANK,
                                                     pdfAssetId = imported.pdfAssetId,
                                                     pdfPageIndex = pdfPageIdx,

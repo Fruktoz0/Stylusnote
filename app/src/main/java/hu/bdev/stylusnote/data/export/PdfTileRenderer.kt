@@ -46,8 +46,12 @@ data class ImportedPdfDocument(
     val pdfAssetId: String,
     val relativeFilePath: String,
     val pageCount: Int,
-    val firstPageDimensionsPt: PageDimensionsPt
-)
+    val firstPageDimensionsPt: PageDimensionsPt,
+    val perPageDimensionsPt: List<PageDimensionsPt> = emptyList()
+) {
+    fun dimensionsForPage(pageIndex: Int): PageDimensionsPt =
+        perPageDimensionsPt.getOrElse(pageIndex) { firstPageDimensionsPt }
+}
 
 data class PdfAspectFitPlacement(
     val scalePdfToDoc: Float,
@@ -149,18 +153,19 @@ class PdfTileRenderer(
                         destFile.delete()
                         throw IllegalArgumentException("A PDF dokumentum üres.")
                     }
-                    val firstDims = renderer.openPage(0).use { page ->
-                        when {
-                            page.width > page.height -> PageDimensionsPt.LANDSCAPE_16_10
-                            page.width <= 520 -> PageDimensionsPt.B5_ISO_PORTRAIT
-                            else -> PageDimensionsPt.A4_PORTRAIT
+                    val perPageDims = ArrayList<PageDimensionsPt>(pageCount)
+                    for (idx in 0 until pageCount) {
+                        val dims = renderer.openPage(idx).use { page ->
+                            classifyPdfPageDimensionsPt(page.width, page.height)
                         }
+                        perPageDims.add(dims)
                     }
                     ImportedPdfDocument(
                         pdfAssetId = pdfAssetId,
                         relativeFilePath = "$PDF_SUBDIR/$pdfAssetId.pdf",
                         pageCount = pageCount,
-                        firstPageDimensionsPt = firstDims
+                        firstPageDimensionsPt = perPageDims.first(),
+                        perPageDimensionsPt = perPageDims
                     )
                 }
             } catch (sec: SecurityException) {
@@ -559,6 +564,12 @@ class PdfTileRenderer(
         private const val MAX_TILE_DIMENSION_PX: Int = 2048
         private const val MAX_EXPORT_BITMAP_PX: Int = 3600
         private const val EXPORT_RASTER_SCALE: Float = 2.0f
+
+        fun classifyPdfPageDimensionsPt(width: Int, height: Int): PageDimensionsPt = when {
+            width > height -> PageDimensionsPt.LANDSCAPE_16_10
+            width <= 520 -> PageDimensionsPt.B5_ISO_PORTRAIT
+            else -> PageDimensionsPt.A4_PORTRAIT
+        }
 
         /**
          * Uniformly aspect-fits native PDF coordinates `(0..pdfPageWidth, 0..pdfPageHeight)` centered

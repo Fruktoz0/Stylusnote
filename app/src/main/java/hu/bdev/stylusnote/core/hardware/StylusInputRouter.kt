@@ -163,6 +163,7 @@ data class StylusMotionFrame<TEvent>(
     val eventTimeNanos: Long,
     val pointers: List<StylusPointerSnapshot>,
     val historyForActivePointer: List<RawScreenSample> = emptyList(),
+    val deviceMeta: StylusInputDeviceMeta? = null,
     val rawEvent: TEvent? = null
 )
 
@@ -332,7 +333,7 @@ class StylusInputRouter<TEvent>(
     private var prevNavCentroidXPx: Float = 0f
     private var prevNavCentroidYPx: Float = 0f
 
-    private var wasPrimaryStylusButtonPressed: Boolean = false
+    private var lastObservedStylusButtonMask: Int = 0
 
     val isStylusStrokeActive: Boolean
         get() = activeStrokePointerId != null && activeStrokeIsStylus
@@ -345,27 +346,58 @@ class StylusInputRouter<TEvent>(
     }
 
     /**
-     * Handles `KeyEvent.KEYCODE_STYLUS_BUTTON_PRIMARY` presses from the Focus Pen Pro.
+     * Handles standard Android stylus button keys (`KEYCODE_STYLUS_BUTTON_PRIMARY/SECONDARY/TERTIARY/TAIL`)
+     * and Focus Pen Pro HID button presses without reacting to key repeats.
      */
-    fun onKeyDown(keyCode: Int, repeatCount: Int = 0): Boolean {
-        if (keyCode == KeyEvent.KEYCODE_STYLUS_BUTTON_PRIMARY) {
-            if (repeatCount == 0) {
-                onTogglePenEraser()
-            }
-            return true
+    fun onKeyDown(
+        keyCode: Int,
+        repeatCount: Int = 0,
+        deviceMeta: StylusInputDeviceMeta? = null
+    ): Boolean {
+        val isStylusToggleKey = StylusHardwareShortcutDetector.shouldToggleEraserForKeyDown(
+            keyCode = keyCode,
+            repeatCount = 0,
+            deviceMeta = deviceMeta
+        )
+        if (!isStylusToggleKey) return false
+        if (repeatCount == 0) {
+            onTogglePenEraser()
         }
-        return false
+        return true
     }
 
     fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean =
-        onKeyDown(keyCode, event?.repeatCount ?: 0)
+        onKeyDown(
+            keyCode = keyCode,
+            repeatCount = event?.repeatCount ?: 0,
+            deviceMeta = event?.device?.toStylusDeviceMeta(event.source)
+        )
+
+    fun processGenericMotionButtonEvent(
+        actionMasked: Int,
+        actionButton: Int,
+        buttonState: Int,
+        deviceMeta: StylusInputDeviceMeta? = null
+    ): Boolean {
+        if (actionMasked == MotionEvent.ACTION_BUTTON_PRESS) {
+            if (StylusHardwareShortcutDetector.shouldToggleEraserForActionButtonPress(actionButton, deviceMeta)) {
+                lastObservedStylusButtonMask = buttonState
+                StylusShortcutDebugBus.recordMotionButtonEvent(actionButton, deviceMeta, matchedToggle = true)
+                onTogglePenEraser()
+                return true
+            }
+        } else if (actionMasked == MotionEvent.ACTION_BUTTON_RELEASE) {
+            lastObservedStylusButtonMask = buttonState
+        }
+        return false
+    }
 
     /**
      * Processes a touch or stylus [StylusMotionFrame].
      * Returns `true` if the frame was consumed by drawing, cancellation, or two-finger navigation.
      */
     fun processTouchFrame(frame: StylusMotionFrame<TEvent>): Boolean {
-        detectPrimaryStylusButtonEdge(frame.buttonState)
+        detectPrimaryStylusButtonEdge(frame.buttonState, frame.deviceMeta)
 
         val hasFlagCanceled = (frame.flags and MotionEvent.FLAG_CANCELED) != 0
         val isFullCancel = frame.action == StylusAction.CANCEL ||
@@ -490,7 +522,7 @@ class StylusInputRouter<TEvent>(
      * Hover cursor rendering is intentionally kept hidden (`isVisible = false`).
      */
     fun processHoverFrame(frame: StylusMotionFrame<TEvent>): Boolean {
-        detectPrimaryStylusButtonEdge(frame.buttonState)
+        detectPrimaryStylusButtonEdge(frame.buttonState, frame.deviceMeta)
 
         if (frame.action == StylusAction.HOVER_EXIT) {
             isStylusHovering = false
@@ -951,12 +983,20 @@ class StylusInputRouter<TEvent>(
         return false
     }
 
-    private fun detectPrimaryStylusButtonEdge(buttonState: Int) {
-        val isPressed = (buttonState and MotionEvent.BUTTON_STYLUS_PRIMARY) != 0
-        if (isPressed && !wasPrimaryStylusButtonPressed) {
+    private fun detectPrimaryStylusButtonEdge(
+        buttonState: Int,
+        deviceMeta: StylusInputDeviceMeta? = null
+    ) {
+        if (StylusHardwareShortcutDetector.hasNewlyPressedButton(
+                previousButtonState = lastObservedStylusButtonMask,
+                currentButtonState = buttonState,
+                deviceMeta = deviceMeta
+            )
+        ) {
+            StylusShortcutDebugBus.recordMotionButtonEvent(buttonState, deviceMeta, matchedToggle = true)
             onTogglePenEraser()
         }
-        wasPrimaryStylusButtonPressed = isPressed
+        lastObservedStylusButtonMask = buttonState
     }
 
     private fun cancelActiveStrokeOnly() {
@@ -1055,6 +1095,7 @@ private fun MotionEvent.toStylusMotionFrame(trackedPointerId: Int?): StylusMotio
         eventTimeNanos = eventTime * 1_000_000L,
         pointers = pointers,
         historyForActivePointer = historySamples,
+        deviceMeta = device.toStylusDeviceMeta(source),
         rawEvent = this
     )
 }
@@ -1080,3 +1121,11 @@ fun StylusInputRouter<MotionEvent>.onHoverEvent(event: MotionEvent): Boolean {
     val frame = event.toStylusMotionFrame(trackedPointerId = null)
     return processHoverFrame(frame)
 }
+
+fun StylusInputRouter<MotionEvent>.onGenericMotionEvent(event: MotionEvent): Boolean =
+    processGenericMotionButtonEvent(
+        actionMasked = event.actionMasked,
+        actionButton = event.actionButton,
+        buttonState = event.buttonState,
+        deviceMeta = event.device.toStylusDeviceMeta(event.source)
+    )

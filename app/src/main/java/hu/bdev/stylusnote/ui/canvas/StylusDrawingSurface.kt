@@ -6,6 +6,7 @@ import android.graphics.Canvas
 import android.graphics.Matrix
 import android.os.Handler
 import android.os.Looper
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.widget.FrameLayout
@@ -57,6 +58,7 @@ import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke as ComposeStroke
 import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -78,6 +80,7 @@ import hu.bdev.stylusnote.core.hardware.HoverCursorState
 import hu.bdev.stylusnote.core.hardware.StylusInputRouter
 import hu.bdev.stylusnote.core.hardware.StylusPointSample
 import hu.bdev.stylusnote.core.hardware.WetStrokeSink
+import hu.bdev.stylusnote.core.hardware.onGenericMotionEvent
 import hu.bdev.stylusnote.core.hardware.onHoverEvent
 import hu.bdev.stylusnote.core.hardware.onTouchEvent
 import hu.bdev.stylusnote.core.hardware.toStrokeInputBatch
@@ -89,6 +92,7 @@ import hu.bdev.stylusnote.core.math.DocRect
 import hu.bdev.stylusnote.core.math.OledStrokeRenderCache
 import hu.bdev.stylusnote.core.math.OneEuroFilter
 import hu.bdev.stylusnote.core.math.PageLayoutSlot
+import hu.bdev.stylusnote.core.math.SavedViewportAnchor
 import hu.bdev.stylusnote.core.math.ShapeRecognizer
 import hu.bdev.stylusnote.core.math.SpatialIndex
 import hu.bdev.stylusnote.core.math.toDocRect
@@ -327,6 +331,9 @@ fun StylusDrawingSurface(
     singlePagePdfAssetId: String? = null,
     singlePagePdfPageIndex: Int = 0,
     liveObjectInteractionController: LiveObjectInteractionController? = null,
+    isViewportMetadataReady: Boolean = true,
+    savedViewportAnchor: SavedViewportAnchor? = null,
+    restoreSavedViewportOnInit: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     val palette = LocalStylusSurfacePalette.current
@@ -541,6 +548,10 @@ fun StylusDrawingSurface(
             var latestSinglePagePdfAssetId: String? = singlePagePdfAssetId
             var latestSinglePagePdfPageIndex: Int = singlePagePdfPageIndex
             var latestLiveObjectController: LiveObjectInteractionController? = liveObjectInteractionController
+            var hasInitializedViewportFlag: Boolean = hasInitializedViewport
+            var latestIsViewportMetadataReady: Boolean = isViewportMetadataReady
+            var latestSavedViewportAnchor: SavedViewportAnchor? = savedViewportAnchor
+            var latestRestoreSavedViewport: Boolean = restoreSavedViewportOnInit
             var lastReportedActivePageId: String? = initialPageId
             var onTogglePenEraserCallback: () -> Unit = onTogglePenEraser
             var onMutatedCallback: () -> Unit = onCanvasStateMutated
@@ -576,6 +587,10 @@ fun StylusDrawingSurface(
         latestSinglePagePdfAssetId = singlePagePdfAssetId
         latestSinglePagePdfPageIndex = singlePagePdfPageIndex
         latestLiveObjectController = liveObjectInteractionController
+        hasInitializedViewportFlag = hasInitializedViewport
+        latestIsViewportMetadataReady = isViewportMetadataReady
+        latestSavedViewportAnchor = savedViewportAnchor
+        latestRestoreSavedViewport = restoreSavedViewportOnInit
         onTogglePenEraserCallback = onTogglePenEraser
         onMutatedCallback = onCanvasStateMutated
         onPageMutatedCallback = onPageMutated
@@ -1464,45 +1479,99 @@ fun StylusDrawingSurface(
     }
 
     suspend fun initializeViewportCameraAndCaches(size: IntSize) {
-        if (hasInitializedViewport || size.width <= 0 || size.height <= 0) return
+        if (hasInitializedViewport ||
+            !routerConfigHolder.latestIsViewportMetadataReady ||
+            size.width <= 0 ||
+            size.height <= 0
+        ) return
         val session = routerConfigHolder.latestMultiPageSession
         val layout = routerConfigHolder.latestMultiPageLayout
         val initPaperConfig = routerConfigHolder.latestPaperConfig
         val initPalette = routerConfigHolder.latestPalette
         val isOled = initPalette.isOledDeepBlack
-
-        if (session != null && layout != null && !layout.isEmpty) {
-            val startSlot = routerConfigHolder.latestInitialPageId?.let { layout.slotForPageId(it) }
-                ?: layout.slotAt(0)!!
-            transformMatrix.fitPageToViewport(
-                pageWidthPt = startSlot.widthPt,
-                pageHeightPt = startSlot.heightPt,
-                viewportWidthPx = size.width.toFloat(),
-                viewportHeightPx = size.height.toFloat(),
-                paddingPx = initialPagePaddingPx
-            )
-            val (panX, panY) = layout.computeCameraPanForSlot(
-                slot = startSlot,
-                scale = transformMatrix.scale,
-                viewportWidthPx = size.width.toFloat(),
-                viewportHeightPx = size.height.toFloat(),
-                verticalPaddingPx = initialPagePaddingPx
-            )
-            transformMatrix.setTransform(scale = transformMatrix.scale, panXPx = panX, panYPx = panY)
-            session.updateActiveFocus(startSlot.pageIndex)
-            routerConfigHolder.lastReportedActivePageId = startSlot.pageId
-            hasInitializedViewport = true
-            prewarmContinuousVisibleSlots(size.width, size.height, layout, session, initPalette)
+        val savedAnchor = if (routerConfigHolder.latestRestoreSavedViewport) {
+            routerConfigHolder.latestSavedViewportAnchor
         } else {
-            transformMatrix.fitPageToViewport(
-                pageWidthPt = initPaperConfig.pageDimensions.widthPt,
-                pageHeightPt = initPaperConfig.pageDimensions.heightPt,
-                viewportWidthPx = size.width.toFloat(),
-                viewportHeightPx = size.height.toFloat(),
-                paddingPx = initialPagePaddingPx
-            )
+            null
+        }
+
+        if (layout != null && !layout.isEmpty) {
+            val startSlot = savedAnchor?.pageId?.let { layout.slotForPageId(it) }
+                ?: routerConfigHolder.latestInitialPageId?.let { layout.slotForPageId(it) }
+                ?: layout.slotAt(0)!!
+            val restored = if (savedAnchor != null && savedAnchor.pageId == startSlot.pageId) {
+                transformMatrix.applySavedPageLocalViewport(
+                    pageOriginXPt = startSlot.leftPt,
+                    pageOriginYPt = startSlot.topPt,
+                    pageWidthPt = startSlot.widthPt,
+                    pageHeightPt = startSlot.heightPt,
+                    localCenterXPt = savedAnchor.localCenterXPt,
+                    localCenterYPt = savedAnchor.localCenterYPt,
+                    relativeZoomFactor = savedAnchor.relativeZoomFactor,
+                    viewportWidthPx = size.width.toFloat(),
+                    viewportHeightPx = size.height.toFloat(),
+                    paddingPx = initialPagePaddingPx
+                )
+            } else {
+                false
+            }
+            if (!restored) {
+                transformMatrix.fitPageToViewport(
+                    pageWidthPt = startSlot.widthPt,
+                    pageHeightPt = startSlot.heightPt,
+                    viewportWidthPx = size.width.toFloat(),
+                    viewportHeightPx = size.height.toFloat(),
+                    paddingPx = initialPagePaddingPx
+                )
+                val (panX, panY) = layout.computeCameraPanForSlot(
+                    slot = startSlot,
+                    scale = transformMatrix.scale,
+                    viewportWidthPx = size.width.toFloat(),
+                    viewportHeightPx = size.height.toFloat(),
+                    verticalPaddingPx = initialPagePaddingPx
+                )
+                transformMatrix.setTransform(scale = transformMatrix.scale, panXPx = panX, panYPx = panY)
+            }
+            session?.updateActiveFocus(startSlot.pageIndex)
+            routerConfigHolder.lastReportedActivePageId = startSlot.pageId
+            routerConfigHolder.onActiveSlotChangedCallback(startSlot)
+            hasInitializedViewport = true
+            routerConfigHolder.hasInitializedViewportFlag = true
+            if (session != null) {
+                prewarmContinuousVisibleSlots(size.width, size.height, layout, session, initPalette)
+            }
+        } else {
+            val initialPageIdSnap = routerConfigHolder.latestInitialPageId
+            val restoredSingle = if (savedAnchor != null &&
+                (initialPageIdSnap == null || savedAnchor.pageId == initialPageIdSnap)
+            ) {
+                transformMatrix.applySavedPageLocalViewport(
+                    pageOriginXPt = 0f,
+                    pageOriginYPt = 0f,
+                    pageWidthPt = initPaperConfig.pageDimensions.widthPt,
+                    pageHeightPt = initPaperConfig.pageDimensions.heightPt,
+                    localCenterXPt = savedAnchor.localCenterXPt,
+                    localCenterYPt = savedAnchor.localCenterYPt,
+                    relativeZoomFactor = savedAnchor.relativeZoomFactor,
+                    viewportWidthPx = size.width.toFloat(),
+                    viewportHeightPx = size.height.toFloat(),
+                    paddingPx = initialPagePaddingPx
+                )
+            } else {
+                false
+            }
+            if (!restoredSingle) {
+                transformMatrix.fitPageToViewport(
+                    pageWidthPt = initPaperConfig.pageDimensions.widthPt,
+                    pageHeightPt = initPaperConfig.pageDimensions.heightPt,
+                    viewportWidthPx = size.width.toFloat(),
+                    viewportHeightPx = size.height.toFloat(),
+                    paddingPx = initialPagePaddingPx
+                )
+            }
             dryInkRasterCache.syncInitialScale(transformMatrix.scale)
             hasInitializedViewport = true
+            routerConfigHolder.hasInitializedViewportFlag = true
             if (dryStrokeStore.spatialIndex.size > 0 || initPaperConfig.canvasMode == CanvasMode.FIXED_PAGE) {
                 val singlePdfId = routerConfigHolder.latestSinglePagePdfAssetId?.takeIf { it.isNotBlank() }
                 val pdfRenderer = routerConfigHolder.latestPdfTileRenderer
@@ -1533,6 +1602,7 @@ fun StylusDrawingSurface(
         dryDrawTick.longValue++
         dryCanvasViewRef?.invalidate()
         routerConfigHolder.onViewportTransformChangedCallback()
+        routerConfigHolder.onLiveViewportTransformChangedCallback()
     }
 
     LaunchedEffect(brushConfig.toolType) {
@@ -1568,8 +1638,18 @@ fun StylusDrawingSurface(
     LaunchedEffect(paperConfig) {
         dryDrawTick.longValue++
     }
-    LaunchedEffect(transformMatrix, paperConfig.pageDimensions, multiPageLayout, viewportSize) {
-        if (!hasInitializedViewport && viewportSize.width > 0 && viewportSize.height > 0) {
+    LaunchedEffect(
+        isViewportMetadataReady,
+        transformMatrix,
+        paperConfig.pageDimensions,
+        multiPageLayout,
+        viewportSize
+    ) {
+        if (!hasInitializedViewport &&
+            isViewportMetadataReady &&
+            viewportSize.width > 0 &&
+            viewportSize.height > 0
+        ) {
             initializeViewportCameraAndCaches(viewportSize)
         }
     }
@@ -1833,11 +1913,6 @@ fun StylusDrawingSurface(
             .onSizeChanged { size ->
                 viewportSize = size
                 onViewportSizeChanged(size)
-                if (!hasInitializedViewport && size.width > 0 && size.height > 0) {
-                    coroutineScope.launch {
-                        initializeViewportCameraAndCaches(size)
-                    }
-                }
             }
     ) {
         // Layers 1-4a (DryCanvasView) + Layer 4b (InProgressStrokesView wet front-buffer)
@@ -1998,15 +2073,31 @@ fun StylusDrawingSurface(
                     setOnHoverListener { _, event ->
                         router.onHoverEvent(event)
                     }
+                    setOnGenericMotionListener { _, event ->
+                        router.onGenericMotionEvent(event)
+                    }
+                    isFocusable = true
+                    isFocusableInTouchMode = true
+                    setOnKeyListener { _, keyCode, event ->
+                        if (event?.action == KeyEvent.ACTION_DOWN) {
+                            router.onKeyDown(keyCode, event)
+                        } else {
+                            false
+                        }
+                    }
                 }
 
-                dryCanvasView.onDrawCallback = { canvas ->
+                dryCanvasView.onDrawCallback = drawCallback@{ canvas ->
                     val paperCfg = routerConfigHolder.latestPaperConfig
                     val pal = routerConfigHolder.latestPalette
                     val isOled = pal.isOledDeepBlack
                     val vpW = dryCanvasView.width
                     val vpH = dryCanvasView.height
                     if (vpW > 0 && vpH > 0) {
+                        if (!routerConfigHolder.hasInitializedViewportFlag) {
+                            canvas.drawColor(pal.deskBackground.toArgb())
+                            return@drawCallback
+                        }
                         val session = routerConfigHolder.latestMultiPageSession
                         val layout = routerConfigHolder.latestMultiPageLayout
                         val pdfRenderer = routerConfigHolder.latestPdfTileRenderer

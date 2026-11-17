@@ -187,3 +187,17 @@ flowchart LR
     AI1["ConsentDialog: Gemini API-kulcs & Modellek"] --> AI2["GeminiApiSupport (sanitizeApiKey + X-Android-* fejléc + érthető REST hiba) → ModelCatalog /v1beta/models"]
 ```
 
+---
+
+## 12. PDF Központosítás, Pontos Oldal- és Szakasz-Visszatöltés & Focus Pen Gombváltás
+
+```mermaid
+flowchart LR
+    OPEN["Füzet / PDF megnyitása"] --> META["Room oldallista & utolsó viewport horgony betöltése (isViewportMetadataReady)"]
+    META --> SPLIT{"Friss PDF import / ugrás vagy visszatérés?"}
+    SPLIT -- Friss PDF / cél-ugrás --> FIT["StartSlot oldalméret alapján középre igazított fitPageToViewport (vegyes PDF-hez classifyPdfPageDimensionsPt)"]
+    SPLIT -- Utoljára bezárt jegyzet --> REST["SavedViewportAnchor → applySavedPageLocalViewport (pontos oldal + lokális közép + zoom)"]
+    MOVE["Görgetés / zoom / ON_PAUSE / Vissza"] --> SAVE["capturePageLocalViewportAnchor → NotebookDao.updateNotebookViewportState (updatedAtEpochMs érintetlenül)"]
+    PEN["Stylus gomb / Focus Pen Pro 0x0022:0x5081"] --> DET["StylusHardwareShortcutDetector + StylusToggleDebouncer (180 ms) → Toll ↔ Radír + Debug HUD napló"]
+```
+

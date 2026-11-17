@@ -11,6 +11,7 @@ import android.view.Choreographer
 import android.view.Display
 import android.view.FrameMetrics
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
 import android.view.Window
 import android.view.WindowManager
@@ -31,6 +32,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.ui.platform.LocalView
+import hu.bdev.stylusnote.core.hardware.StylusHardwareShortcutDetector
+import hu.bdev.stylusnote.core.hardware.StylusShortcutDebugBus
+import hu.bdev.stylusnote.core.hardware.toStylusDeviceMeta
 import hu.bdev.stylusnote.core.telemetry.FrameTimingAccumulator
 import hu.bdev.stylusnote.core.telemetry.FrameTimingSnapshot
 import androidx.compose.runtime.Composable
@@ -73,6 +77,7 @@ class MainActivity : ComponentActivity() {
     private var lockedRefreshRateHz by mutableFloatStateOf(60f)
     private var reportedRefreshRateHz by mutableFloatStateOf(60f)
     private var penButtonToggleTick by mutableLongStateOf(0L)
+    private var isNotebookWorkspaceActive by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -99,7 +104,8 @@ class MainActivity : ComponentActivity() {
                     onToggleDebugOverlay = { showDebugOverlay = !showDebugOverlay },
                     lockedRefreshRateHz = lockedRefreshRateHz,
                     reportedRefreshRateHz = reportedRefreshRateHz,
-                    currentDisplayHzProvider = { resolveActiveDisplay()?.refreshRate ?: reportedRefreshRateHz }
+                    currentDisplayHzProvider = { resolveActiveDisplay()?.refreshRate ?: reportedRefreshRateHz },
+                    onWorkspaceActiveChanged = { isActive -> isNotebookWorkspaceActive = isActive }
                 )
             }
         }
@@ -138,12 +144,68 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Focus Pen Pro primary button hook: toggles between the active brush and the most
-     * recently used eraser without reacting to key repeats.
+     * Focus Pen Pro button / pinch hook: intercepts standard Android stylus buttons (`PRIMARY`,
+     * `SECONDARY`, `TERTIARY`, `TAIL`) and Xiaomi Focus Pen Pro HID events (`Vendor 0x0022 /
+     * Product 0x5081`) before view focus consumes them.
      */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN) {
+            val deviceMeta = event.device.toStylusDeviceMeta(event.source)
+            val isStylusToggleKey = StylusHardwareShortcutDetector.shouldToggleEraserForKeyDown(
+                keyCode = event.keyCode,
+                repeatCount = 0,
+                deviceMeta = deviceMeta
+            )
+            val matchedToggle = isStylusToggleKey && event.repeatCount == 0
+            if (StylusShortcutDebugBus.captureEnabled &&
+                event.repeatCount == 0 &&
+                (matchedToggle || StylusHardwareShortcutDetector.isXiaomiFocusPenOrStylusDevice(deviceMeta))
+            ) {
+                StylusShortcutDebugBus.recordKeyEvent(event.keyCode, deviceMeta, matchedToggle)
+            }
+            if (isNotebookWorkspaceActive && isStylusToggleKey) {
+                if (event.repeatCount == 0) {
+                    penButtonToggleTick++
+                }
+                return true
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_BUTTON_PRESS) {
+            val deviceMeta = ev.device.toStylusDeviceMeta(ev.source)
+            val matchedToggle = StylusHardwareShortcutDetector.shouldToggleEraserForActionButtonPress(
+                actionButton = ev.actionButton,
+                deviceMeta = deviceMeta
+            )
+            if (StylusShortcutDebugBus.captureEnabled &&
+                (matchedToggle || StylusHardwareShortcutDetector.isXiaomiFocusPenOrStylusDevice(deviceMeta))
+            ) {
+                StylusShortcutDebugBus.recordMotionButtonEvent(ev.actionButton, deviceMeta, matchedToggle)
+            }
+            if (isNotebookWorkspaceActive && matchedToggle) {
+                penButtonToggleTick++
+                return true
+            }
+        }
+        return super.dispatchGenericMotionEvent(ev)
+    }
+
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if (keyCode == KeyEvent.KEYCODE_STYLUS_BUTTON_PRIMARY && event?.repeatCount == 0) {
-            penButtonToggleTick++
+        val deviceMeta = event?.device?.toStylusDeviceMeta(event.source)
+        val repeatCount = event?.repeatCount ?: 0
+        if (isNotebookWorkspaceActive &&
+            StylusHardwareShortcutDetector.shouldToggleEraserForKeyDown(
+                keyCode = keyCode,
+                repeatCount = 0,
+                deviceMeta = deviceMeta
+            )
+        ) {
+            if (repeatCount == 0) {
+                penButtonToggleTick++
+            }
             return true
         }
         return super.onKeyDown(keyCode, event)
@@ -203,7 +265,8 @@ private fun StylusNoteAppRoot(
     onToggleDebugOverlay: () -> Unit,
     lockedRefreshRateHz: Float,
     reportedRefreshRateHz: Float,
-    currentDisplayHzProvider: () -> Float
+    currentDisplayHzProvider: () -> Float,
+    onWorkspaceActiveChanged: (Boolean) -> Unit
 ) {
     val context = LocalContext.current
     val database = remember(context) { AppDatabase.getInstance(context.applicationContext) }
@@ -258,6 +321,9 @@ private fun StylusNoteAppRoot(
 
     Box(modifier = Modifier.fillMaxSize()) {
         val activePrimary = primaryTarget
+        LaunchedEffect(activePrimary) {
+            onWorkspaceActiveChanged(activePrimary != null)
+        }
         if (activePrimary == null) {
             BookshelfScreen(
                 database = database,
@@ -362,6 +428,13 @@ private fun FrameDebugOverlay(
                 style = MaterialTheme.typography.labelSmall,
                 color = statusColor
             )
+            StylusShortcutDebugBus.currentSummary()?.let { penDiag ->
+                Text(
+                    text = penDiag,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.secondary
+                )
+            }
         }
     }
 }
@@ -413,7 +486,10 @@ private fun rememberFrameTimingStats(
     val hostWindow = findHostWindow(LocalView.current.context)
 
     DisposableEffect(enabled, hostWindow, lockedRefreshRateHz, reportedRefreshRateHz) {
-        if (!enabled) return@DisposableEffect onDispose {}
+        StylusShortcutDebugBus.captureEnabled = enabled
+        if (!enabled) return@DisposableEffect onDispose {
+            StylusShortcutDebugBus.captureEnabled = false
+        }
 
         val accumulator = FrameTimingAccumulator()
         val choreographer = Choreographer.getInstance()
@@ -449,6 +525,7 @@ private fun rememberFrameTimingStats(
 
         choreographer.postFrameCallback(callback)
         onDispose {
+            StylusShortcutDebugBus.captureEnabled = false
             choreographer.removeFrameCallback(callback)
             hostWindow?.let { w ->
                 runCatching { w.removeOnFrameMetricsAvailableListener(metricsListener) }

@@ -114,6 +114,10 @@ data class NotebookEntity(
     val ocrLanguage: OcrLanguageTag = OcrLanguageTag.HUNGARIAN,
     val isFavorite: Boolean = false,
     val lastOpenedPageId: String? = null,
+    val lastViewportPageId: String? = null,
+    val lastViewportCenterXPt: Float? = null,
+    val lastViewportCenterYPt: Float? = null,
+    val lastViewportZoomFactor: Float? = null,
     val createdAtEpochMs: Long,
     val updatedAtEpochMs: Long
 )
@@ -393,6 +397,29 @@ interface NotebookDao {
     @Update
     suspend fun updateNotebook(notebook: NotebookEntity)
 
+    @Query("UPDATE notebooks SET lastOpenedPageId = :lastOpenedPageId WHERE id = :notebookId")
+    suspend fun updateLastOpenedPageId(notebookId: String, lastOpenedPageId: String?)
+
+    @Query(
+        """
+        UPDATE notebooks
+        SET lastOpenedPageId = :lastOpenedPageId,
+            lastViewportPageId = :viewportPageId,
+            lastViewportCenterXPt = :centerXPt,
+            lastViewportCenterYPt = :centerYPt,
+            lastViewportZoomFactor = :zoomFactor
+        WHERE id = :notebookId
+        """
+    )
+    suspend fun updateNotebookViewportState(
+        notebookId: String,
+        lastOpenedPageId: String?,
+        viewportPageId: String?,
+        centerXPt: Float?,
+        centerYPt: Float?,
+        zoomFactor: Float?
+    )
+
     @Query("DELETE FROM notebooks WHERE id = :notebookId")
     suspend fun deleteNotebookById(notebookId: String)
 }
@@ -610,7 +637,7 @@ interface SyncMetadataDao {
         SyncTombstoneEntity::class,
         CloudSyncedAssetEntity::class
     ],
-    version = 3,
+    version = 4,
     exportSchema = true
 )
 @TypeConverters(StylusNoteDatabaseConverters::class)
@@ -703,9 +730,21 @@ abstract class AppDatabase : RoomDatabase() {
         }
 
         /**
-         * Explicit forward migration registry (`v1 -> v2 -> v3`). Destructive fallback is never enabled.
+         * Adds saved viewport center/zoom anchor columns onto `notebooks` for v4.
          */
-        val ALL_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_1_2, MIGRATION_2_3)
+        val MIGRATION_3_4: Migration = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE notebooks ADD COLUMN lastViewportPageId TEXT")
+                db.execSQL("ALTER TABLE notebooks ADD COLUMN lastViewportCenterXPt REAL")
+                db.execSQL("ALTER TABLE notebooks ADD COLUMN lastViewportCenterYPt REAL")
+                db.execSQL("ALTER TABLE notebooks ADD COLUMN lastViewportZoomFactor REAL")
+            }
+        }
+
+        /**
+         * Explicit forward migration registry (`v1 -> v2 -> v3 -> v4`). Destructive fallback is never enabled.
+         */
+        val ALL_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
 
         @Volatile
         private var instance: AppDatabase? = null

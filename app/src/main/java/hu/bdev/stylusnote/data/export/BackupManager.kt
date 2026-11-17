@@ -60,7 +60,8 @@ data class BackupManifest(
     companion object {
         const val MANIFEST_VERSION_V1: Int = 1
         const val MANIFEST_VERSION_V2: Int = 2
-        const val CURRENT_MANIFEST_VERSION: Int = MANIFEST_VERSION_V2
+        const val MANIFEST_VERSION_V3: Int = 3
+        const val CURRENT_MANIFEST_VERSION: Int = MANIFEST_VERSION_V3
         const val DEFAULT_APP_VERSION: String = "0.1.0-alpha"
     }
 }
@@ -133,6 +134,12 @@ class BackupManager(
             writeUtf(out, conv.fromOcrLanguageTag(nb.ocrLanguage))
             out.writeBoolean(nb.isFavorite)
             writeNullableUtf(out, nb.lastOpenedPageId)
+            if (manifest.formatVersion >= BackupManifest.MANIFEST_VERSION_V3) {
+                writeNullableUtf(out, nb.lastViewportPageId)
+                writeNullableFloat(out, nb.lastViewportCenterXPt)
+                writeNullableFloat(out, nb.lastViewportCenterYPt)
+                writeNullableFloat(out, nb.lastViewportZoomFactor)
+            }
             out.writeLong(nb.createdAtEpochMs)
             out.writeLong(nb.updatedAtEpochMs)
         }
@@ -265,6 +272,26 @@ class BackupManager(
                     ocrLanguage = conv.toOcrLanguageTag(readUtf(input)),
                     isFavorite = input.readBoolean(),
                     lastOpenedPageId = readNullableUtf(input),
+                    lastViewportPageId = if (formatVersion >= BackupManifest.MANIFEST_VERSION_V3) {
+                        readNullableUtf(input)
+                    } else {
+                        null
+                    },
+                    lastViewportCenterXPt = if (formatVersion >= BackupManifest.MANIFEST_VERSION_V3) {
+                        readNullableFloat(input)
+                    } else {
+                        null
+                    },
+                    lastViewportCenterYPt = if (formatVersion >= BackupManifest.MANIFEST_VERSION_V3) {
+                        readNullableFloat(input)
+                    } else {
+                        null
+                    },
+                    lastViewportZoomFactor = if (formatVersion >= BackupManifest.MANIFEST_VERSION_V3) {
+                        readNullableFloat(input)
+                    } else {
+                        null
+                    },
                     createdAtEpochMs = input.readLong(),
                     updatedAtEpochMs = input.readLong()
                 )
@@ -793,6 +820,18 @@ class BackupManager(
 
     private fun readNullableUtf(input: DataInputStream): String? =
         if (input.readBoolean()) readUtf(input) else null
+
+    private fun writeNullableFloat(out: DataOutputStream, value: Float?) {
+        if (value == null || !value.isFinite()) {
+            out.writeBoolean(false)
+        } else {
+            out.writeBoolean(true)
+            out.writeFloat(value)
+        }
+    }
+
+    private fun readNullableFloat(input: DataInputStream): Float? =
+        if (input.readBoolean()) input.readFloat().takeIf { it.isFinite() } else null
 
     companion object {
         const val MANIFEST_ENTRY_NAME: String = "manifest.bin"
