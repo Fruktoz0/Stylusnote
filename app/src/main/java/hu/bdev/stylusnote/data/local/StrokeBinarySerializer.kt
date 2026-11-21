@@ -7,6 +7,7 @@ import androidx.ink.storage.encode
 import androidx.ink.brush.InputToolType
 import androidx.ink.strokes.Stroke
 import androidx.ink.strokes.StrokeInputBatch
+import hu.bdev.stylusnote.core.code.CodeLanguage
 import hu.bdev.stylusnote.core.hardware.PressureCurve
 import hu.bdev.stylusnote.core.hardware.StylusPointSample
 import hu.bdev.stylusnote.core.hardware.toStrokeInputBatch
@@ -17,6 +18,7 @@ import hu.bdev.stylusnote.core.math.ShapeMeta
 import hu.bdev.stylusnote.domain.model.AffineTransform2D
 import hu.bdev.stylusnote.domain.model.BrushConfig
 import hu.bdev.stylusnote.domain.model.BrushToolType
+import hu.bdev.stylusnote.domain.model.ClozeTapePattern
 import hu.bdev.stylusnote.domain.model.PageObject
 import hu.bdev.stylusnote.domain.model.PersistedStrokeRecord
 import hu.bdev.stylusnote.domain.model.StrokeLayerType
@@ -47,6 +49,9 @@ object StrokeBinarySerializer {
     private const val OBJECT_TAG_FORMATTED_TEXT: Int = 5
     private const val OBJECT_TAG_GEOMETRIC_SHAPE: Int = 6
     private const val OBJECT_TAG_IMAGE: Int = 7
+    private const val OBJECT_TAG_CODE_BLOCK: Int = 8
+    private const val OBJECT_TAG_CLOZE_TAPE: Int = 9
+    private const val OBJECT_TAG_TABLE: Int = 10
 
     fun encodeStrokeRecord(record: PersistedStrokeRecord): ByteArray {
         val baos = ByteArrayOutputStream(256)
@@ -283,6 +288,9 @@ object StrokeBinarySerializer {
             is PageObject.FormattedTextObject -> OBJECT_TAG_FORMATTED_TEXT
             is PageObject.GeometricShapeObject -> OBJECT_TAG_GEOMETRIC_SHAPE
             is PageObject.ImageObject -> OBJECT_TAG_IMAGE
+            is PageObject.CodeBlockObject -> OBJECT_TAG_CODE_BLOCK
+            is PageObject.ClozeTapeObject -> OBJECT_TAG_CLOZE_TAPE
+            is PageObject.TableObject -> OBJECT_TAG_TABLE
         }
         out.writeByte(tag)
         writeIdentifier(out, obj.id)
@@ -350,6 +358,27 @@ object StrokeBinarySerializer {
             is PageObject.ImageObject -> {
                 writeUtfString(out, obj.imageAssetRelativePath)
                 out.writeFloat(obj.rotationRadians)
+            }
+            is PageObject.CodeBlockObject -> {
+                writeUtfString(out, obj.language.name)
+                writeUtfString(out, obj.codeText)
+                out.writeFloat(obj.fontSizePt)
+                writeUtfString(out, obj.title)
+                out.writeBoolean(obj.showLineNumbers)
+                out.writeFloat(obj.rotationRadians)
+            }
+            is PageObject.ClozeTapeObject -> {
+                out.writeInt(obj.canonicalColorArgb)
+                writeUtfString(out, obj.patternStyle.name)
+                out.writeFloat(obj.rotationRadians)
+                writeUtfString(out, obj.label)
+            }
+            is PageObject.TableObject -> {
+                out.writeInt(obj.rows)
+                out.writeInt(obj.columns)
+                out.writeFloat(obj.borderStrokeWidthPt)
+                out.writeInt(obj.canonicalBorderColorArgb)
+                out.writeBoolean(obj.hasHeaderRow)
             }
         }
 
@@ -483,6 +512,61 @@ object StrokeBinarySerializer {
                     bounds = bounds,
                     imageAssetRelativePath = assetPath,
                     rotationRadians = rotationRadians
+                )
+            }
+            OBJECT_TAG_CODE_BLOCK -> {
+                val languageName = readUtfString(input)
+                val language = CodeLanguage.fromNameOrNull(languageName) ?: CodeLanguage.PYTHON
+                val codeText = readUtfString(input)
+                val fontSizePt = input.readFloat()
+                val title = readUtfString(input)
+                val showLineNumbers = input.readBoolean()
+                val rotationRadians = input.readFloat()
+                PageObject.CodeBlockObject(
+                    id = id,
+                    zOrder = zOrder,
+                    bounds = bounds,
+                    language = language,
+                    codeText = codeText,
+                    fontSizePt = fontSizePt,
+                    title = title,
+                    showLineNumbers = showLineNumbers,
+                    rotationRadians = rotationRadians
+                )
+            }
+            OBJECT_TAG_CLOZE_TAPE -> {
+                val canonicalColorArgb = input.readInt()
+                val patternName = readUtfString(input)
+                val patternStyle = runCatching {
+                    ClozeTapePattern.valueOf(patternName)
+                }.getOrDefault(ClozeTapePattern.DIAGONAL_STRIPES)
+                val rotationRadians = input.readFloat()
+                val label = readUtfString(input)
+                PageObject.ClozeTapeObject(
+                    id = id,
+                    zOrder = zOrder,
+                    bounds = bounds,
+                    canonicalColorArgb = canonicalColorArgb,
+                    patternStyle = patternStyle,
+                    rotationRadians = rotationRadians,
+                    label = label
+                )
+            }
+            OBJECT_TAG_TABLE -> {
+                val rows = input.readInt().coerceIn(PageObject.TableObject.MIN_ROWS, PageObject.TableObject.MAX_ROWS)
+                val cols = input.readInt().coerceIn(PageObject.TableObject.MIN_COLS, PageObject.TableObject.MAX_COLS)
+                val strokeWidthPt = input.readFloat().coerceIn(0.4f, 6f)
+                val borderColor = input.readInt()
+                val hasHeader = input.readBoolean()
+                PageObject.TableObject(
+                    id = id,
+                    zOrder = zOrder,
+                    bounds = bounds,
+                    rows = rows,
+                    columns = cols,
+                    borderStrokeWidthPt = strokeWidthPt,
+                    canonicalBorderColorArgb = borderColor,
+                    hasHeaderRow = hasHeader
                 )
             }
             else -> throw IOException("Unknown PageObject tag: $tag")

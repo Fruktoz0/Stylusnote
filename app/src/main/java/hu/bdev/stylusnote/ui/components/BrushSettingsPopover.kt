@@ -73,7 +73,9 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -83,6 +85,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
@@ -95,8 +98,11 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import hu.bdev.stylusnote.core.hardware.PressureCurve
+import hu.bdev.stylusnote.core.math.DocRect
 import hu.bdev.stylusnote.domain.model.BrushConfig
 import hu.bdev.stylusnote.domain.model.BrushToolType
+import hu.bdev.stylusnote.domain.model.ClozeTapePattern
+import hu.bdev.stylusnote.ui.canvas.ClozeTapeCanvasRenderer
 import hu.bdev.stylusnote.ui.theme.LocalStylusSurfacePalette
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
@@ -229,8 +235,9 @@ private val QUICK_COLOR_PALETTE = listOf(
     0xFFFACC15.toInt()
 )
 
-private val QUICK_SIZE_PRESETS_PT = listOf(1.0f, 2.0f, 4.0f, 8.0f)
+private val QUICK_SIZE_PRESETS_PT = listOf(0.5f, 1.0f, 2.0f, 4.0f, 8.0f)
 private val QUICK_HIGHLIGHTER_SIZE_PRESETS_PT = listOf(8.0f, 12.0f, 16.0f, 24.0f)
+private val QUICK_CLOZE_HEIGHT_PRESETS_PT = listOf(12.0f, 18.0f, 24.0f, 34.0f)
 private val QUICK_ERASER_RADII_DP = listOf(12f, 20f, 32f, 44f)
 
 /**
@@ -321,6 +328,13 @@ fun BrushSettingsPopover(
     presets: List<BrushConfig>,
     anchorBoundsPx: Rect = Rect.Zero,
     viewportSize: IntSize = IntSize.Zero,
+    highlighterAutoSize: Boolean = true,
+    onToggleHighlighterAutoSize: (Boolean) -> Unit = {},
+    clozeTapePattern: ClozeTapePattern = ClozeTapePattern.DIAGONAL_STRIPES,
+    onClozeTapePatternChange: (ClozeTapePattern) -> Unit = {},
+    revealedClozeCount: Int = 0,
+    totalClozeCount: Int = 0,
+    onToggleRevealAllCloze: (Boolean) -> Unit = {},
     onConfigChange: (BrushConfig) -> Unit,
     onSavePresetSlot: (Int, BrushConfig) -> Unit,
     onApplyPreset: (BrushConfig) -> Unit,
@@ -546,7 +560,10 @@ fun BrushSettingsPopover(
                         }
 
                         // Compact Live Stroke Preview
-                        LiveBrushPreviewCard(config = currentConfig)
+                        LiveBrushPreviewCard(
+                            config = currentConfig,
+                            clozeTapePattern = clozeTapePattern
+                        )
 
                         if (currentConfig.toolType.isEraser) {
                             StudioSectionCard {
@@ -607,16 +624,190 @@ fun BrushSettingsPopover(
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
+                        } else if (currentConfig.toolType == BrushToolType.CLOZE_TAPE) {
+                            StudioSectionCard {
+                                SettingSliderHeader(
+                                    title = "Szalag magasság",
+                                    valueBadge = "${"%.0f".format(java.util.Locale.US, currentConfig.clampedSizePt)} pt"
+                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    QUICK_CLOZE_HEIGHT_PRESETS_PT.forEach { presetPt ->
+                                        val isSelected = kotlin.math.abs(currentConfig.clampedSizePt - presetPt) < 1.2f
+                                        Surface(
+                                            onClick = { onConfigChange(currentConfig.copy(sizePt = presetPt)) },
+                                            shape = RoundedCornerShape(10.dp),
+                                            color = if (isSelected) {
+                                                surfacePalette.activePillBackground
+                                            } else {
+                                                MaterialTheme.colorScheme.surface
+                                            },
+                                            border = if (isSelected) {
+                                                BorderStroke(1.25.dp, MaterialTheme.colorScheme.primary)
+                                            } else null,
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .height(32.dp)
+                                        ) {
+                                            Box(contentAlignment = Alignment.Center) {
+                                                Text(
+                                                    text = "${presetPt.toInt()}pt",
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                                Slider(
+                                    value = currentConfig.clampedSizePt.coerceIn(8f, 48f),
+                                    onValueChange = { nextSize ->
+                                        onConfigChange(currentConfig.copy(sizePt = nextSize))
+                                    },
+                                    valueRange = 8f..48f
+                                )
+                            }
+
+                            StudioSectionCard {
+                                SettingSliderHeader(
+                                    title = "Szalag mintázat",
+                                    valueBadge = clozeTapePattern.displayNameHu
+                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    ClozeTapePattern.entries.forEach { pattern ->
+                                        val isSelected = pattern == clozeTapePattern
+                                        Surface(
+                                            onClick = { onClozeTapePatternChange(pattern) },
+                                            shape = RoundedCornerShape(10.dp),
+                                            color = if (isSelected) {
+                                                surfacePalette.activePillBackground
+                                            } else {
+                                                MaterialTheme.colorScheme.surface
+                                            },
+                                            border = if (isSelected) {
+                                                BorderStroke(1.25.dp, MaterialTheme.colorScheme.primary)
+                                            } else null,
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .height(34.dp)
+                                        ) {
+                                            Box(contentAlignment = Alignment.Center) {
+                                                Text(
+                                                    text = pattern.displayNameHu,
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    maxLines = 1,
+                                                    color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+
+                                HorizontalDivider(
+                                    modifier = Modifier.padding(vertical = 2.dp),
+                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+                                )
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = "Szalagok az oldalon",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    Text(
+                                        text = "$revealedClozeCount / $totalClozeCount felfedve",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+
+                                val shouldRevealAll = revealedClozeCount < totalClozeCount
+                                Surface(
+                                    onClick = {
+                                        if (totalClozeCount > 0) {
+                                            onToggleRevealAllCloze(shouldRevealAll)
+                                        }
+                                    },
+                                    enabled = totalClozeCount > 0,
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = if (totalClozeCount > 0) {
+                                        surfacePalette.activePillBackground
+                                    } else {
+                                        MaterialTheme.colorScheme.surface.copy(alpha = 0.55f)
+                                    },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(36.dp)
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Text(
+                                            text = if (shouldRevealAll || totalClozeCount == 0) {
+                                                "Összes szalag felfedése"
+                                            } else {
+                                                "Összes szalag visszazárása"
+                                            },
+                                            style = MaterialTheme.typography.labelMedium,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = if (totalClozeCount > 0) {
+                                                MaterialTheme.colorScheme.primary
+                                            } else {
+                                                MaterialTheme.colorScheme.onSurfaceVariant
+                                            }
+                                        )
+                                    }
+                                }
+                            }
                         } else {
                             // Stage 1 Essential 1: Quick Thickness Pills + Slider
                             StudioSectionCard {
                                 SettingSliderHeader(
                                     title = "Vastagság",
-                                    valueBadge = "${"%.1f".format(currentConfig.clampedSizePt)} pt"
+                                    valueBadge = "${"%.1f".format(java.util.Locale.US, currentConfig.clampedSizePt)} pt"
                                 )
+                                if (currentConfig.toolType.isHighlighter) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = "Tollhoz igazítás (Auto)",
+                                                style = MaterialTheme.typography.labelLarge,
+                                                fontWeight = FontWeight.SemiBold
+                                            )
+                                            Text(
+                                                text = "Automatikusan követi az aktuális toll méretét",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                        Switch(
+                                            checked = highlighterAutoSize,
+                                            onCheckedChange = onToggleHighlighterAutoSize,
+                                            modifier = Modifier.testTag("highlighter_auto_size_switch")
+                                        )
+                                    }
+                                    HorizontalDivider(
+                                        modifier = Modifier.padding(vertical = 2.dp),
+                                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+                                    )
+                                }
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
                                 ) {
                                     val sizePresets = if (currentConfig.toolType.isHighlighter) {
                                         QUICK_HIGHLIGHTER_SIZE_PRESETS_PT
@@ -624,9 +815,14 @@ fun BrushSettingsPopover(
                                         QUICK_SIZE_PRESETS_PT
                                     }
                                     sizePresets.forEach { presetPt ->
-                                        val isSelected = kotlin.math.abs(currentConfig.clampedSizePt - presetPt) < 0.25f
+                                        val isSelected = kotlin.math.abs(currentConfig.clampedSizePt - presetPt) < 0.2f
                                         Surface(
-                                            onClick = { onConfigChange(currentConfig.copy(sizePt = presetPt)) },
+                                            onClick = {
+                                                if (currentConfig.toolType.isHighlighter && highlighterAutoSize) {
+                                                    onToggleHighlighterAutoSize(false)
+                                                }
+                                                onConfigChange(currentConfig.copy(sizePt = presetPt))
+                                            },
                                             shape = RoundedCornerShape(10.dp),
                                             color = if (isSelected) {
                                                 surfacePalette.activePillBackground
@@ -646,15 +842,16 @@ fun BrushSettingsPopover(
                                             ) {
                                                 Box(
                                                     modifier = Modifier
-                                                        .size((presetPt * 0.65f + 3f).coerceIn(4f, 12f).dp)
+                                                        .size((presetPt * 0.6f + 2.5f).coerceIn(3f, 11f).dp)
                                                         .clip(CircleShape)
                                                         .background(Color(currentConfig.effectiveColorArgb()))
                                                 )
-                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Spacer(modifier = Modifier.width(2.dp))
                                                 Text(
                                                     text = if (presetPt % 1f == 0f) "${presetPt.toInt()}" else "$presetPt",
                                                     style = MaterialTheme.typography.labelMedium,
-                                                    fontWeight = FontWeight.SemiBold
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    maxLines = 1
                                                 )
                                             }
                                         }
@@ -663,6 +860,9 @@ fun BrushSettingsPopover(
                                 Slider(
                                     value = currentConfig.clampedSizePt,
                                     onValueChange = { nextSize ->
+                                        if (currentConfig.toolType.isHighlighter && highlighterAutoSize) {
+                                            onToggleHighlighterAutoSize(false)
+                                        }
                                         onConfigChange(currentConfig.copy(sizePt = nextSize))
                                     },
                                     valueRange = BrushConfig.MIN_BRUSH_SIZE_PT..BrushConfig.MAX_BRUSH_SIZE_PT
@@ -803,7 +1003,7 @@ fun BrushSettingsPopover(
                             }
 
                             // Stage 2 Only: Opacity + 1-Euro Stabilization + Presets + Pressure Curve + Hold-to-Snap
-                            if (showFullSections) {
+                            if (showFullSections && currentConfig.toolType != BrushToolType.CLOZE_TAPE) {
                                 Column(
                                     modifier = Modifier.progressiveStudioReveal(stage2RevealFraction),
                                     verticalArrangement = Arrangement.spacedBy(10.dp)
@@ -1225,9 +1425,13 @@ private fun SettingSliderHeader(
 }
 
 @Composable
-private fun LiveBrushPreviewCard(config: BrushConfig) {
+private fun LiveBrushPreviewCard(
+    config: BrushConfig,
+    clozeTapePattern: ClozeTapePattern = ClozeTapePattern.DIAGONAL_STRIPES
+) {
     val previewInkColor = Color(config.effectiveColorArgb()).copy(alpha = config.effectiveOpacity())
     val gridColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f)
+    val isOledMode = LocalStylusSurfacePalette.current.isOledDeepBlack
 
     Surface(
         shape = RoundedCornerShape(18.dp),
@@ -1254,7 +1458,28 @@ private fun LiveBrushPreviewCard(config: BrushConfig) {
                 y += stepPx
             }
 
-            if (config.toolType.isEraser) {
+            if (config.toolType == BrushToolType.CLOZE_TAPE) {
+                val bandH = (config.clampedSizePt * 1.4f).dp.toPx().coerceIn(14f, size.height * 0.62f)
+                val padX = 20.dp.toPx()
+                val cy = size.height * 0.5f
+                drawIntoCanvas { canvas ->
+                    ClozeTapeCanvasRenderer.drawClozeTape(
+                        canvas = canvas.nativeCanvas,
+                        bounds = DocRect(
+                            leftPt = padX,
+                            topPt = cy - bandH * 0.5f,
+                            rightPt = (size.width - padX).coerceAtLeast(padX + 24f),
+                            bottomPt = cy + bandH * 0.5f
+                        ),
+                        canonicalColorArgb = config.colorArgb,
+                        patternStyle = clozeTapePattern,
+                        rotationRadians = 0f,
+                        label = "KITAKARÓ SZALAG",
+                        isOledMode = isOledMode,
+                        isRevealed = false
+                    )
+                }
+            } else if (config.toolType.isEraser) {
                 drawCircle(
                     color = Color(0xFF94A3B8).copy(alpha = 0.25f),
                     radius = config.eraserRadiusDp.dp.toPx().coerceAtMost(size.height * 0.42f),

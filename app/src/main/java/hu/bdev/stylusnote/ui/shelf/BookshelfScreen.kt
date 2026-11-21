@@ -5,6 +5,11 @@ import android.os.Looper
 import android.os.SystemClock
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -59,16 +64,20 @@ import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Functions
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Inbox
 import androidx.compose.material.icons.filled.Label
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.PictureAsPdf
+import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.ShowChart
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material3.Button
@@ -145,15 +154,24 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import hu.bdev.stylusnote.core.ai.AiConsentState
 import hu.bdev.stylusnote.core.ai.AiConsentStore
 import hu.bdev.stylusnote.core.ai.BackgroundOcrWorker
+import hu.bdev.stylusnote.core.ai.EqualsGestureDetector
+import hu.bdev.stylusnote.core.ai.EqualsTriggerContext
 import hu.bdev.stylusnote.core.ai.GeminiApiSupport
 import hu.bdev.stylusnote.core.ai.GeminiClient
 import hu.bdev.stylusnote.core.ai.GeminiModelInfo
 import hu.bdev.stylusnote.core.ai.InNotebookSearchCoordinator
+import hu.bdev.stylusnote.core.ai.LiveMathSuggestion
+import hu.bdev.stylusnote.core.ai.LiveMathSuggestionEngine
+import hu.bdev.stylusnote.core.ai.MathFractionLayoutAnalyzer
+import hu.bdev.stylusnote.core.ai.MlKitLineInkRecognizer
 import hu.bdev.stylusnote.core.ai.ModelCatalog
 import hu.bdev.stylusnote.core.ai.NotebookSearchMatch
+import hu.bdev.stylusnote.core.ai.OcrLineSegmenter
+import hu.bdev.stylusnote.core.ai.OcrModelDownloadManager
 import hu.bdev.stylusnote.core.ai.SearchExecutionResult
 import hu.bdev.stylusnote.core.ai.SearchIndexState
 import hu.bdev.stylusnote.core.ai.SearchTextIndexer
+import hu.bdev.stylusnote.core.code.CodeLanguage
 import hu.bdev.stylusnote.core.hardware.StylusToggleDebouncer
 import hu.bdev.stylusnote.core.math.CanvasTransformMatrix
 import hu.bdev.stylusnote.core.math.ContinuousPageLayout
@@ -183,8 +201,10 @@ import hu.bdev.stylusnote.data.local.TagEntity
 import hu.bdev.stylusnote.domain.model.BrushConfig
 import hu.bdev.stylusnote.domain.model.BrushToolType
 import hu.bdev.stylusnote.domain.model.CanvasMode
+import hu.bdev.stylusnote.domain.model.ClozeTapePattern
 import hu.bdev.stylusnote.domain.model.GeometricShapeType
 import hu.bdev.stylusnote.domain.model.NotebookCover
+import hu.bdev.stylusnote.domain.model.ObjectAttachmentGeometry
 import hu.bdev.stylusnote.domain.model.OcrLanguageTag
 import hu.bdev.stylusnote.domain.model.PageObject
 import hu.bdev.stylusnote.domain.model.PagePaperConfig
@@ -192,10 +212,15 @@ import hu.bdev.stylusnote.domain.model.PageSizePreset
 import hu.bdev.stylusnote.domain.model.PaperTemplateType
 import hu.bdev.stylusnote.domain.model.PersistedStrokeRecord
 import hu.bdev.stylusnote.domain.repository.CanvasStateHolder
+import hu.bdev.stylusnote.domain.repository.SelectionTransferSnapshot
+import hu.bdev.stylusnote.ui.canvas.CodeBlockEditorDialog
 import hu.bdev.stylusnote.ui.canvas.DryInkRasterCache
 import hu.bdev.stylusnote.ui.canvas.HandwritingToLatexConverter
 import hu.bdev.stylusnote.ui.canvas.IndexedDryStroke
 import hu.bdev.stylusnote.ui.canvas.LassoAutoFormatResult
+import hu.bdev.stylusnote.ui.canvas.LatexConversionResult
+import hu.bdev.stylusnote.ui.canvas.LatexEditDialog
+import hu.bdev.stylusnote.ui.canvas.LatexSyntaxValidator
 import hu.bdev.stylusnote.ui.canvas.LeftPageDrawerOverlay
 import hu.bdev.stylusnote.ui.canvas.LeftPagePullTab
 import hu.bdev.stylusnote.ui.canvas.LiveObjectInteractionController
@@ -204,6 +229,8 @@ import hu.bdev.stylusnote.ui.canvas.NotebookPageRuntime
 import hu.bdev.stylusnote.ui.canvas.PageObjectsOverlayLayer
 import hu.bdev.stylusnote.ui.canvas.PageThumbnailRenderer
 import hu.bdev.stylusnote.ui.canvas.PageThumbnailSourceSnapshot
+import hu.bdev.stylusnote.ui.canvas.PendingTableDraft
+import hu.bdev.stylusnote.ui.canvas.PendingTableDraftOverlay
 import hu.bdev.stylusnote.ui.canvas.StylusDrawingSurface
 import hu.bdev.stylusnote.ui.canvas.computeStrokeDocBounds
 import hu.bdev.stylusnote.ui.canvas.resolveNextActivePageAfterDelete
@@ -219,6 +246,8 @@ import hu.bdev.stylusnote.ui.components.InNotebookSearchToolbarSection
 import hu.bdev.stylusnote.ui.components.PaperSettingsDialog
 import hu.bdev.stylusnote.ui.components.SearchHighlightCanvasOverlay
 import hu.bdev.stylusnote.ui.components.ShapePickerPopover
+import hu.bdev.stylusnote.ui.components.TableCreationConfig
+import hu.bdev.stylusnote.ui.components.TablePickerPopover
 import hu.bdev.stylusnote.ui.components.ToolDockPreferencesStore
 import hu.bdev.stylusnote.ui.components.ToolDockPrefs
 import hu.bdev.stylusnote.ui.theme.LocalStylusSurfacePalette
@@ -226,6 +255,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -2212,10 +2242,23 @@ fun NotebookWorkspaceScreen(
         onClose = ::closeInNotebookSearch
     )
 
+    var isCodeBlockPlaceMode by remember(target.notebookId) { mutableStateOf(false) }
+
     fun updateActiveBrushConfig(next: BrushConfig) {
         brushConfig = next
         val updatedMap = perToolConfigs.toMutableMap()
         updatedMap[next.toolType] = next
+        if (dockPrefs.highlighterAutoSize &&
+            (next.toolType == BrushToolType.FOUNTAIN_PEN ||
+                next.toolType == BrushToolType.BALLPOINT_PEN ||
+                next.toolType == BrushToolType.PENCIL)
+        ) {
+            val existingHl = updatedMap[BrushToolType.HIGHLIGHTER]
+                ?: ToolDockPreferencesStore.defaultToolConfig(BrushToolType.HIGHLIGHTER)
+            updatedMap[BrushToolType.HIGHLIGHTER] = existingHl.copy(
+                sizePt = BrushConfig.computeRecommendedHighlighterSizePt(next.clampedSizePt)
+            )
+        }
         perToolConfigs = updatedMap
         hasHydratedPerToolConfigs = true
         workspaceScope.launch {
@@ -2224,10 +2267,19 @@ fun NotebookWorkspaceScreen(
     }
 
     fun selectTool(nextTool: BrushToolType) {
+        isCodeBlockPlaceMode = false
         val updatedMap = perToolConfigs.toMutableMap()
         updatedMap[brushConfig.toolType] = brushConfig
-        val restored = (updatedMap[nextTool] ?: ToolDockPreferencesStore.defaultToolConfig(nextTool))
+        var restored = (updatedMap[nextTool] ?: ToolDockPreferencesStore.defaultToolConfig(nextTool))
             .copy(toolType = nextTool)
+        if (nextTool == BrushToolType.HIGHLIGHTER && dockPrefs.highlighterAutoSize) {
+            val penCfg = updatedMap[BrushToolType.FOUNTAIN_PEN]
+                ?: ToolDockPreferencesStore.defaultToolConfig(BrushToolType.FOUNTAIN_PEN)
+            restored = restored.copy(
+                sizePt = BrushConfig.computeRecommendedHighlighterSizePt(penCfg.clampedSizePt)
+            )
+            updatedMap[BrushToolType.HIGHLIGHTER] = restored
+        }
         perToolConfigs = updatedMap
         if (nextTool == BrushToolType.FOUNTAIN_PEN || nextTool == BrushToolType.HIGHLIGHTER) {
             lastDrawingTool = nextTool
@@ -2238,6 +2290,31 @@ fun NotebookWorkspaceScreen(
         hasHydratedPerToolConfigs = true
         workspaceScope.launch {
             toolDockPrefsStore.savePerToolConfigs(updatedMap)
+        }
+    }
+
+    fun toggleHighlighterAutoSize(enabled: Boolean) {
+        if (enabled) {
+            val penCfg = perToolConfigs[BrushToolType.FOUNTAIN_PEN]
+                ?: ToolDockPreferencesStore.defaultToolConfig(BrushToolType.FOUNTAIN_PEN)
+            val recommendedSize = BrushConfig.computeRecommendedHighlighterSizePt(penCfg.clampedSizePt)
+            val existingHl = perToolConfigs[BrushToolType.HIGHLIGHTER]
+                ?: ToolDockPreferencesStore.defaultToolConfig(BrushToolType.HIGHLIGHTER)
+            val syncedHl = existingHl.copy(sizePt = recommendedSize)
+            val updatedMap = perToolConfigs.toMutableMap()
+            updatedMap[BrushToolType.HIGHLIGHTER] = syncedHl
+            perToolConfigs = updatedMap
+            if (brushConfig.toolType == BrushToolType.HIGHLIGHTER) {
+                brushConfig = syncedHl
+            }
+            workspaceScope.launch {
+                toolDockPrefsStore.saveHighlighterAutoSize(true)
+                toolDockPrefsStore.savePerToolConfigs(updatedMap)
+            }
+        } else {
+            workspaceScope.launch {
+                toolDockPrefsStore.saveHighlighterAutoSize(false)
+            }
         }
     }
 
@@ -2319,6 +2396,12 @@ fun NotebookWorkspaceScreen(
                 onToggleDebugOverlay = onToggleDebugOverlay,
                 onSelectPageTarget = onSelectPageTarget,
                 onBackToShelf = onExitToBookshelf,
+                isCodeBlockPlaceMode = isCodeBlockPlaceMode,
+                onToggleCodeBlockPlaceMode = { isCodeBlockPlaceMode = !isCodeBlockPlaceMode },
+                onToggleHighlighterAutoSize = ::toggleHighlighterAutoSize,
+                onToggleTopToolbarAutoHide = { enabled ->
+                    workspaceScope.launch { toolDockPrefsStore.saveTopToolbarAutoHide(enabled) }
+                },
                 modifier = Modifier.fillMaxSize()
             )
         }
@@ -2391,6 +2474,13 @@ private data class ActivePageBinding(
     val isReadOnly: Boolean
 )
 
+private data class LiveMathOverlayState(
+    val pageId: String,
+    val triggerContext: EqualsTriggerContext,
+    val suggestion: LiveMathSuggestion,
+    val colorArgb: Int
+)
+
 @Composable
 private fun NotebookPagePane(
     database: AppDatabase,
@@ -2431,6 +2521,10 @@ private fun NotebookPagePane(
     onToggleDebugOverlay: () -> Unit,
     onSelectPageTarget: (OpenedPageTarget) -> Unit,
     onBackToShelf: () -> Unit,
+    isCodeBlockPlaceMode: Boolean = false,
+    onToggleCodeBlockPlaceMode: () -> Unit = {},
+    onToggleHighlighterAutoSize: (Boolean) -> Unit = {},
+    onToggleTopToolbarAutoHide: (Boolean) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -2455,12 +2549,26 @@ private fun NotebookPagePane(
     var dockBoundsPx by remember { mutableStateOf(Rect.Zero) }
     var showBrushSettings by remember(sessionKey) { mutableStateOf(false) }
     var showShapePicker by remember(sessionKey) { mutableStateOf(false) }
+    var showTablePicker by remember(sessionKey) { mutableStateOf(false) }
+    var lastTableConfig by remember(target.notebookId) { mutableStateOf(TableCreationConfig()) }
+    var pendingTableDraft by remember(sessionKey) { mutableStateOf<PendingTableDraft?>(null) }
+    var lassoClipboard by remember(target.notebookId) { mutableStateOf<SelectionTransferSnapshot?>(null) }
     var showPaperSettings by remember(sessionKey) { mutableStateOf(false) }
     var showAiCopilot by remember(sessionKey) { mutableStateOf(false) }
     var showCloudBackupDialog by remember(sessionKey) { mutableStateOf(false) }
     var selectedObjectId by remember(sessionKey) { mutableStateOf<String?>(null) }
     var selectedObjectPageId by remember(sessionKey) { mutableStateOf<String?>(null) }
     var copilotNoticeBannerHu by remember(sessionKey) { mutableStateOf<String?>(null) }
+    var clozeTapePattern by remember(target.notebookId) { mutableStateOf(ClozeTapePattern.DIAGONAL_STRIPES) }
+    var revealedClozeTapeIds by remember(target.notebookId) { mutableStateOf<Set<String>>(emptySet()) }
+    var editingCodeBlockState by remember(sessionKey) { mutableStateOf<Pair<String, PageObject.CodeBlockObject>?>(null) }
+    var editingLatexState by remember(sessionKey) { mutableStateOf<Pair<String, PageObject.LatexObject>?>(null) }
+    var isTopToolbarExpanded by remember(target.notebookId) { mutableStateOf(true) }
+    var topToolbarInteractionTick by remember(target.notebookId) { mutableLongStateOf(0L) }
+    var isStylusHoveringTopLeft by remember(sessionKey) { mutableStateOf(false) }
+    var activeLiveMathBanner by remember(sessionKey) { mutableStateOf<LiveMathOverlayState?>(null) }
+    var mathEvalTick by remember(sessionKey) { mutableLongStateOf(0L) }
+    var pendingMathEvalPageId by remember(sessionKey) { mutableStateOf<String?>(null) }
 
     var notebookTitle by remember(sessionKey) { mutableStateOf("Jegyzetfüzet") }
     var pageNumber by remember(sessionKey) { mutableIntStateOf(1) }
@@ -2777,15 +2885,24 @@ private fun NotebookPagePane(
         }
     }
 
-    LaunchedEffect(isFullScreenCanvas) {
-        if (isFullScreenCanvas == observedFullScreen) {
-            return@LaunchedEffect
+    LaunchedEffect(
+        dockPrefs.topToolbarAutoHide,
+        topToolbarInteractionTick,
+        isStylusHoveringTopLeft,
+        searchUiState.isOpen
+    ) {
+        if (dockPrefs.topToolbarAutoHide && !isStylusHoveringTopLeft && !searchUiState.isOpen) {
+            delay(3500L)
+            if (dockPrefs.topToolbarAutoHide && !isStylusHoveringTopLeft && !searchUiState.isOpen) {
+                isTopToolbarExpanded = false
+            }
+        } else {
+            isTopToolbarExpanded = true
         }
-        observedFullScreen = isFullScreenCanvas
-        if (isFullScreenCanvas) {
-            topToolbarBoundsPx = Rect.Zero
-        }
-        fitPageToViewportNow(overridePaddingPx = if (isFullScreenCanvas) 0f else 36f)
+    }
+
+    LaunchedEffect(brushConfig.toolType) {
+        activeLiveMathBanner = null
     }
 
     fun persistedStrokesFrom(holder: CanvasStateHolder): List<PersistedStrokeRecord> =
@@ -2796,6 +2913,90 @@ private fun NotebookPagePane(
                 shapeMeta = holder.getShapeMeta(entry.id)
             )
         }
+
+    LaunchedEffect(mathEvalTick) {
+        if (mathEvalTick <= 0L) return@LaunchedEffect
+        delay(600L)
+        val evalPageId = pendingMathEvalPageId ?: latestTargetPageId
+        val evalBinding = resolveBindingForPage(evalPageId) ?: return@LaunchedEffect
+        if (evalBinding.isReadOnly) return@LaunchedEffect
+        val allStrokes = persistedStrokesFrom(evalBinding.canvasStateHolder)
+        val triggerCtx = withContext(Dispatchers.Default) {
+            EqualsGestureDetector.detectTrailingEquals(allStrokes, evalBinding.pageId)
+        }
+        if (triggerCtx == null) {
+            activeLiveMathBanner = null
+            return@LaunchedEffect
+        }
+        val exprStrokes = allStrokes.filter { it.id in triggerCtx.expressionStrokeIds }
+        val segmentedLine = OcrLineSegmenter().buildSingleLineForRecognition(exprStrokes)
+        val modelReady = withContext(Dispatchers.IO) {
+            OcrModelDownloadManager.isModelDownloaded(notebookOcrLanguage)
+        }
+        val recognizedText = if (modelReady && segmentedLine != null) {
+            runCatching {
+                MlKitLineInkRecognizer().recognizeLine(segmentedLine, null, notebookOcrLanguage)
+            }.getOrNull()
+        } else {
+            null
+        }
+        val suggestion = when {
+            !recognizedText.isNullOrBlank() -> LiveMathSuggestionEngine.evaluateRecognizedExpression(
+                rawText = recognizedText,
+                aiAvailable = consentState.isReadyForUserInitiatedCall
+            )
+            consentState.isReadyForUserInitiatedCall -> LiveMathSuggestion.OfferAiSolve("Képlet megoldása")
+            else -> null
+        }
+        activeLiveMathBanner = if (suggestion != null) {
+            val firstColor = exprStrokes.lastOrNull()?.canonicalColorArgb
+                ?: BrushConfig.DEFAULT_INK_COLOR_ARGB
+            LiveMathOverlayState(
+                pageId = evalBinding.pageId,
+                triggerContext = triggerCtx,
+                suggestion = suggestion,
+                colorArgb = firstColor
+            )
+        } else {
+            null
+        }
+    }
+
+    fun plotFunctionFromLatexObject(binding: ActivePageBinding, latexObj: PageObject.LatexObject) {
+        if (binding.isReadOnly) return
+        val expr = LiveMathSuggestionEngine.extractPlotExpressionFromLatex(latexObj.latexSource) ?: return
+        val plotW = 220f
+        val plotH = 148f
+        val left = latexObj.bounds.leftPt.coerceAtLeast(16f)
+        val top = latexObj.bounds.bottomPt + 12f
+        val plotObj = PageObject.FunctionPlotObject(
+            id = UUID.randomUUID().toString(),
+            zOrder = binding.canvasStateHolder.allocateObjectZOrder(),
+            bounds = DocRect(leftPt = left, topPt = top, rightPt = left + plotW, bottomPt = top + plotH),
+            expression = expr,
+            canonicalColorArgb = latexObj.canonicalColorArgb
+        )
+        binding.canvasStateHolder.addPageObject(plotObj)
+        coroutineScope.launch { binding.strokeJournal.appendAddObject(plotObj) }
+        pageThumbnailRenderer.invalidatePage(binding.pageId)
+        dirtyContinuousPageIds.add(binding.pageId)
+        selectedObjectId = plotObj.id
+        selectedObjectPageId = binding.pageId
+        externalDrawTick++
+        historyRevisionTick++
+        viewportTransformTick++
+    }
+
+    LaunchedEffect(isFullScreenCanvas) {
+        if (isFullScreenCanvas == observedFullScreen) {
+            return@LaunchedEffect
+        }
+        observedFullScreen = isFullScreenCanvas
+        if (isFullScreenCanvas) {
+            topToolbarBoundsPx = Rect.Zero
+        }
+        fitPageToViewportNow(overridePaddingPx = if (isFullScreenCanvas) 0f else 36f)
+    }
 
     suspend fun formatInMemoryTarget(
         holder: CanvasStateHolder,
@@ -3569,6 +3770,7 @@ private fun NotebookPagePane(
                 bumpOverlayTransformTickIfVisible()
             },
             onCanvasTouchStart = {
+                activeLiveMathBanner = null
                 if (selectedObjectId != null) {
                     selectedObjectId = null
                     selectedObjectPageId = null
@@ -3622,10 +3824,18 @@ private fun NotebookPagePane(
                     coroutineScope.launch {
                         val selectedRecords = selectedIds.mapNotNull { id ->
                             binding.canvasStateHolder.getStroke(id)?.let { entry ->
+                                val sourceToolType = if (entry.isHighlighter) {
+                                    BrushToolType.HIGHLIGHTER
+                                } else {
+                                    BrushToolType.FOUNTAIN_PEN
+                                }
                                 val strokeColor = entry.stroke.brush.colorIntArgb
                                 StrokeBinarySerializer.fromIndexedDryStroke(
                                     entry = entry,
-                                    brushConfig = brushConfig.copy(colorArgb = strokeColor),
+                                    brushConfig = brushConfig.copy(
+                                        toolType = sourceToolType,
+                                        colorArgb = strokeColor
+                                    ),
                                     shapeMeta = binding.canvasStateHolder.getShapeMeta(id)
                                 )
                             }
@@ -3746,10 +3956,18 @@ private fun NotebookPagePane(
                     coroutineScope.launch {
                         val selectedRecords = selectedIds.mapNotNull { id ->
                             binding.canvasStateHolder.getStroke(id)?.let { entry ->
+                                val sourceToolType = if (entry.isHighlighter) {
+                                    BrushToolType.HIGHLIGHTER
+                                } else {
+                                    BrushToolType.FOUNTAIN_PEN
+                                }
                                 val strokeColor = entry.stroke.brush.colorIntArgb
                                 StrokeBinarySerializer.fromIndexedDryStroke(
                                     entry = entry,
-                                    brushConfig = brushConfig.copy(colorArgb = strokeColor),
+                                    brushConfig = brushConfig.copy(
+                                        toolType = sourceToolType,
+                                        colorArgb = strokeColor
+                                    ),
                                     shapeMeta = binding.canvasStateHolder.getShapeMeta(id)
                                 )
                             }
@@ -3802,6 +4020,246 @@ private fun NotebookPagePane(
                 lassoPreviewDeltaYPt = dy
                 lassoPreviewRotationRad = rot
                 lassoPreviewRotationCenter = center
+            },
+            isCodeBlockPlaceMode = isCodeBlockPlaceMode,
+            clozeTapePattern = clozeTapePattern,
+            onClozeTapeCreatedInPage = { pageId, bounds, colorArgb, pattern ->
+                val resolvedPageId = pageId ?: latestTargetPageId
+                val binding = resolveBindingForPage(resolvedPageId)
+                if (binding != null && !binding.isReadOnly) {
+                    val tape = PageObject.ClozeTapeObject(
+                        id = UUID.randomUUID().toString(),
+                        zOrder = binding.canvasStateHolder.allocateObjectZOrder(),
+                        bounds = bounds,
+                        canonicalColorArgb = colorArgb,
+                        patternStyle = pattern
+                    )
+                    binding.canvasStateHolder.addPageObject(tape)
+                    coroutineScope.launch { binding.strokeJournal.appendAddObject(tape) }
+                    pageThumbnailRenderer.invalidatePage(binding.pageId)
+                    dirtyContinuousPageIds.add(binding.pageId)
+                    externalDrawTick++
+                    historyRevisionTick++
+                    viewportTransformTick++
+                }
+            },
+            onToggleRevealClozeTapeAtPoint = { pageId, localDocPt ->
+                val resolvedPageId = pageId ?: latestTargetPageId
+                val binding = resolveBindingForPage(resolvedPageId)
+                val matchedTape = binding?.canvasStateHolder?.allPageObjects()
+                    ?.filterIsInstance<PageObject.ClozeTapeObject>()
+                    ?.sortedByDescending { it.zOrder }
+                    ?.firstOrNull { tape ->
+                        ObjectAttachmentGeometry.containsPointInRotatedRect(
+                            xPt = localDocPt.xPt,
+                            yPt = localDocPt.yPt,
+                            bounds = tape.bounds,
+                            rotationRadians = tape.rotationRadians,
+                            marginPt = 6f
+                        )
+                    }
+                if (matchedTape != null) {
+                    revealedClozeTapeIds = if (matchedTape.id in revealedClozeTapeIds) {
+                        revealedClozeTapeIds - matchedTape.id
+                    } else {
+                        revealedClozeTapeIds + matchedTape.id
+                    }
+                    true
+                } else {
+                    false
+                }
+            },
+            onCodeBlockZonePlacedInPage = { pageId, bounds ->
+                val resolvedPageId = pageId ?: latestTargetPageId
+                val binding = resolveBindingForPage(resolvedPageId)
+                if (binding != null && !binding.isReadOnly) {
+                    val block = PageObject.CodeBlockObject(
+                        id = UUID.randomUUID().toString(),
+                        zOrder = binding.canvasStateHolder.allocateObjectZOrder(),
+                        bounds = bounds,
+                        language = CodeLanguage.PYTHON,
+                        codeText = ""
+                    )
+                    binding.canvasStateHolder.addPageObject(block)
+                    coroutineScope.launch { binding.strokeJournal.appendAddObject(block) }
+                    pageThumbnailRenderer.invalidatePage(binding.pageId)
+                    dirtyContinuousPageIds.add(binding.pageId)
+                    if (isCodeBlockPlaceMode) onToggleCodeBlockPlaceMode()
+                    selectedObjectId = block.id
+                    selectedObjectPageId = binding.pageId
+                    editingCodeBlockState = binding.pageId to block
+                    externalDrawTick++
+                    historyRevisionTick++
+                    viewportTransformTick++
+                }
+            },
+            onStylusHoverTopLeftZoneChanged = { isHovering ->
+                isStylusHoveringTopLeft = isHovering
+                if (isHovering) {
+                    isTopToolbarExpanded = true
+                    topToolbarInteractionTick++
+                }
+            },
+            onConvertLassoToLatexInPage = { pageId, selectedIds, onDone ->
+                val resolvedPageId = pageId ?: latestTargetPageId
+                val binding = resolveBindingForPage(resolvedPageId)
+                if (selectedIds.isEmpty() || binding == null || binding.isReadOnly) {
+                    onDone(false)
+                } else {
+                    coroutineScope.launch {
+                        val selectedRecords = selectedIds.mapNotNull { id ->
+                            binding.canvasStateHolder.getStroke(id)?.let { entry ->
+                                val sourceToolType = if (entry.isHighlighter) {
+                                    BrushToolType.HIGHLIGHTER
+                                } else {
+                                    BrushToolType.FOUNTAIN_PEN
+                                }
+                                val strokeColor = entry.stroke.brush.colorIntArgb
+                                StrokeBinarySerializer.fromIndexedDryStroke(
+                                    entry = entry,
+                                    brushConfig = brushConfig.copy(
+                                        toolType = sourceToolType,
+                                        colorArgb = strokeColor
+                                    ),
+                                    shapeMeta = binding.canvasStateHolder.getShapeMeta(id)
+                                )
+                            }
+                        }
+                        if (selectedRecords.isEmpty()) {
+                            onDone(false)
+                            return@launch
+                        }
+                        if (consentState.isReadyForUserInitiatedCall) {
+                            copilotNoticeBannerHu = "LaTeX konverzió folyamatban..."
+                            val aiRes = runCatching {
+                                HandwritingToLatexConverter.convertLassoToLatex(
+                                    selectedStrokes = selectedRecords,
+                                    geminiClient = geminiClient,
+                                    canvasStateHolder = binding.canvasStateHolder,
+                                    context = context,
+                                    journalSink = binding.strokeJournal
+                                )
+                            }.getOrNull()
+                            if (aiRes is LatexConversionResult.Success) {
+                                pageThumbnailRenderer.invalidatePage(resolvedPageId)
+                                dirtyContinuousPageIds.add(resolvedPageId)
+                                selectedObjectId = aiRes.latexObject.id
+                                selectedObjectPageId = resolvedPageId
+                                externalDrawTick++
+                                historyRevisionTick++
+                                viewportTransformTick++
+                                copilotNoticeBannerHu = aiRes.modelSwitchedNoticeHu
+                                    ?: "Képlet LaTeX blokká alakítva (${aiRes.modelIdUsed})."
+                                onDone(true)
+                                return@launch
+                            }
+                        }
+                        // Offline ML Kit Digital Ink math recognition with geometric fraction analysis
+                        val resolvedOcrLang = withContext(Dispatchers.IO) {
+                            val enReady = runCatching {
+                                OcrModelDownloadManager.isModelDownloaded(OcrLanguageTag.ENGLISH_US) ||
+                                    OcrModelDownloadManager.downloadModelIfNeeded(OcrLanguageTag.ENGLISH_US)
+                            }.getOrDefault(false)
+                            if (enReady) {
+                                OcrLanguageTag.ENGLISH_US
+                            } else {
+                                val prefReady = runCatching {
+                                    OcrModelDownloadManager.isModelDownloaded(notebookOcrLanguage) ||
+                                        OcrModelDownloadManager.downloadModelIfNeeded(notebookOcrLanguage)
+                                }.getOrDefault(false)
+                                if (prefReady) notebookOcrLanguage else null
+                            }
+                        }
+                        val segmenter = OcrLineSegmenter()
+                        val recognizer = MlKitLineInkRecognizer()
+                        suspend fun recognizeMathChunk(chunk: List<PersistedStrokeRecord>): String? {
+                            if (chunk.isEmpty() || resolvedOcrLang == null) return null
+                            val segmented = segmenter.buildMathLineForRecognition(chunk) ?: return null
+                            val recognized = runCatching {
+                                recognizer.recognizeLine(segmented, null, resolvedOcrLang)
+                            }.getOrNull()?.trim().orEmpty()
+                            if (recognized.isEmpty()) return null
+                            return LiveMathSuggestionEngine.toBasicLatex(recognized).takeIf { it.isNotBlank() }
+                        }
+
+                        val fractionSplit = MathFractionLayoutAnalyzer.detectTopLevelFraction(selectedRecords)
+                        val structuredFractionLatex = if (fractionSplit != null) {
+                            val num = recognizeMathChunk(fractionSplit.numeratorStrokes)
+                            val den = recognizeMathChunk(fractionSplit.denominatorStrokes)
+                            if (!num.isNullOrBlank() && !den.isNullOrBlank()) {
+                                val prefix = recognizeMathChunk(fractionSplit.prefixStrokes)
+                                val suffix = recognizeMathChunk(fractionSplit.suffixStrokes)
+                                listOfNotNull(
+                                    prefix?.takeIf { it.isNotBlank() },
+                                    "\\frac{$num}{$den}",
+                                    suffix?.takeIf { it.isNotBlank() }
+                                ).joinToString(" ")
+                            } else {
+                                null
+                            }
+                        } else {
+                            null
+                        }
+
+                        val basicCandidate = structuredFractionLatex ?: recognizeMathChunk(selectedRecords)
+                        val validation = basicCandidate?.let { LatexSyntaxValidator.validate(it, context) }
+                        if (validation == null || !validation.isValid) {
+                            copilotNoticeBannerHu =
+                                "Nem sikerült felismerni a képletet. Írd tisztábban vagy kapcsold be a Gemini AI-t."
+                            onDone(false)
+                            return@launch
+                        }
+                        val finalLatex = validation.normalizedLatex
+                        var minL = Float.POSITIVE_INFINITY
+                        var minT = Float.POSITIVE_INFINITY
+                        var maxR = Float.NEGATIVE_INFINITY
+                        var maxB = Float.NEGATIVE_INFINITY
+                        for (rec in selectedRecords) {
+                            minL = minOf(minL, rec.bounds.leftPt)
+                            minT = minOf(minT, rec.bounds.topPt)
+                            maxR = maxOf(maxR, rec.bounds.rightPt)
+                            maxB = maxOf(maxB, rec.bounds.bottomPt)
+                        }
+                        val unionBounds = DocRect(minL, minT, maxOf(maxR, minL + 40f), maxOf(maxB, minT + 24f))
+                        val latexObj = PageObject.LatexObject(
+                            id = UUID.randomUUID().toString(),
+                            zOrder = binding.canvasStateHolder.allocateObjectZOrder(),
+                            bounds = unionBounds,
+                            latexSource = finalLatex,
+                            fontSizePt = (unionBounds.heightPt * 0.65f).coerceIn(14f, 42f),
+                            canonicalColorArgb = selectedRecords.first().canonicalColorArgb,
+                            sourceStrokeIds = selectedRecords.map { it.id },
+                            originalStrokes = selectedRecords
+                        )
+                        val strokeIds = selectedRecords.map { it.id }
+                        binding.canvasStateHolder.replaceStrokesWithPageObject(strokeIds, latexObj)
+                        binding.strokeJournal.appendRemoveStrokes(strokeIds)
+                        binding.strokeJournal.appendAddObject(latexObj)
+                        pageThumbnailRenderer.invalidatePage(binding.pageId)
+                        dirtyContinuousPageIds.add(binding.pageId)
+                        selectedObjectId = latexObj.id
+                        selectedObjectPageId = binding.pageId
+                        copilotNoticeBannerHu =
+                            "Képlet LaTeX blokká alakítva. Koppints a Szerkesztés gombra a finomításhoz."
+                        externalDrawTick++
+                        historyRevisionTick++
+                        viewportTransformTick++
+                        onDone(true)
+                    }
+                }
+            },
+            onStrokeCommittedInPage = { pageId ->
+                if (benchmarkStrokeCount == 0) {
+                    pendingMathEvalPageId = pageId ?: target.pageId
+                    mathEvalTick++
+                }
+            },
+            lassoClipboard = lassoClipboard,
+            onLassoClipboardChanged = { next ->
+                lassoClipboard = next
+                if (next != null) {
+                    copilotNoticeBannerHu = "Kijelölés vágólapra másolva — görgess másik oldalra és koppints a Beillesztésre."
+                }
             },
             externalDrawVersionTick = externalDrawTick,
             modifier = Modifier.fillMaxSize()
@@ -3857,7 +4315,24 @@ private fun NotebookPagePane(
                         lassoPreviewDeltaYPt = lassoPreviewDeltaYPt,
                         lassoPreviewRotationRadians = lassoPreviewRotationRad,
                         lassoPreviewRotationCenter = lassoPreviewRotationCenter,
-                        viewportTransformTick = viewportTransformTick
+                        viewportTransformTick = viewportTransformTick,
+                        revealedClozeTapeIds = revealedClozeTapeIds,
+                        onToggleRevealClozeTape = { tapeId ->
+                            revealedClozeTapeIds = if (tapeId in revealedClozeTapeIds) {
+                                revealedClozeTapeIds - tapeId
+                            } else {
+                                revealedClozeTapeIds + tapeId
+                            }
+                        },
+                        onEditCodeBlock = { block ->
+                            editingCodeBlockState = slot.pageId to block
+                        },
+                        onEditLatex = { latex ->
+                            editingLatexState = slot.pageId to latex
+                        },
+                        onPlotLatexFunction = { latex ->
+                            plotFunctionFromLatexObject(slotBinding, latex)
+                        }
                     )
                 }
             }
@@ -3891,7 +4366,24 @@ private fun NotebookPagePane(
                     lassoPreviewDeltaYPt = lassoPreviewDeltaYPt,
                     lassoPreviewRotationRadians = lassoPreviewRotationRad,
                     lassoPreviewRotationCenter = lassoPreviewRotationCenter,
-                    viewportTransformTick = viewportTransformTick
+                    viewportTransformTick = viewportTransformTick,
+                    revealedClozeTapeIds = revealedClozeTapeIds,
+                    onToggleRevealClozeTape = { tapeId ->
+                        revealedClozeTapeIds = if (tapeId in revealedClozeTapeIds) {
+                            revealedClozeTapeIds - tapeId
+                        } else {
+                            revealedClozeTapeIds + tapeId
+                        }
+                    },
+                    onEditCodeBlock = { block ->
+                        editingCodeBlockState = singleBinding.pageId to block
+                    },
+                    onEditLatex = { latex ->
+                        editingLatexState = singleBinding.pageId to latex
+                    },
+                    onPlotLatexFunction = { latex ->
+                        plotFunctionFromLatexObject(singleBinding, latex)
+                    }
                 )
             }
         }
@@ -3911,35 +4403,96 @@ private fun NotebookPagePane(
             )
         }
 
+        val isTopToolbarVisible = !dockPrefs.topToolbarAutoHide ||
+            isTopToolbarExpanded ||
+            searchUiState.isOpen ||
+            isStylusHoveringTopLeft
+        LaunchedEffect(isTopToolbarVisible, isFullScreenCanvas) {
+            if (!isTopToolbarVisible || isFullScreenCanvas) {
+                topToolbarBoundsPx = Rect.Zero
+            }
+        }
+
         if (!isFullScreenCanvas) {
-            CanvasTopToolbar(
-                notebookTitle = notebookTitle,
-                zoomPercentProvider = { currentZoomPercent },
-                searchUiState = searchUiState,
-                onBackToShelf = {
-                    coroutineScope.launch {
-                        withContext(Dispatchers.IO) {
-                            persistCurrentViewportNow()
+            AnimatedVisibility(
+                visible = isTopToolbarVisible,
+                enter = slideInVertically { -it } + fadeIn(),
+                exit = slideOutVertically { -it } + fadeOut(),
+                modifier = Modifier.align(Alignment.TopStart)
+            ) {
+                CanvasTopToolbar(
+                    notebookTitle = notebookTitle,
+                    zoomPercentProvider = { currentZoomPercent },
+                    searchUiState = searchUiState,
+                    isAutoHideEnabled = dockPrefs.topToolbarAutoHide,
+                    onToggleAutoHide = {
+                        val nextAutoHide = !dockPrefs.topToolbarAutoHide
+                        onToggleTopToolbarAutoHide(nextAutoHide)
+                        isTopToolbarExpanded = true
+                        topToolbarInteractionTick++
+                    },
+                    onUserInteraction = {
+                        isTopToolbarExpanded = true
+                        topToolbarInteractionTick++
+                    },
+                    onBackToShelf = {
+                        coroutineScope.launch {
+                            withContext(Dispatchers.IO) {
+                                persistCurrentViewportNow()
+                            }
+                            onBackToShelf()
                         }
-                        onBackToShelf()
-                    }
-                },
-                onOpenCloudBackupDialog = { showCloudBackupDialog = true },
-                onCloudQuickSyncTriggered = { msg -> onShowWorkspaceBanner(msg) },
-                onZoomOut = { applyStepZoom(0.8f) },
-                onResetZoom = { fitPageToViewportNow() },
-                onZoomIn = { applyStepZoom(1.25f) },
-                onOpenAiCopilot = { showAiCopilot = true },
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .padding(0.dp)
-                    .onGloballyPositioned { coords ->
-                        val next = coords.boundsInParent()
-                        if (rectsDifferOver1Px(topToolbarBoundsPx, next)) {
-                            topToolbarBoundsPx = next
+                    },
+                    onOpenCloudBackupDialog = { showCloudBackupDialog = true },
+                    onCloudQuickSyncTriggered = { msg -> onShowWorkspaceBanner(msg) },
+                    onZoomOut = { applyStepZoom(0.8f) },
+                    onResetZoom = { fitPageToViewportNow() },
+                    onZoomIn = { applyStepZoom(1.25f) },
+                    onOpenAiCopilot = { showAiCopilot = true },
+                    modifier = Modifier
+                        .padding(0.dp)
+                        .onGloballyPositioned { coords ->
+                            val next = coords.boundsInParent()
+                            if (rectsDifferOver1Px(topToolbarBoundsPx, next)) {
+                                topToolbarBoundsPx = next
+                            }
                         }
+                )
+            }
+
+            if (!isTopToolbarVisible) {
+                Surface(
+                    onClick = {
+                        isTopToolbarExpanded = true
+                        topToolbarInteractionTick++
+                    },
+                    shape = RoundedCornerShape(bottomEnd = 12.dp),
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.88f),
+                    tonalElevation = 2.dp,
+                    shadowElevation = 2.dp,
+                    border = BorderStroke(0.75.dp, MaterialTheme.colorScheme.outlineVariant),
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .testTag("top_toolbar_reveal_tab")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ExpandMore,
+                            contentDescription = "Menü megnyitása",
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Text(
+                            text = "Menü",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold
+                        )
                     }
-            )
+                }
+            }
         }
 
         if (benchmarkStrokeCount == 0 && paperConfig.canvasMode == CanvasMode.FIXED_PAGE) {
@@ -4092,22 +4645,31 @@ private fun NotebookPagePane(
                         } else {
                             manager.applyRedo()
                         } ?: return@withLock
-                        val runtime = manager.getReadyRuntime(res.pageId)
-                        if (selectedObjectId != null &&
-                            selectedObjectPageId == res.pageId &&
-                            runtime?.canvasStateHolder?.getPageObject(selectedObjectId!!) == null
-                        ) {
-                            selectedObjectId = null
-                            selectedObjectPageId = null
+                        for (mutatedId in res.mutatedPageIds) {
+                            val runtime = manager.getReadyRuntime(mutatedId)
+                            if (selectedObjectId != null &&
+                                selectedObjectPageId == mutatedId &&
+                                runtime?.canvasStateHolder?.getPageObject(selectedObjectId!!) == null
+                            ) {
+                                selectedObjectId = null
+                                selectedObjectPageId = null
+                            }
+                            if (!res.isReadOnly) {
+                                dirtyContinuousPageIds.add(mutatedId)
+                            }
+                            pageThumbnailRenderer.invalidatePage(mutatedId)
                         }
                         if (!res.isReadOnly) {
-                            dirtyContinuousPageIds.add(res.pageId)
+                            val mutatedIdsSnapshot = res.mutatedPageIds.toList()
                             coroutineScope.launch(Dispatchers.IO) {
-                                database.pageDao().markOcrSyncState(
-                                    pageId = res.pageId,
-                                    needsSync = true,
-                                    updatedAtMs = System.currentTimeMillis()
-                                )
+                                val nowMs = System.currentTimeMillis()
+                                for (mutatedId in mutatedIdsSnapshot) {
+                                    database.pageDao().markOcrSyncState(
+                                        pageId = mutatedId,
+                                        needsSync = true,
+                                        updatedAtMs = nowMs
+                                    )
+                                }
                                 CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
                             }
                         }
@@ -4121,7 +4683,6 @@ private fun NotebookPagePane(
                             scrollToPageRequestTick++
                             onSelectPageTarget(OpenedPageTarget(target.notebookId, res.pageId))
                         }
-                        pageThumbnailRenderer.invalidatePage(res.pageId)
                         externalDrawTick++
                         historyRevisionTick++
                     }
@@ -4161,6 +4722,217 @@ private fun NotebookPagePane(
             historyRevisionTick++
         }
 
+        activeLiveMathBanner?.let { banner ->
+            viewportTransformTick
+            val slot = continuousLayout?.slotForPageId(banner.pageId)
+            val eqRightDocX = (slot?.leftPt ?: 0f) + banner.triggerContext.equalsBounds.rightPt + 10f
+            val eqTopDocY = (slot?.topPt ?: 0f) + banner.triggerContext.equalsBounds.topPt - 8f
+            val anchorScreen = transformMatrix.docToScreen(eqRightDocX, eqTopDocY)
+            val maxXPx = (viewportSize.width - 240).coerceAtLeast(12)
+            val maxYPx = (viewportSize.height - 80).coerceAtLeast(12)
+            val pillX = anchorScreen.xPx.roundToInt().coerceIn(12, maxXPx)
+            val pillY = anchorScreen.yPx.roundToInt().coerceIn(12, maxYPx)
+
+            Surface(
+                modifier = Modifier
+                    .offset { IntOffset(pillX, pillY) }
+                    .testTag("live_math_suggestion_pill"),
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.88f),
+                tonalElevation = 4.dp,
+                shadowElevation = 4.dp,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    when (val sug = banner.suggestion) {
+                        is LiveMathSuggestion.NumericResult -> {
+                            Text(
+                                text = "= ${sug.formattedResult}",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.86f)
+                            )
+                            Surface(
+                                onClick = {
+                                    val b = resolveBindingForPage(banner.pageId)
+                                    if (b != null && !b.isReadOnly) {
+                                        val eqBounds = banner.triggerContext.equalsBounds
+                                        val resWidth = maxOf(44f, sug.formattedResult.length * 14f)
+                                        val resHeight = maxOf(24f, eqBounds.heightPt * 1.4f)
+                                        val cy = eqBounds.centerYPt
+                                        val latexObj = PageObject.LatexObject(
+                                            id = UUID.randomUUID().toString(),
+                                            zOrder = b.canvasStateHolder.allocateObjectZOrder(),
+                                            bounds = DocRect(
+                                                leftPt = eqBounds.rightPt + 8f,
+                                                topPt = cy - resHeight * 0.5f,
+                                                rightPt = eqBounds.rightPt + 8f + resWidth,
+                                                bottomPt = cy + resHeight * 0.5f
+                                            ),
+                                            latexSource = sug.formattedResult,
+                                            fontSizePt = 18f,
+                                            canonicalColorArgb = banner.colorArgb
+                                        )
+                                        b.canvasStateHolder.addPageObject(latexObj)
+                                        coroutineScope.launch { b.strokeJournal.appendAddObject(latexObj) }
+                                        pageThumbnailRenderer.invalidatePage(b.pageId)
+                                        dirtyContinuousPageIds.add(b.pageId)
+                                        externalDrawTick++
+                                        historyRevisionTick++
+                                        viewportTransformTick++
+                                    }
+                                    activeLiveMathBanner = null
+                                },
+                                shape = CircleShape,
+                                color = MaterialTheme.colorScheme.primary
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Check,
+                                    contentDescription = "Eredmény beillesztése",
+                                    tint = MaterialTheme.colorScheme.onPrimary,
+                                    modifier = Modifier
+                                        .padding(4.dp)
+                                        .size(14.dp)
+                                )
+                            }
+                        }
+                        is LiveMathSuggestion.FunctionPlotOffer -> {
+                            Text(
+                                text = "y = ${sug.plotExpression}",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.86f)
+                            )
+                            Surface(
+                                onClick = {
+                                    val b = resolveBindingForPage(banner.pageId)
+                                    if (b != null && !b.isReadOnly) {
+                                        val eb = banner.triggerContext.expressionBounds
+                                        val plotObj = PageObject.FunctionPlotObject(
+                                            id = UUID.randomUUID().toString(),
+                                            zOrder = b.canvasStateHolder.allocateObjectZOrder(),
+                                            bounds = DocRect(
+                                                leftPt = eb.leftPt.coerceAtLeast(16f),
+                                                topPt = eb.bottomPt + 12f,
+                                                rightPt = eb.leftPt.coerceAtLeast(16f) + 220f,
+                                                bottomPt = eb.bottomPt + 160f
+                                            ),
+                                            expression = sug.plotExpression,
+                                            canonicalColorArgb = banner.colorArgb
+                                        )
+                                        b.canvasStateHolder.addPageObject(plotObj)
+                                        coroutineScope.launch { b.strokeJournal.appendAddObject(plotObj) }
+                                        pageThumbnailRenderer.invalidatePage(b.pageId)
+                                        dirtyContinuousPageIds.add(b.pageId)
+                                        selectedObjectId = plotObj.id
+                                        selectedObjectPageId = b.pageId
+                                        externalDrawTick++
+                                        historyRevisionTick++
+                                        viewportTransformTick++
+                                    }
+                                    activeLiveMathBanner = null
+                                },
+                                shape = RoundedCornerShape(10.dp),
+                                color = MaterialTheme.colorScheme.primaryContainer
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(3.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.ShowChart,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    Text("Grafikon", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                        is LiveMathSuggestion.OfferAiSolve -> {
+                            Surface(
+                                onClick = {
+                                    val b = resolveBindingForPage(banner.pageId)
+                                    activeLiveMathBanner = null
+                                    if (b != null && !b.isReadOnly) {
+                                        val targetIds = banner.triggerContext.expressionStrokeIds +
+                                            banner.triggerContext.equalsStrokeIds
+                                        coroutineScope.launch {
+                                            val recs = targetIds.distinct().mapNotNull { id ->
+                                                b.canvasStateHolder.getStroke(id)?.let { entry ->
+                                                    StrokeBinarySerializer.fromIndexedDryStroke(
+                                                        entry = entry,
+                                                        brushConfig = brushConfig.copy(colorArgb = entry.stroke.brush.colorIntArgb),
+                                                        shapeMeta = b.canvasStateHolder.getShapeMeta(id)
+                                                    )
+                                                }
+                                            }
+                                            if (recs.isNotEmpty()) {
+                                                copilotNoticeBannerHu = "AI megoldás folyamatban..."
+                                                when (
+                                                    val conv = HandwritingToLatexConverter.convertLassoToLatex(
+                                                        selectedStrokes = recs,
+                                                        geminiClient = geminiClient,
+                                                        canvasStateHolder = b.canvasStateHolder,
+                                                        context = context,
+                                                        journalSink = b.strokeJournal
+                                                    )
+                                                ) {
+                                                    is LatexConversionResult.Success -> {
+                                                        dirtyContinuousPageIds.add(b.pageId)
+                                                        selectedObjectId = conv.latexObject.id
+                                                        selectedObjectPageId = b.pageId
+                                                        historyRevisionTick++
+                                                        viewportTransformTick++
+                                                        HandwritingToLatexConverter.generateStepByStepDerivationCard(
+                                                            latexObject = conv.latexObject,
+                                                            geminiClient = geminiClient,
+                                                            canvasStateHolder = b.canvasStateHolder,
+                                                            journalSink = b.strokeJournal
+                                                        )
+                                                        historyRevisionTick++
+                                                        copilotNoticeBannerHu = null
+                                                    }
+                                                    is LatexConversionResult.InvalidLatexError -> {
+                                                        copilotNoticeBannerHu = conv.messageHu
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                shape = RoundedCornerShape(10.dp),
+                                color = MaterialTheme.colorScheme.primaryContainer
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(14.dp))
+                                    Text("AI megoldás", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+                    IconButton(
+                        onClick = { activeLiveMathBanner = null },
+                        modifier = Modifier.size(22.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = "Elvetés",
+                            modifier = Modifier.size(14.dp)
+                        )
+                    }
+                }
+            }
+        }
+
         FloatingToolDock(
             brushConfig = brushConfig,
             lastDrawingTool = lastDrawingTool,
@@ -4173,6 +4945,7 @@ private fun NotebookPagePane(
             isDarkTheme = isDarkTheme,
             showDebugOverlay = showDebugOverlay,
             isFullScreen = isFullScreenCanvas,
+            isCodeBlockPlaceMode = isCodeBlockPlaceMode,
             onUpdateDockPrefs = { next ->
                 coroutineScope.launch { toolDockPrefsStore.savePrefs(next) }
             },
@@ -4180,7 +4953,9 @@ private fun NotebookPagePane(
             onOpenSettings = { showBrushSettings = true },
             onOpenPaperSettings = { showPaperSettings = true },
             onOpenShapes = { showShapePicker = true },
+            onOpenTablePicker = { showTablePicker = true },
             onInsertImage = { insertImageLauncher.launch("image/*") },
+            onToggleCodeBlockPlaceMode = onToggleCodeBlockPlaceMode,
             onUndo = { applyHistoryTransition(isUndo = true) },
             onRedo = { applyHistoryTransition(isUndo = false) },
             onFitPage = { fitPageToViewportNow() },
@@ -4196,11 +4971,31 @@ private fun NotebookPagePane(
         )
 
         if (showBrushSettings) {
+            val activeClozeBinding = resolveViewportTargetBinding()
+            val pageClozeTapes = activeClozeBinding?.canvasStateHolder?.allPageObjects()
+                ?.filterIsInstance<PageObject.ClozeTapeObject>()
+                .orEmpty()
+            val pageClozeIds = pageClozeTapes.map { it.id }.toSet()
+            val pageRevealedCount = pageClozeIds.count { it in revealedClozeTapeIds }
+
             BrushSettingsPopover(
                 currentConfig = brushConfig,
                 presets = presets,
                 anchorBoundsPx = dockBoundsPx,
                 viewportSize = viewportSize,
+                highlighterAutoSize = dockPrefs.highlighterAutoSize,
+                onToggleHighlighterAutoSize = onToggleHighlighterAutoSize,
+                clozeTapePattern = clozeTapePattern,
+                onClozeTapePatternChange = { nextPattern -> clozeTapePattern = nextPattern },
+                revealedClozeCount = pageRevealedCount,
+                totalClozeCount = pageClozeTapes.size,
+                onToggleRevealAllCloze = { revealAll ->
+                    revealedClozeTapeIds = if (revealAll) {
+                        revealedClozeTapeIds + pageClozeIds
+                    } else {
+                        revealedClozeTapeIds - pageClozeIds
+                    }
+                },
                 onConfigChange = onUpdateBrushConfig,
                 onSavePresetSlot = { slot, cfg ->
                     coroutineScope.launch { presetStore.savePreset(slot, cfg) }
@@ -4260,6 +5055,99 @@ private fun NotebookPagePane(
                     }
                 },
                 onDismiss = { showShapePicker = false }
+            )
+        }
+
+        if (showTablePicker) {
+            TablePickerPopover(
+                initialConfig = lastTableConfig,
+                onDismiss = { showTablePicker = false },
+                onConfirm = { cfg ->
+                    lastTableConfig = cfg
+                    showTablePicker = false
+                    val binding = resolveViewportTargetBinding()
+                    if (binding != null && !binding.isReadOnly) {
+                        val slot = continuousLayout?.slotForPageId(binding.pageId)
+                        val pageW = slot?.widthPt ?: paperConfig.pageDimensions.widthPt
+                        val pageH = slot?.heightPt ?: paperConfig.pageDimensions.heightPt
+                        val centerWs = viewportCenterWorkspacePoint()
+                        val centerX = centerWs.xPt - binding.originXPt
+                        val centerY = centerWs.yPt - binding.originYPt
+                        val minDraftW = (cfg.columns * 44f).coerceAtLeast(120f)
+                        val maxDraftW = (pageW - 32f).coerceAtLeast(minDraftW)
+                        val draftW = (pageW * 0.68f).coerceIn(minDraftW, maxDraftW).coerceAtMost(pageW - 24f)
+                        val minDraftH = (cfg.rows * 24f).coerceAtLeast(72f)
+                        val maxDraftH = (pageH * 0.65f).coerceAtLeast(minDraftH)
+                        val draftH = (cfg.rows * 34f).coerceIn(minDraftH, maxDraftH).coerceAtMost(pageH - 24f)
+                        val margin = 12f
+                        val left = (centerX - draftW * 0.5f).coerceIn(margin, (pageW - draftW - margin).coerceAtLeast(margin))
+                        val top = (centerY - draftH * 0.5f).coerceIn(margin, (pageH - draftH - margin).coerceAtLeast(margin))
+                        selectedObjectId = null
+                        selectedObjectPageId = null
+                        pendingTableDraft = PendingTableDraft(
+                            pageId = binding.pageId,
+                            bounds = DocRect(
+                                leftPt = left,
+                                topPt = top,
+                                rightPt = left + draftW,
+                                bottomPt = top + draftH
+                            ),
+                            rows = cfg.rows,
+                            columns = cfg.columns,
+                            borderStrokeWidthPt = cfg.borderStrokeWidthPt,
+                            canonicalBorderColorArgb = cfg.canonicalBorderColorArgb,
+                            hasHeaderRow = cfg.hasHeaderRow
+                        )
+                    }
+                }
+            )
+        }
+
+        val activeTableDraft = pendingTableDraft
+        if (activeTableDraft != null) {
+            val draftSlot = continuousLayout?.slotForPageId(activeTableDraft.pageId)
+            val draftOriginX = draftSlot?.leftPt ?: 0f
+            val draftOriginY = draftSlot?.topPt ?: 0f
+            val draftPageW = draftSlot?.widthPt ?: paperConfig.pageDimensions.widthPt
+            val draftPageH = draftSlot?.heightPt ?: paperConfig.pageDimensions.heightPt
+            PendingTableDraftOverlay(
+                draft = activeTableDraft,
+                pageOriginXPt = draftOriginX,
+                pageOriginYPt = draftOriginY,
+                pageWidthPt = draftPageW,
+                pageHeightPt = draftPageH,
+                transformMatrix = transformMatrix,
+                isOledMode = isDarkTheme,
+                onUpdateBounds = { nextBounds ->
+                    pendingTableDraft = activeTableDraft.copy(bounds = nextBounds)
+                },
+                onCancel = { pendingTableDraft = null },
+                onConfirmPlacement = { finalized ->
+                    pendingTableDraft = null
+                    val binding = resolveBindingForPage(finalized.pageId)
+                    if (binding != null && !binding.isReadOnly) {
+                        val tableObj = PageObject.TableObject(
+                            id = UUID.randomUUID().toString(),
+                            zOrder = binding.canvasStateHolder.allocateObjectZOrder(),
+                            bounds = finalized.bounds,
+                            rows = finalized.rows,
+                            columns = finalized.columns,
+                            borderStrokeWidthPt = finalized.borderStrokeWidthPt,
+                            canonicalBorderColorArgb = finalized.canonicalBorderColorArgb,
+                            hasHeaderRow = finalized.hasHeaderRow
+                        )
+                        binding.canvasStateHolder.addPageObject(tableObj)
+                        binding.dryInkRasterCache.invalidateDocRect(tableObj.bounds)
+                        coroutineScope.launch { binding.strokeJournal.appendAddObject(tableObj) }
+                        pageThumbnailRenderer.invalidatePage(binding.pageId)
+                        dirtyContinuousPageIds.add(binding.pageId)
+                        // Deliberately keep selectedObjectId null so the table locks permanently upon placement.
+                        externalDrawTick++
+                        historyRevisionTick++
+                        viewportTransformTick++
+                    }
+                },
+                modifier = Modifier.fillMaxSize()
             )
         }
 
@@ -4383,6 +5271,57 @@ private fun NotebookPagePane(
                 onBackupNotice = { msg -> onShowWorkspaceBanner(msg) }
             )
         }
+
+        editingCodeBlockState?.let { (editPageId, initialBlock) ->
+            CodeBlockEditorDialog(
+                initialBlock = initialBlock,
+                isOledMode = isDarkTheme,
+                onDismiss = { editingCodeBlockState = null },
+                onSave = { updatedBlock ->
+                    val b = resolveBindingForPage(editPageId)
+                    if (b != null && !b.isReadOnly) {
+                        b.canvasStateHolder.updatePageObject(updatedBlock)
+                        coroutineScope.launch { b.strokeJournal.appendUpdateObject(updatedBlock) }
+                        pageThumbnailRenderer.invalidatePage(b.pageId)
+                        dirtyContinuousPageIds.add(b.pageId)
+                        externalDrawTick++
+                        historyRevisionTick++
+                        viewportTransformTick++
+                    }
+                    editingCodeBlockState = null
+                }
+            )
+        }
+
+        editingLatexState?.let { (editPageId, initialLatex) ->
+            LatexEditDialog(
+                initialObject = initialLatex,
+                isOledMode = isDarkTheme,
+                onDismiss = { editingLatexState = null },
+                onSave = { updatedLatex ->
+                    val b = resolveBindingForPage(editPageId)
+                    if (b != null && !b.isReadOnly) {
+                        b.canvasStateHolder.updatePageObject(updatedLatex)
+                        coroutineScope.launch { b.strokeJournal.appendUpdateObject(updatedLatex) }
+                        pageThumbnailRenderer.invalidatePage(b.pageId)
+                        dirtyContinuousPageIds.add(b.pageId)
+                        externalDrawTick++
+                        historyRevisionTick++
+                        viewportTransformTick++
+                    }
+                    editingLatexState = null
+                },
+                onPlotFunction = { updatedLatex ->
+                    val b = resolveBindingForPage(editPageId)
+                    if (b != null && !b.isReadOnly) {
+                        b.canvasStateHolder.updatePageObject(updatedLatex)
+                        coroutineScope.launch { b.strokeJournal.appendUpdateObject(updatedLatex) }
+                        plotFunctionFromLatexObject(b, updatedLatex)
+                    }
+                    editingLatexState = null
+                }
+            )
+        }
     }
 }
 
@@ -4406,7 +5345,12 @@ private fun BoundPageObjectsOverlay(
     lassoPreviewDeltaYPt: Float,
     lassoPreviewRotationRadians: Float,
     lassoPreviewRotationCenter: DocPoint?,
-    viewportTransformTick: Long
+    viewportTransformTick: Long,
+    revealedClozeTapeIds: Set<String> = emptySet(),
+    onToggleRevealClozeTape: (String) -> Unit = {},
+    onEditCodeBlock: (PageObject.CodeBlockObject) -> Unit = {},
+    onEditLatex: (PageObject.LatexObject) -> Unit = {},
+    onPlotLatexFunction: (PageObject.LatexObject) -> Unit = {}
 ) {
     PageObjectsOverlayLayer(
         pageObjects = pageObjects,
@@ -4517,6 +5461,11 @@ private fun BoundPageObjectsOverlay(
         viewportTransformTick = viewportTransformTick,
         pageOriginXPt = binding.originXPt,
         pageOriginYPt = binding.originYPt,
+        revealedClozeTapeIds = revealedClozeTapeIds,
+        onToggleRevealClozeTape = onToggleRevealClozeTape,
+        onEditCodeBlock = onEditCodeBlock,
+        onEditLatex = onEditLatex,
+        onPlotLatexFunction = onPlotLatexFunction,
         modifier = Modifier.fillMaxSize()
     )
 }
@@ -4526,6 +5475,9 @@ internal fun CanvasTopToolbar(
     notebookTitle: String,
     zoomPercentProvider: () -> Int,
     searchUiState: NotebookSearchUiState = NotebookSearchUiState(),
+    isAutoHideEnabled: Boolean = false,
+    onToggleAutoHide: () -> Unit = {},
+    onUserInteraction: () -> Unit = {},
     onBackToShelf: () -> Unit,
     onOpenCloudBackupDialog: () -> Unit,
     onCloudQuickSyncTriggered: (String) -> Unit,
@@ -4631,7 +5583,10 @@ internal fun CanvasTopToolbar(
             )
 
             Surface(
-                onClick = onOpenAiCopilot,
+                onClick = {
+                    onUserInteraction()
+                    onOpenAiCopilot()
+                },
                 shape = RoundedCornerShape(12.dp),
                 color = MaterialTheme.colorScheme.primaryContainer
             ) {
@@ -4653,6 +5608,35 @@ internal fun CanvasTopToolbar(
                         color = MaterialTheme.colorScheme.primary
                     )
                 }
+            }
+
+            IconButton(
+                onClick = {
+                    onUserInteraction()
+                    onToggleAutoHide()
+                },
+                modifier = Modifier
+                    .size(30.dp)
+                    .testTag("top_toolbar_autohide_toggle")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.PushPin,
+                    contentDescription = if (isAutoHideEnabled) {
+                        "Automatikus elrejtés aktív (rögzítés)"
+                    } else {
+                        "Felső menü rögzítve (elrejtés engedélyezése)"
+                    },
+                    tint = if (isAutoHideEnabled) {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    } else {
+                        MaterialTheme.colorScheme.primary
+                    },
+                    modifier = Modifier
+                        .size(16.dp)
+                        .graphicsLayer {
+                            rotationZ = if (isAutoHideEnabled) 45f else 0f
+                        }
+                )
             }
 
             InNotebookSearchToolbarSection(

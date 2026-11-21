@@ -26,12 +26,13 @@ enum class BrushToolType(val displayName: String) {
     HIGHLIGHTER("Kiemelő"),
     VECTOR_ERASER("Vektoros radír"),
     PRECISION_ERASER("Precíziós radír"),
-    LASSO("Lasszó");
+    LASSO("Lasszó"),
+    CLOZE_TAPE("Kitakaró szalag");
 
     val isDrawingBrush: Boolean
         get() = when (this) {
             FOUNTAIN_PEN, BALLPOINT_PEN, PENCIL, HIGHLIGHTER -> true
-            VECTOR_ERASER, PRECISION_ERASER, LASSO -> false
+            VECTOR_ERASER, PRECISION_ERASER, LASSO, CLOZE_TAPE -> false
         }
 
     val isEraser: Boolean
@@ -39,6 +40,9 @@ enum class BrushToolType(val displayName: String) {
 
     val isHighlighter: Boolean
         get() = this == HIGHLIGHTER
+
+    val isClozeTape: Boolean
+        get() = this == CLOZE_TAPE
 }
 
 /**
@@ -112,6 +116,8 @@ data class BrushConfig(
         const val DEFAULT_BRUSH_SIZE_PT: Float = 2.5f
         const val DEFAULT_STABILIZATION_PERCENT: Float = 0f
         const val DEFAULT_ERASER_RADIUS_DP: Float = 18f
+        const val DEFAULT_CLOZE_TAPE_SIZE_PT: Float = 18f
+        const val DEFAULT_CLOZE_TAPE_COLOR_ARGB: Int = 0xFFFDE68A.toInt()
         const val HIGHLIGHTER_OPACITY: Float = 0.35f
         const val MIN_OPACITY: Float = 0.10f
         const val DEFAULT_BRUSH_EPSILON: Float = 0.05f
@@ -119,11 +125,20 @@ data class BrushConfig(
         const val DEFAULT_INK_COLOR_ARGB: Int = 0xFF14171C.toInt()
         const val DEFAULT_HIGHLIGHTER_COLOR_ARGB: Int = 0xFFFFEB3B.toInt()
 
+        /**
+         * Derives a comfortable highlighter tip height from the companion pen stroke thickness
+         * so handwritten letters stay covered cleanly without manual resizing every swap.
+         */
+        fun computeRecommendedHighlighterSizePt(penSizePt: Float): Float {
+            val clampedPen = penSizePt.coerceIn(MIN_BRUSH_SIZE_PT, MAX_BRUSH_SIZE_PT)
+            return (8.0f + clampedPen * 3.5f).coerceIn(8.0f, 36.0f)
+        }
+
         private val cachedPencilFamily: BrushFamily by lazy { buildTiltSensitivePencilFamily() }
 
         /**
          * Resolves the Jetpack Ink [BrushFamily] for [toolType].
-         * Non-drawing modes (erasers / lasso) fall back to a neutral marker family.
+         * Non-drawing modes (erasers / lasso / cloze tape) fall back to a neutral marker family.
          */
         fun resolveBrushFamily(toolType: BrushToolType): BrushFamily = when (toolType) {
             BrushToolType.FOUNTAIN_PEN -> StockBrushes.pressurePen()
@@ -132,7 +147,8 @@ data class BrushConfig(
             BrushToolType.HIGHLIGHTER -> StockBrushes.highlighter(selfOverlap = SelfOverlap.DISCARD)
             BrushToolType.VECTOR_ERASER,
             BrushToolType.PRECISION_ERASER,
-            BrushToolType.LASSO -> StockBrushes.marker()
+            BrushToolType.LASSO,
+            BrushToolType.CLOZE_TAPE -> StockBrushes.marker()
         }
 
         /**

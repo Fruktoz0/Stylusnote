@@ -1,5 +1,6 @@
 package hu.bdev.stylusnote.domain.model
 
+import hu.bdev.stylusnote.core.code.CodeLanguage
 import hu.bdev.stylusnote.core.hardware.StylusPointSample
 import hu.bdev.stylusnote.core.math.DocPoint
 import hu.bdev.stylusnote.core.math.DocRect
@@ -370,14 +371,182 @@ sealed interface PageObject {
             zOrder = newZOrder
         )
     }
+
+    /**
+     * Syntax-highlighted monospace code zone rendered under ink (Layer 2b) so annotations and
+     * arrows drawn onto or around the card sit cleanly on top and follow block transforms.
+     */
+    data class CodeBlockObject(
+        override val id: String,
+        override val zOrder: Long,
+        override val bounds: DocRect,
+        val language: CodeLanguage = CodeLanguage.PYTHON,
+        val codeText: String = "",
+        val fontSizePt: Float = 11f,
+        val title: String = "",
+        val showLineNumbers: Boolean = true,
+        val rotationRadians: Float = 0f
+    ) : PageObject {
+        override fun transform(affine: AffineTransform2D): PageObject {
+            val scale = affine.averageScaleFactor()
+            val newCenter = affine.transformPoint(bounds.centerXPt, bounds.centerYPt)
+            val halfW = (bounds.widthPt * 0.5f * scale).coerceAtLeast(48f)
+            val halfH = (bounds.heightPt * 0.5f * scale).coerceAtLeast(28f)
+            val deltaRot = atan2(affine.shearY, affine.scaleX)
+            return copy(
+                bounds = DocRect(
+                    leftPt = newCenter.xPt - halfW,
+                    topPt = newCenter.yPt - halfH,
+                    rightPt = newCenter.xPt + halfW,
+                    bottomPt = newCenter.yPt + halfH
+                ),
+                fontSizePt = (fontSizePt * scale).coerceIn(8f, 22f),
+                rotationRadians = rotationRadians + deltaRot
+            )
+        }
+
+        override fun duplicateWith(
+            newId: String,
+            newZOrder: Long,
+            affine: AffineTransform2D
+        ): PageObject = (transform(affine) as CodeBlockObject).copy(
+            id = newId,
+            zOrder = newZOrder
+        )
+    }
+
+    /**
+     * Layer-5b Cloze / Masking tape placed over definitions or labels; tapping reveals temporarily
+     * during study and re-covers on next tap without disturbing underlying strokes.
+     */
+    data class ClozeTapeObject(
+        override val id: String,
+        override val zOrder: Long,
+        override val bounds: DocRect,
+        val canonicalColorArgb: Int = BrushConfig.DEFAULT_CLOZE_TAPE_COLOR_ARGB,
+        val patternStyle: ClozeTapePattern = ClozeTapePattern.DIAGONAL_STRIPES,
+        val rotationRadians: Float = 0f,
+        val label: String = ""
+    ) : PageObject {
+        override fun transform(affine: AffineTransform2D): PageObject {
+            val scale = affine.averageScaleFactor()
+            val newCenter = affine.transformPoint(bounds.centerXPt, bounds.centerYPt)
+            val halfW = (bounds.widthPt * 0.5f * scale).coerceAtLeast(12f)
+            val halfH = (bounds.heightPt * 0.5f * scale).coerceAtLeast(10f)
+            val deltaRot = atan2(affine.shearY, affine.scaleX)
+            return copy(
+                bounds = DocRect(
+                    leftPt = newCenter.xPt - halfW,
+                    topPt = newCenter.yPt - halfH,
+                    rightPt = newCenter.xPt + halfW,
+                    bottomPt = newCenter.yPt + halfH
+                ),
+                rotationRadians = rotationRadians + deltaRot
+            )
+        }
+
+        override fun duplicateWith(
+            newId: String,
+            newZOrder: Long,
+            affine: AffineTransform2D
+        ): PageObject = (transform(affine) as ClozeTapeObject).copy(
+            id = newId,
+            zOrder = newZOrder
+        )
+
+        override fun withCanonicalColorOrNull(canonicalColorArgb: Int): PageObject =
+            copy(canonicalColorArgb = canonicalColorArgb)
+    }
+
+    /**
+     * Layer-2b static table grid rendered underneath highlighters & ink. Locked immediately after
+     * pre-placement drafting so stylus writing, highlighting, and erasing operate inside cells
+     * without accidentally selecting, moving, or editing the table structure.
+     */
+    data class TableObject(
+        override val id: String,
+        override val zOrder: Long,
+        override val bounds: DocRect,
+        val rows: Int,
+        val columns: Int,
+        val borderStrokeWidthPt: Float = DEFAULT_BORDER_WIDTH_PT,
+        val canonicalBorderColorArgb: Int = DEFAULT_BORDER_COLOR_ARGB,
+        val hasHeaderRow: Boolean = true
+    ) : PageObject {
+        init {
+            require(rows in MIN_ROWS..MAX_ROWS) { "rows must be $MIN_ROWS..$MAX_ROWS" }
+            require(columns in MIN_COLS..MAX_COLS) { "columns must be $MIN_COLS..$MAX_COLS" }
+        }
+
+        override fun transform(affine: AffineTransform2D): PageObject {
+            val scale = affine.averageScaleFactor()
+            val newCenter = affine.transformPoint(bounds.centerXPt, bounds.centerYPt)
+            val halfW = (bounds.widthPt * 0.5f * scale).coerceAtLeast(columns * 18f)
+            val halfH = (bounds.heightPt * 0.5f * scale).coerceAtLeast(rows * 14f)
+            return copy(
+                bounds = DocRect(
+                    leftPt = newCenter.xPt - halfW,
+                    topPt = newCenter.yPt - halfH,
+                    rightPt = newCenter.xPt + halfW,
+                    bottomPt = newCenter.yPt + halfH
+                )
+            )
+        }
+
+        override fun duplicateWith(
+            newId: String,
+            newZOrder: Long,
+            affine: AffineTransform2D
+        ): PageObject = (transform(affine) as TableObject).copy(
+            id = newId,
+            zOrder = newZOrder
+        )
+
+        override fun withCanonicalColorOrNull(canonicalColorArgb: Int): PageObject =
+            copy(canonicalBorderColorArgb = canonicalColorArgb)
+
+        companion object {
+            const val MIN_ROWS: Int = 1
+            const val MAX_ROWS: Int = 20
+            const val MIN_COLS: Int = 1
+            const val MAX_COLS: Int = 12
+            const val DEFAULT_BORDER_WIDTH_PT: Float = 1.1f
+            const val DEFAULT_BORDER_COLOR_ARGB: Int = 0xFF334155.toInt()
+        }
+    }
+}
+
+enum class ClozeTapePattern(val displayNameHu: String) {
+    SOLID("Egyszínű"),
+    DIAGONAL_STRIPES("Csíkozott"),
+    DOTS("Pontozott")
 }
 
 /**
- * Pure geometry helpers for attaching handwritten ink strokes to under-ink [PageObject.ImageObject]s
- * and keeping them aligned through translations, rotations, and non-uniform corner resizes.
+ * Pure geometry helpers for attaching handwritten ink strokes to under-ink [PageObject]s
+ * ([PageObject.ImageObject], [PageObject.CodeBlockObject], and [PageObject.TableObject])
+ * and classifying all Layer-2b under-ink rendered objects.
  */
 object ObjectAttachmentGeometry {
     const val DEFAULT_ATTACHMENT_MARGIN_PT: Float = 2f
+
+    fun isUnderInkAttachableObject(obj: PageObject): Boolean =
+        obj is PageObject.ImageObject ||
+            obj is PageObject.CodeBlockObject ||
+            obj is PageObject.TableObject
+
+    fun isUnderInkRenderedObject(obj: PageObject): Boolean =
+        isUnderInkAttachableObject(obj)
+
+    fun rotationRadiansOf(obj: PageObject): Float = when (obj) {
+        is PageObject.ImageObject -> obj.rotationRadians
+        is PageObject.CodeBlockObject -> obj.rotationRadians
+        is PageObject.ClozeTapeObject -> obj.rotationRadians
+        is PageObject.GeometricShapeObject -> obj.rotationRadians
+        is PageObject.FormattedTextObject -> obj.rotationRadians
+        is PageObject.LatexObject -> obj.rotationRadians
+        else -> 0f
+    }
 
     fun containsPointInRotatedRect(
         xPt: Float,
@@ -402,38 +571,53 @@ object ObjectAttachmentGeometry {
         return abs(localX) <= hw && abs(localY) <= hh
     }
 
-    fun isStrokeAttachedToImage(
+    fun isStrokeAttachedToObject(
         points: List<DocPoint>,
-        image: PageObject.ImageObject,
+        target: PageObject,
         marginPt: Float = DEFAULT_ATTACHMENT_MARGIN_PT
     ): Boolean {
-        if (points.isEmpty()) return false
+        if (points.isEmpty() || !isUnderInkAttachableObject(target)) return false
+        val rot = rotationRadiansOf(target)
         var insideCount = 0
         for (i in 0 until points.size) {
             val pt = points[i]
-            if (containsPointInRotatedRect(pt.xPt, pt.yPt, image.bounds, image.rotationRadians, marginPt)) {
+            if (containsPointInRotatedRect(pt.xPt, pt.yPt, target.bounds, rot, marginPt)) {
                 insideCount++
             }
         }
         return insideCount * 2 >= points.size
     }
 
-    fun findTopmostImageForStroke(
+    fun isStrokeAttachedToImage(
+        points: List<DocPoint>,
+        image: PageObject.ImageObject,
+        marginPt: Float = DEFAULT_ATTACHMENT_MARGIN_PT
+    ): Boolean = isStrokeAttachedToObject(points, image, marginPt)
+
+    fun findTopmostUnderInkObjectForStroke(
         points: List<DocPoint>,
         objects: Collection<PageObject>,
         marginPt: Float = DEFAULT_ATTACHMENT_MARGIN_PT
-    ): PageObject.ImageObject? {
+    ): PageObject? {
         if (points.isEmpty() || objects.isEmpty()) return null
-        var best: PageObject.ImageObject? = null
+        var best: PageObject? = null
         for (obj in objects) {
-            if (obj !is PageObject.ImageObject) continue
+            if (!isUnderInkAttachableObject(obj)) continue
             if (best != null && obj.zOrder <= best.zOrder) continue
-            if (isStrokeAttachedToImage(points, obj, marginPt)) {
+            if (isStrokeAttachedToObject(points, obj, marginPt)) {
                 best = obj
             }
         }
         return best
     }
+
+    fun findTopmostImageForStroke(
+        points: List<DocPoint>,
+        objects: Collection<PageObject>,
+        marginPt: Float = DEFAULT_ATTACHMENT_MARGIN_PT
+    ): PageObject.ImageObject? =
+        findTopmostUnderInkObjectForStroke(points, objects.filterIsInstance<PageObject.ImageObject>(), marginPt)
+            as? PageObject.ImageObject
 
     fun computeOrientedBoxAffineTransform(
         beforeBounds: DocRect,
@@ -453,28 +637,12 @@ object ObjectAttachmentGeometry {
     fun computeObjectInteractionAffine(
         beforeObject: PageObject,
         afterObject: PageObject
-    ): AffineTransform2D {
-        val beforeRot = when (beforeObject) {
-            is PageObject.ImageObject -> beforeObject.rotationRadians
-            is PageObject.GeometricShapeObject -> beforeObject.rotationRadians
-            is PageObject.FormattedTextObject -> beforeObject.rotationRadians
-            is PageObject.LatexObject -> beforeObject.rotationRadians
-            else -> 0f
-        }
-        val afterRot = when (afterObject) {
-            is PageObject.ImageObject -> afterObject.rotationRadians
-            is PageObject.GeometricShapeObject -> afterObject.rotationRadians
-            is PageObject.FormattedTextObject -> afterObject.rotationRadians
-            is PageObject.LatexObject -> afterObject.rotationRadians
-            else -> 0f
-        }
-        return computeOrientedBoxAffineTransform(
-            beforeBounds = beforeObject.bounds,
-            beforeRotationRad = beforeRot,
-            afterBounds = afterObject.bounds,
-            afterRotationRad = afterRot
-        )
-    }
+    ): AffineTransform2D = computeOrientedBoxAffineTransform(
+        beforeBounds = beforeObject.bounds,
+        beforeRotationRad = rotationRadiansOf(beforeObject),
+        afterBounds = afterObject.bounds,
+        afterRotationRad = rotationRadiansOf(afterObject)
+    )
 }
 
 /**

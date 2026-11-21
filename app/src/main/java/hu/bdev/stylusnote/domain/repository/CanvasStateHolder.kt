@@ -46,6 +46,28 @@ data class CombinedDuplicateResult(
     val affectedBounds: DocRect?
 )
 
+/**
+ * Detached snapshot of a Lasso selection (strokes + optional [ShapeMeta] + selectable
+ * [PageObject]s) used for notebook-wide copy/paste and atomic cross-page drag transfers.
+ */
+data class SelectionTransferSnapshot(
+    val sourcePageId: String,
+    val strokes: List<IndexedDryStroke>,
+    val shapeMetasByStrokeId: Map<String, ShapeMeta>,
+    val pageObjects: List<PageObject>,
+    val bounds: DocRect?
+) {
+    val isEmpty: Boolean
+        get() = strokes.isEmpty() && pageObjects.isEmpty()
+}
+
+/** Result of importing or pasting a [SelectionTransferSnapshot] into a destination [CanvasStateHolder]. */
+data class SelectionImportResult(
+    val importedStrokes: List<IndexedDryStroke>,
+    val importedObjects: List<PageObject>,
+    val affectedBounds: DocRect?
+)
+
 /** Result of recoloring a combined Lasso selection of strokes and/or [PageObject]s. */
 data class SelectionRecolorResult(
     val affectedBounds: DocRect?,
@@ -522,13 +544,39 @@ class CanvasStateHolder(
     }
 
     fun hasUnderInkObjects(): Boolean = synchronized(stateLock) {
-        objectsById.values.any { it is PageObject.ImageObject }
+        objectsById.values.any { ObjectAttachmentGeometry.isUnderInkRenderedObject(it) }
     }
 
     fun strokeIdsAttachedToObject(objectId: String): Set<String> = synchronized(stateLock) {
         strokesById.values
             .filter { it.attachedObjectId == objectId }
             .mapTo(LinkedHashSet()) { it.id }
+    }
+
+    /**
+     * Collects every stroke explicitly attached to [objectId], and for a [PageObject.TableObject]
+     * also includes any cell stroke whose center lies geometrically inside the table bounds
+     * (ensuring strokes authored before attachment was enabled move/copy with the table too).
+     */
+    fun strokeIdsInsideOrAttachedToObject(objectId: String): Set<String> = synchronized(stateLock) {
+        val out = LinkedHashSet<String>()
+        for (entry in strokesById.values) {
+            if (entry.attachedObjectId == objectId) {
+                out.add(entry.id)
+            }
+        }
+        val obj = objectsById[objectId]
+        if (obj is PageObject.TableObject) {
+            val padded = obj.bounds.inflate(ObjectAttachmentGeometry.DEFAULT_ATTACHMENT_MARGIN_PT)
+            val candidates = spatialIndex.queryRect(padded)
+            for (i in 0 until candidates.size) {
+                val entry = candidates[i].payload
+                if (padded.contains(entry.bounds.centerXPt, entry.bounds.centerYPt)) {
+                    out.add(entry.id)
+                }
+            }
+        }
+        out
     }
 
     fun strokesAttachedToObject(objectId: String): List<IndexedDryStroke> = synchronized(stateLock) {
@@ -758,7 +806,9 @@ class CanvasStateHolder(
         val polyBounds = SpatialIndex.computePolygonBounds(polygonDocPt)
         val matched = synchronized(stateLock) {
             objectsById.values.filter { obj ->
-                if (obj is PageObject.PdfPageRefObject) return@filter false
+                if (obj is PageObject.PdfPageRefObject) {
+                    return@filter false
+                }
                 val b = obj.bounds
                 val pad = max(b.widthPt, b.heightPt) * 0.25f
                 val roughOverlap = (b.rightPt + pad) >= polyBounds.leftPt &&
@@ -767,13 +817,7 @@ class CanvasStateHolder(
                     (b.topPt - pad) <= polyBounds.bottomPt
                 if (!roughOverlap) return@filter false
 
-                val rotRad = when (obj) {
-                    is PageObject.GeometricShapeObject -> obj.rotationRadians
-                    is PageObject.ImageObject -> obj.rotationRadians
-                    is PageObject.FormattedTextObject -> obj.rotationRadians
-                    is PageObject.LatexObject -> obj.rotationRadians
-                    else -> 0f
-                }
+                val rotRad = ObjectAttachmentGeometry.rotationRadiansOf(obj)
                 val cx = b.centerXPt
                 val cy = b.centerYPt
                 val hw = b.widthPt * 0.5f
@@ -792,6 +836,25 @@ class CanvasStateHolder(
                         if (SpatialIndex.isPointInPolygon(pt, polygonDocPt)) {
                             insideCount++
                             if (insideCount >= 2) return@filter true
+                        }
+                    }
+                }
+                if (obj is PageObject.TableObject) {
+                    // For tables, circling across the main interior grid (at least 3 inset lattice
+                    // points) captures the table together with its cell ink while small single-cell
+                    // digit selections stay below this threshold.
+                    var insetInside = 0
+                    val insetFactors = floatArrayOf(-0.55f, 0f, 0.55f)
+                    for (syFactor in insetFactors) {
+                        for (sxFactor in insetFactors) {
+                            val pt = DocPoint(
+                                xPt = cx + sxFactor * hw,
+                                yPt = cy + syFactor * hh
+                            )
+                            if (SpatialIndex.isPointInPolygon(pt, polygonDocPt)) {
+                                insetInside++
+                                if (insetInside >= 3) return@filter true
+                            }
                         }
                     }
                 }
@@ -1645,12 +1708,242 @@ class CanvasStateHolder(
         }
     }
 
+    /**
+     * Captures a detached snapshot of the currently selected strokes, their optional [ShapeMeta],
+     * and lasso-selectable [PageObject]s so they can be pasted on another page or moved across
+     * page boundaries. Locked structural objects ([PageObject.PdfPageRefObject], [PageObject.TableObject])
+     * are never captured.
+     */
+    fun snapshotSelection(
+        sourcePageId: String,
+        strokeIds: Collection<String>,
+        objectIds: Collection<String>
+    ): SelectionTransferSnapshot = synchronized(stateLock) {
+        val strokes = strokeIds.distinct()
+            .mapNotNull { strokesById[it] }
+            .sortedBy { it.zIndex }
+        val metas = LinkedHashMap<String, ShapeMeta>(strokes.size)
+        for (entry in strokes) {
+            shapeMetaById[entry.id]?.let { meta -> metas[entry.id] = meta }
+        }
+        val pageObjects = objectIds.distinct()
+            .mapNotNull { objectsById[it] }
+            .filter { it !is PageObject.PdfPageRefObject }
+            .sortedBy { it.zOrder }
+        val unionBounds = mergeBounds(
+            strokes.map { it.bounds } + pageObjects.map { it.bounds }
+        )
+        SelectionTransferSnapshot(
+            sourcePageId = sourcePageId,
+            strokes = strokes,
+            shapeMetasByStrokeId = metas,
+            pageObjects = pageObjects,
+            bounds = unionBounds
+        )
+    }
+
+    /**
+     * Atomically removes the selected strokes and lasso-selectable objects WITHOUT touching this
+     * page's local Undo stack (used by [hu.bdev.stylusnote.ui.canvas.MultiPageSessionManager] as
+     * one half of a grouped cross-page move transaction).
+     */
+    internal fun removeSelectionExternal(
+        strokeIds: Collection<String>,
+        objectIds: Collection<String>
+    ): Pair<CanvasAction, DocRect?>? = synchronized(stateLock) {
+        val liveStrokes = strokeIds.distinct().mapNotNull { strokesById[it] }
+        val liveObjects = objectIds.distinct()
+            .mapNotNull { objectsById[it] }
+            .filter { it !is PageObject.PdfPageRefObject }
+        if (liveStrokes.isEmpty() && liveObjects.isEmpty()) return null
+
+        val subActions = ArrayList<CanvasAction>(1 + liveObjects.size)
+        if (liveStrokes.isNotEmpty()) {
+            subActions.add(CanvasAction.RemovedStrokes(liveStrokes))
+        }
+        for (obj in liveObjects) {
+            subActions.add(CanvasAction.RemovedObject(obj))
+        }
+        val action = if (subActions.size == 1) {
+            subActions.first()
+        } else {
+            CanvasAction.CompositeAction(subActions, "Kijelölés áthelyezése másik oldalra")
+        }
+        applyForwardLocked(action)
+        action to action.affectedBounds
+    }
+
+    /**
+     * Pastes [snapshot] onto this page offset by ([dxPt], [dyPt]) with fresh UUIDs and records
+     * an atomic Undo delta on this page.
+     */
+    fun pasteSelectionSnapshot(
+        snapshot: SelectionTransferSnapshot,
+        dxPt: Float,
+        dyPt: Float
+    ): SelectionImportResult = insertSelectionSnapshotInternal(
+        snapshot = snapshot,
+        dxPt = dxPt,
+        dyPt = dyPt,
+        recordLocalUndo = true
+    )?.second ?: SelectionImportResult(emptyList(), emptyList(), null)
+
+    /**
+     * Inserts [snapshot] onto this destination page offset by ([dxPt], [dyPt]) WITHOUT recording
+     * a standalone local Undo entry (used by multi-page transfer transactions).
+     */
+    internal fun insertSelectionSnapshotExternal(
+        snapshot: SelectionTransferSnapshot,
+        dxPt: Float,
+        dyPt: Float
+    ): Pair<CanvasAction, SelectionImportResult>? = insertSelectionSnapshotInternal(
+        snapshot = snapshot,
+        dxPt = dxPt,
+        dyPt = dyPt,
+        recordLocalUndo = false
+    )
+
+    private fun insertSelectionSnapshotInternal(
+        snapshot: SelectionTransferSnapshot,
+        dxPt: Float,
+        dyPt: Float,
+        recordLocalUndo: Boolean
+    ): Pair<CanvasAction, SelectionImportResult>? {
+        if (snapshot.isEmpty) return null
+        val translate = AffineTransform2D.translation(dxPt, dyPt)
+
+        val objectIdMap = HashMap<String, String>(snapshot.pageObjects.size)
+        val clonedObjects = ArrayList<PageObject>(snapshot.pageObjects.size)
+        for (obj in snapshot.pageObjects.sortedBy { it.zOrder }) {
+            if (obj is PageObject.PdfPageRefObject) continue
+            val newId = uuidGenerator()
+            objectIdMap[obj.id] = newId
+            clonedObjects.add(
+                obj.duplicateWith(
+                    newId = newId,
+                    newZOrder = allocateObjectZOrder(),
+                    affine = translate
+                )
+            )
+        }
+
+        val sortedOrigStrokes = snapshot.strokes.sortedBy { it.zIndex }
+        val movedEntries = if (sortedOrigStrokes.isNotEmpty()) {
+            buildTransformedStrokeEntries(sortedOrigStrokes, translate)
+        } else {
+            emptyList()
+        }
+
+        val copiedShapeMetas = HashMap<String, ShapeMeta>(movedEntries.size)
+        val importedStrokes = ArrayList<IndexedDryStroke>(movedEntries.size)
+        for (i in 0 until movedEntries.size) {
+            val orig = sortedOrigStrokes[i]
+            val moved = movedEntries[i]
+            val newId = uuidGenerator()
+            val mappedAttachedId = orig.attachedObjectId?.let { objectIdMap[it] }
+            importedStrokes.add(
+                moved.copy(
+                    id = newId,
+                    zIndex = allocateZIndex(orig.isHighlighter),
+                    attachedObjectId = mappedAttachedId
+                )
+            )
+            snapshot.shapeMetasByStrokeId[orig.id]?.let { meta ->
+                copiedShapeMetas[newId] = meta.transform(translate)
+            }
+        }
+
+        if (importedStrokes.isEmpty() && clonedObjects.isEmpty()) return null
+
+        synchronized(stateLock) {
+            val subActions = ArrayList<CanvasAction>(1 + clonedObjects.size)
+            if (importedStrokes.isNotEmpty()) {
+                subActions.add(CanvasAction.AddedStrokes(importedStrokes))
+            }
+            for (obj in clonedObjects) {
+                subActions.add(CanvasAction.AddedObject(obj))
+            }
+            val action = if (subActions.size == 1) {
+                subActions.first()
+            } else {
+                CanvasAction.CompositeAction(subActions, "Kijelölés beillesztése")
+            }
+            applyForwardLocked(action)
+            if (copiedShapeMetas.isNotEmpty()) {
+                shapeMetaById.putAll(copiedShapeMetas)
+            }
+            if (recordLocalUndo) {
+                pushUndoActionLocked(action)
+            }
+            val result = SelectionImportResult(
+                importedStrokes = importedStrokes,
+                importedObjects = clonedObjects,
+                affectedBounds = action.affectedBounds
+            )
+            return action to result
+        }
+    }
+
     companion object {
         const val DEFAULT_MIN_UNDO_STEPS: Int = 50
         const val DEFAULT_MAX_UNDO_STEPS: Int = 200
         const val DEFAULT_MAX_POINT_BUDGET: Int = 250_000
         const val INK_Z_ORDER_BASE: Long = 1_000_000_000L
         const val OBJECT_Z_ORDER_BASE: Long = 2_000_000_000L
+
+        /**
+         * Converts a drag delta performed in unified continuous document space into the exact
+         * local translation `(dx, dy)` needed when transferring strokes/objects from a slot at
+         * ([sourceOffsetXPt], [sourceOffsetYPt]) onto a destination slot at
+         * ([destOffsetXPt], [destOffsetYPt]).
+         */
+        fun computeCrossPageTransferOffset(
+            sourceOffsetXPt: Float,
+            sourceOffsetYPt: Float,
+            destOffsetXPt: Float,
+            destOffsetYPt: Float,
+            dragDeltaXPt: Float,
+            dragDeltaYPt: Float
+        ): DocPoint = DocPoint(
+            xPt = (sourceOffsetXPt - destOffsetXPt) + dragDeltaXPt,
+            yPt = (sourceOffsetYPt - destOffsetYPt) + dragDeltaYPt
+        )
+
+        /**
+         * Computes a local translation delta for pasting [selectionBounds] onto a page of size
+         * ([destPageWidthPt] × [destPageHeightPt]), keeping pasted content visible inside page bounds.
+         */
+        fun computeClipboardPasteOffset(
+            selectionBounds: DocRect?,
+            isSamePage: Boolean,
+            destPageWidthPt: Float,
+            destPageHeightPt: Float,
+            preferredCenterLocal: DocPoint? = null
+        ): DocPoint {
+            if (selectionBounds == null) return DocPoint(0f, 0f)
+            val selW = selectionBounds.widthPt.coerceAtLeast(1f)
+            val selH = selectionBounds.heightPt.coerceAtLeast(1f)
+            val margin = 10f
+            val maxLeft = max(margin, destPageWidthPt - selW - margin)
+            val maxTop = max(margin, destPageHeightPt - selH - margin)
+
+            val desiredLeft = when {
+                preferredCenterLocal != null -> preferredCenterLocal.xPt - selW * 0.5f
+                isSamePage -> selectionBounds.leftPt + 18f
+                else -> selectionBounds.leftPt
+            }
+            val desiredTop = when {
+                preferredCenterLocal != null -> preferredCenterLocal.yPt - selH * 0.5f
+                isSamePage -> selectionBounds.topPt + 18f
+                else -> selectionBounds.topPt
+            }
+            val targetLeft = desiredLeft.coerceIn(margin, maxLeft)
+            val targetTop = desiredTop.coerceIn(margin, maxTop)
+            return DocPoint(
+                xPt = targetLeft - selectionBounds.leftPt,
+                yPt = targetTop - selectionBounds.topPt
+            )
+        }
 
         fun extractStylusPoints(stroke: Stroke): List<StylusPointSample> {
             val inputs = stroke.inputs

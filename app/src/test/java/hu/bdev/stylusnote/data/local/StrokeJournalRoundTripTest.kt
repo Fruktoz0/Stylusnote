@@ -1,5 +1,6 @@
 package hu.bdev.stylusnote.data.local
 
+import hu.bdev.stylusnote.core.code.CodeLanguage
 import hu.bdev.stylusnote.core.hardware.PressureCurve
 import hu.bdev.stylusnote.core.hardware.StylusPointSample
 import hu.bdev.stylusnote.core.math.DocPoint
@@ -10,6 +11,7 @@ import hu.bdev.stylusnote.domain.model.AffineTransform2D
 import hu.bdev.stylusnote.domain.model.BrushConfig
 import hu.bdev.stylusnote.domain.model.BrushToolType
 import hu.bdev.stylusnote.domain.model.CanvasAction
+import hu.bdev.stylusnote.domain.model.ClozeTapePattern
 import hu.bdev.stylusnote.domain.model.GeometricShapeType
 import hu.bdev.stylusnote.domain.model.PageObject
 import hu.bdev.stylusnote.domain.model.PersistedStrokeRecord
@@ -175,6 +177,36 @@ class StrokeJournalRoundTripTest {
                 bounds = DocRect(150f, 360f, 390f, 540f),
                 imageAssetRelativePath = "pages/page-1/images/sample.png",
                 rotationRadians = 0.42f
+            ),
+            PageObject.CodeBlockObject(
+                id = "code-1",
+                zOrder = 108L,
+                bounds = DocRect(40f, 560f, 320f, 700f),
+                language = CodeLanguage.SQL,
+                codeText = "SELECT id, title FROM notebooks WHERE archived = 0;",
+                fontSizePt = 11.5f,
+                title = "Lekérdezés",
+                showLineNumbers = true,
+                rotationRadians = 0.08f
+            ),
+            PageObject.ClozeTapeObject(
+                id = "cloze-1",
+                zOrder = 109L,
+                bounds = DocRect(80f, 710f, 260f, 732f),
+                canonicalColorArgb = 0xFFFDE68A.toInt(),
+                patternStyle = ClozeTapePattern.DOTS,
+                rotationRadians = 0.03f,
+                label = "Definíció"
+            ),
+            PageObject.TableObject(
+                id = "table-1",
+                zOrder = 110L,
+                bounds = DocRect(48f, 120f, 460f, 340f),
+                rows = 5,
+                columns = 4,
+                borderStrokeWidthPt = 1.4f,
+                canonicalBorderColorArgb = 0xFF2563EB.toInt(),
+                hasHeaderRow = true
             )
         )
 

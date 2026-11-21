@@ -547,4 +547,169 @@ object StylusIcons {
             }
         }.build()
     }
+
+    /**
+     * StarNote-styled Cloze / Masking tape icon (tilted diagonal-striped amber/teal tape band).
+     */
+    val ClozeTape: ImageVector by lazy {
+        ImageVector.Builder(
+            name = "ClozeTape",
+            defaultWidth = 24.dp,
+            defaultHeight = 24.dp,
+            viewportWidth = 24f,
+            viewportHeight = 24f
+        ).apply {
+            // Tape body
+            path(
+                fill = SolidColor(Color(0xFFFDE68A)),
+                stroke = SolidColor(Color(0xFFD97706)),
+                strokeLineWidth = 1.5f,
+                strokeLineJoin = StrokeJoin.Round
+            ) {
+                moveTo(3.2f, 14.2f)
+                lineTo(15.2f, 4.4f)
+                lineTo(20.8f, 9.8f)
+                lineTo(8.8f, 19.6f)
+                close()
+            }
+            // Diagonal hatching stripes inside tape
+            path(
+                fill = null,
+                stroke = SolidColor(Color(0xFFB45309)),
+                strokeLineWidth = 1.4f,
+                strokeLineCap = StrokeCap.Round
+            ) {
+                moveTo(7.4f, 10.8f)
+                lineTo(11.6f, 16.4f)
+                moveTo(11.0f, 7.8f)
+                lineTo(15.2f, 13.4f)
+                moveTo(14.6f, 5.2f)
+                lineTo(18.3f, 10.2f)
+            }
+            // Subtle ink underline peek beneath tape
+            path(
+                fill = null,
+                stroke = strokeBrush,
+                strokeLineWidth = 1.6f,
+                strokeLineCap = StrokeCap.Round
+            ) {
+                moveTo(13.5f, 19.5f)
+                lineTo(20.5f, 19.5f)
+            }
+        }.build()
+    }
+
+    /**
+     * Syntax-highlighted embedded code block icon (`</>` inside monospace rounded card).
+     */
+    val CodeBlock: ImageVector by lazy {
+        ImageVector.Builder(
+            name = "CodeBlock",
+            defaultWidth = 24.dp,
+            defaultHeight = 24.dp,
+            viewportWidth = 24f,
+            viewportHeight = 24f
+        ).apply {
+            path(
+                fill = SolidColor(Color(0xFFEFF6FF)),
+                stroke = SolidColor(Color(0xFF334155)),
+                strokeLineWidth = 1.6f,
+                strokeLineJoin = StrokeJoin.Round
+            ) {
+                moveTo(3.5f, 4.5f)
+                lineTo(20.5f, 4.5f)
+                lineTo(20.5f, 19.5f)
+                lineTo(3.5f, 19.5f)
+                close()
+            }
+            // Left `<` bracket
+            path(
+                fill = null,
+                stroke = SolidColor(Color(0xFF7C3AED)),
+                strokeLineWidth = 1.8f,
+                strokeLineCap = StrokeCap.Round,
+                strokeLineJoin = StrokeJoin.Round
+            ) {
+                moveTo(9.0f, 9.0f)
+                lineTo(6.2f, 12.0f)
+                lineTo(9.0f, 15.0f)
+            }
+            // Center `/` slash
+            path(
+                fill = null,
+                stroke = SolidColor(Color(0xFF0284C7)),
+                strokeLineWidth = 1.8f,
+                strokeLineCap = StrokeCap.Round
+            ) {
+                moveTo(13.4f, 8.2f)
+                lineTo(10.6f, 15.8f)
+            }
+            // Right `>` bracket
+            path(
+                fill = null,
+                stroke = SolidColor(Color(0xFF7C3AED)),
+                strokeLineWidth = 1.8f,
+                strokeLineCap = StrokeCap.Round,
+                strokeLineJoin = StrokeJoin.Round
+            ) {
+                moveTo(15.0f, 9.0f)
+                lineTo(17.8f, 12.0f)
+                lineTo(15.0f, 15.0f)
+            }
+        }.build()
+    }
+
+    /**
+     * Multi-tone N × M table grid icon with highlighted header band for inserting static tables.
+     */
+    val TableGrid: ImageVector by lazy {
+        ImageVector.Builder(
+            name = "TableGrid",
+            defaultWidth = 24.dp,
+            defaultHeight = 24.dp,
+            viewportWidth = 24f,
+            viewportHeight = 24f
+        ).apply {
+            // Tinted top header bar
+            path(
+                fill = SolidColor(Color(0xFFDBEAFE)),
+                stroke = null
+            ) {
+                moveTo(4.0f, 4.5f)
+                lineTo(20.0f, 4.5f)
+                lineTo(20.0f, 9.5f)
+                lineTo(4.0f, 9.5f)
+                close()
+            }
+            // Outer rounded grid frame
+            path(
+                fill = null,
+                stroke = SolidColor(Color(0xFF2563EB)),
+                strokeLineWidth = 1.7f,
+                strokeLineJoin = StrokeJoin.Round
+            ) {
+                moveTo(4.0f, 4.5f)
+                lineTo(20.0f, 4.5f)
+                lineTo(20.0f, 19.5f)
+                lineTo(4.0f, 19.5f)
+                close()
+            }
+            // Horizontal row dividers + vertical column dividers
+            path(
+                fill = null,
+                stroke = SolidColor(Color(0xFF334155)),
+                strokeLineWidth = 1.4f,
+                strokeLineCap = StrokeCap.Round
+            ) {
+                moveTo(4.0f, 9.5f)
+                lineTo(20.0f, 9.5f)
+                moveTo(4.0f, 14.5f)
+                lineTo(20.0f, 14.5f)
+                moveTo(9.5f, 4.5f)
+                lineTo(9.5f, 19.5f)
+                moveTo(14.8f, 4.5f)
+                lineTo(14.8f, 19.5f)
+            }
+        }.build()
+    }
 }

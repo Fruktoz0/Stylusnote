@@ -171,6 +171,39 @@ class CanvasTransformMatrix(
     }
 
     /**
+     * Advances vertical pan by [dyPx] while clamping against document boundaries `[minPanYPx, maxPanYPx]`.
+     * Allows movement back inside bounds if already slightly outside, but stops at the edge and
+     * returns `true` if a boundary stopped further travel.
+     */
+    @Synchronized
+    fun panYWithBoundaryClamp(
+        dyPx: Float,
+        minPanYPx: Float,
+        maxPanYPx: Float
+    ): Boolean {
+        if (!dyPx.isFinite() || dyPx == 0f) return false
+        val current = _panYPx
+        val candidate = current + dyPx
+        var hitBoundary = false
+        val clamped = when {
+            dyPx < 0f && candidate <= minPanYPx -> {
+                hitBoundary = true
+                min(current, minPanYPx)
+            }
+            dyPx > 0f && candidate >= maxPanYPx -> {
+                hitBoundary = true
+                max(current, maxPanYPx)
+            }
+            else -> candidate
+        }
+        if (clamped != current) {
+            _panYPx = clamped
+            _version++
+        }
+        return hitBoundary
+    }
+
+    /**
      * Scales the canvas around [focalXPx], [focalYPx] in screen coordinates while keeping
      * the underlying document point stationary under the user's fingers.
      */

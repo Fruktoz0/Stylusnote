@@ -195,9 +195,42 @@ object SearchTextIndexer {
                         )
                     }
                 }
+                is PageObject.CodeBlockObject -> {
+                    val combined = buildString {
+                        if (obj.title.isNotBlank()) {
+                            append(obj.title.trim())
+                            if (obj.codeText.isNotBlank()) append('\n')
+                        }
+                        if (obj.codeText.isNotBlank()) {
+                            append(obj.codeText.trim())
+                        }
+                    }
+                    if (combined.isNotEmpty()) {
+                        out.add(
+                            IndexedSearchFragment(
+                                text = combined,
+                                docRect = obj.bounds,
+                                source = SearchMatchSource.FORMATTED_TEXT
+                            )
+                        )
+                    }
+                }
+                is PageObject.ClozeTapeObject -> {
+                    val lbl = obj.label.trim()
+                    if (lbl.isNotEmpty()) {
+                        out.add(
+                            IndexedSearchFragment(
+                                text = lbl,
+                                docRect = obj.bounds,
+                                source = SearchMatchSource.FORMATTED_TEXT
+                            )
+                        )
+                    }
+                }
                 is PageObject.PdfPageRefObject,
                 is PageObject.GeometricShapeObject,
-                is PageObject.ImageObject -> Unit
+                is PageObject.ImageObject,
+                is PageObject.TableObject -> Unit
             }
         }
         return out
@@ -756,6 +789,16 @@ class InNotebookSearchCoordinator(
                     h = h * 31L + o.stepsMarkdownLatex.hashCode().toLong()
                 }
                 is PageObject.FunctionPlotObject -> h = h * 31L + o.expression.hashCode().toLong()
+                is PageObject.CodeBlockObject -> {
+                    h = h * 31L + o.language.name.hashCode().toLong()
+                    h = h * 31L + o.title.hashCode().toLong()
+                    h = h * 31L + o.codeText.hashCode().toLong()
+                }
+                is PageObject.ClozeTapeObject -> {
+                    h = h * 31L + o.label.hashCode().toLong()
+                    h = h * 31L + o.canonicalColorArgb.toLong()
+                    h = h * 31L + o.patternStyle.name.hashCode().toLong()
+                }
                 else -> Unit
             }
         }

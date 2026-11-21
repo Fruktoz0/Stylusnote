@@ -31,7 +31,9 @@ data class ToolDockPrefs(
     val isCollapsed: Boolean = false,
     val isVertical: Boolean = false,
     val leftTabYFraction: Float = 0.5f,
-    val perToolConfigsRaw: String = ""
+    val perToolConfigsRaw: String = "",
+    val highlighterAutoSize: Boolean = true,
+    val topToolbarAutoHide: Boolean = false
 )
 
 class ToolDockPreferencesStore(private val context: Context) {
@@ -43,7 +45,9 @@ class ToolDockPreferencesStore(private val context: Context) {
             isCollapsed = prefs[KEY_IS_COLLAPSED] ?: false,
             isVertical = prefs[KEY_IS_VERTICAL] ?: false,
             leftTabYFraction = (prefs[KEY_LEFT_TAB_Y_FRACTION] ?: 0.5f).coerceIn(0.08f, 0.92f),
-            perToolConfigsRaw = prefs[KEY_PER_TOOL_CONFIGS] ?: ""
+            perToolConfigsRaw = prefs[KEY_PER_TOOL_CONFIGS] ?: "",
+            highlighterAutoSize = prefs[KEY_HIGHLIGHTER_AUTO_SIZE] ?: true,
+            topToolbarAutoHide = prefs[KEY_TOP_TOOLBAR_AUTO_HIDE] ?: false
         )
     }
 
@@ -57,12 +61,26 @@ class ToolDockPreferencesStore(private val context: Context) {
             if (next.perToolConfigsRaw.isNotEmpty()) {
                 prefs[KEY_PER_TOOL_CONFIGS] = next.perToolConfigsRaw
             }
+            prefs[KEY_HIGHLIGHTER_AUTO_SIZE] = next.highlighterAutoSize
+            prefs[KEY_TOP_TOOLBAR_AUTO_HIDE] = next.topToolbarAutoHide
         }
     }
 
     suspend fun saveLeftTabYFraction(fraction: Float) {
         context.toolDockDataStore.edit { prefs ->
             prefs[KEY_LEFT_TAB_Y_FRACTION] = fraction.coerceIn(0.08f, 0.92f)
+        }
+    }
+
+    suspend fun saveHighlighterAutoSize(enabled: Boolean) {
+        context.toolDockDataStore.edit { prefs ->
+            prefs[KEY_HIGHLIGHTER_AUTO_SIZE] = enabled
+        }
+    }
+
+    suspend fun saveTopToolbarAutoHide(enabled: Boolean) {
+        context.toolDockDataStore.edit { prefs ->
+            prefs[KEY_TOP_TOOLBAR_AUTO_HIDE] = enabled
         }
     }
 
@@ -80,6 +98,8 @@ class ToolDockPreferencesStore(private val context: Context) {
         private val KEY_IS_VERTICAL = booleanPreferencesKey("dock_is_vertical")
         private val KEY_LEFT_TAB_Y_FRACTION = floatPreferencesKey("left_tab_y_fraction")
         private val KEY_PER_TOOL_CONFIGS = stringPreferencesKey("per_tool_configs_v1")
+        private val KEY_HIGHLIGHTER_AUTO_SIZE = booleanPreferencesKey("highlighter_auto_size_v1")
+        private val KEY_TOP_TOOLBAR_AUTO_HIDE = booleanPreferencesKey("top_toolbar_auto_hide_v1")
 
         fun defaultToolConfig(toolType: BrushToolType): BrushConfig = when (toolType) {
             BrushToolType.FOUNTAIN_PEN -> BrushConfig(
@@ -91,10 +111,17 @@ class ToolDockPreferencesStore(private val context: Context) {
             )
             BrushToolType.HIGHLIGHTER -> BrushConfig(
                 toolType = BrushToolType.HIGHLIGHTER,
-                sizePt = 16.0f,
+                sizePt = BrushConfig.computeRecommendedHighlighterSizePt(2.0f),
                 colorArgb = BrushConfig.DEFAULT_HIGHLIGHTER_COLOR_ARGB,
                 opacity = BrushConfig.HIGHLIGHTER_OPACITY,
                 stabilizationPercent = 40f
+            )
+            BrushToolType.CLOZE_TAPE -> BrushConfig(
+                toolType = BrushToolType.CLOZE_TAPE,
+                sizePt = BrushConfig.DEFAULT_CLOZE_TAPE_SIZE_PT,
+                colorArgb = BrushConfig.DEFAULT_CLOZE_TAPE_COLOR_ARGB,
+                opacity = 1.0f,
+                stabilizationPercent = 0f
             )
             BrushToolType.PRECISION_ERASER -> BrushConfig(
                 toolType = BrushToolType.PRECISION_ERASER,
@@ -115,6 +142,7 @@ class ToolDockPreferencesStore(private val context: Context) {
         fun defaultPerToolConfigsMap(): Map<BrushToolType, BrushConfig> = linkedMapOf(
             BrushToolType.FOUNTAIN_PEN to defaultToolConfig(BrushToolType.FOUNTAIN_PEN),
             BrushToolType.HIGHLIGHTER to defaultToolConfig(BrushToolType.HIGHLIGHTER),
+            BrushToolType.CLOZE_TAPE to defaultToolConfig(BrushToolType.CLOZE_TAPE),
             BrushToolType.PRECISION_ERASER to defaultToolConfig(BrushToolType.PRECISION_ERASER),
             BrushToolType.VECTOR_ERASER to defaultToolConfig(BrushToolType.VECTOR_ERASER),
             BrushToolType.LASSO to defaultToolConfig(BrushToolType.LASSO)

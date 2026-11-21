@@ -7,31 +7,41 @@ import android.graphics.Canvas as AndroidCanvas
 import android.graphics.Color as AndroidColor
 import android.graphics.Paint
 import android.util.LruCache
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.RotateRight
 import androidx.compose.material.icons.automirrored.filled.Undo
@@ -40,23 +50,31 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Functions
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.ShowChart
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Button
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -66,6 +84,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
@@ -74,6 +94,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.nativeCanvas
@@ -89,11 +110,18 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalWindowInfo
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -104,13 +132,16 @@ import hu.bdev.stylusnote.core.ai.FunctionEvaluator
 import hu.bdev.stylusnote.core.ai.FunctionParseException
 import hu.bdev.stylusnote.core.ai.GeminiClient
 import hu.bdev.stylusnote.core.ai.HandwritingFormatGeometry
+import hu.bdev.stylusnote.core.ai.LiveMathSuggestionEngine
 import hu.bdev.stylusnote.core.ai.UserInitiatedAiTrigger
+import hu.bdev.stylusnote.core.code.CodeLanguage
 import hu.bdev.stylusnote.core.hardware.StylusPointSample
 import hu.bdev.stylusnote.core.hardware.toStrokeInputBatch
 import hu.bdev.stylusnote.core.math.CanvasTransformMatrix
 import hu.bdev.stylusnote.core.math.ColorLuminanceInverter
 import hu.bdev.stylusnote.core.math.DocPoint
 import hu.bdev.stylusnote.core.math.DocRect
+import hu.bdev.stylusnote.core.math.ScreenPoint
 import hu.bdev.stylusnote.core.math.GeometricShapeRenderer
 import hu.bdev.stylusnote.core.math.RecognizedShapeType
 import hu.bdev.stylusnote.core.math.ShapeMeta
@@ -120,6 +151,7 @@ import hu.bdev.stylusnote.data.local.StrokeBinarySerializer
 import hu.bdev.stylusnote.data.local.StrokeJournal
 import hu.bdev.stylusnote.domain.model.AffineTransform2D
 import hu.bdev.stylusnote.domain.model.BrushConfig
+import hu.bdev.stylusnote.domain.model.ClozeTapePattern
 import hu.bdev.stylusnote.domain.model.ObjectAttachmentGeometry
 import hu.bdev.stylusnote.domain.model.OcrLanguageTag
 import hu.bdev.stylusnote.domain.model.PageObject
@@ -127,6 +159,7 @@ import hu.bdev.stylusnote.domain.model.PersistedStrokeRecord
 import hu.bdev.stylusnote.domain.model.StrokeLayerType
 import hu.bdev.stylusnote.domain.repository.CanvasStateHolder
 import hu.bdev.stylusnote.ui.theme.HandwritingFontFamily
+import hu.bdev.stylusnote.ui.theme.LocalStylusSurfacePalette
 import org.json.JSONObject
 import ru.noties.jlatexmath.JLatexMathDrawable
 import kotlin.math.PI
@@ -397,12 +430,15 @@ object HandwritingToLatexConverter {
 
         val response = geminiClient.generateContent(
             trigger = UserInitiatedAiTrigger.LASSO_TO_LATEX,
-            promptText = "Alakítsd át a képen látható kézzel írt matematikai kifejezést pontos LaTeX-re. " +
-                "Kizárólag érvényes JSON objektumot adj vissza egyetlen \"latex\" szöveges mezővel.",
+            promptText = "Alakítsd át a képen látható kézzel írt matematikai kifejezést pontos, szabványos LaTeX kóddá " +
+                "(tört: \\frac{a}{b}, hatvány: x^{n}, index: a_{i}, gyök: \\sqrt{x}, integrál: \\int_{a}^{b}, szumma: \\sum_{i=1}^{n}, " +
+                "görög betűk, egyenlőtlenségek, egyenletrendszer/mátrix). Kizárólag érvényes JSON objektumot adj vissza egyetlen \"latex\" szöveges mezővel, " +
+                "a képen ténylegesen látható matematikai tartalommal.",
             inlinePngImages = listOf(pngBytes),
             responseMimeType = "application/json",
             responseSchemaJson = LATEX_RESPONSE_SCHEMA,
-            systemInstruction = "Matematikai OCR asszisztens vagy. Mindig egyetlen {\"latex\": \"...\"} JSON objektummal válaszolj."
+            systemInstruction = "Precíz matematikai kézírás-LaTeX konvertáló vagy. Csak azt írd le, ami a képen ténylegesen szerepel; " +
+                "soha ne találj ki példaképletet. Mindig egyetlen {\"latex\": \"...\"} JSON objektummal válaszolj."
         )
 
         val extracted = GeminiClient.extractJsonStringField(response.text, "latex")
@@ -1197,6 +1233,11 @@ fun PageObjectsOverlayLayer(
     viewportTransformTick: Long = 0L,
     pageOriginXPt: Float = 0f,
     pageOriginYPt: Float = 0f,
+    revealedClozeTapeIds: Set<String> = emptySet(),
+    onToggleRevealClozeTape: (String) -> Unit = {},
+    onEditCodeBlock: (PageObject.CodeBlockObject) -> Unit = {},
+    onEditLatex: (PageObject.LatexObject) -> Unit = {},
+    onPlotLatexFunction: (PageObject.LatexObject) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     // Reading viewportTransformTick forces Compose to track pan/zoom changes on the paper so objects stick 1:1.
@@ -1205,6 +1246,7 @@ fun PageObjectsOverlayLayer(
     val scale = snapshot.scale.coerceAtLeast(0.1f)
     val currentScale by rememberUpdatedState(scale)
     var overlayCoords by remember { mutableStateOf<LayoutCoordinates?>(null) }
+    var containerSizePx by remember { mutableStateOf(IntSize.Zero) }
     var activeDragPreview by remember(pageId) { mutableStateOf<LiveObjectInteractionPreview?>(null) }
 
     DisposableEffect(pageId, selectedObjectId, liveObjectInteractionController) {
@@ -1259,6 +1301,7 @@ fun PageObjectsOverlayLayer(
     Box(
         modifier = modifier
             .fillMaxSize()
+            .onSizeChanged { containerSizePx = it }
             .onGloballyPositioned { overlayCoords = it }
     ) {
         val liveLassoAffine = remember(
@@ -1280,8 +1323,11 @@ fun PageObjectsOverlayLayer(
             }
         }
 
-        for (rawObj in pageObjects) {
-            if (rawObj is PageObject.PdfPageRefObject) continue
+        val orderedObjects = remember(pageObjects) {
+            pageObjects.sortedBy { if (it is PageObject.ClozeTapeObject) 1 else 0 }
+        }
+        for (rawObj in orderedObjects) {
+            if (rawObj is PageObject.PdfPageRefObject || rawObj is PageObject.TableObject) continue
             val lassoObj = if (liveLassoAffine != null && rawObj.id in lassoPreviewObjectIds) {
                 rawObj.transform(liveLassoAffine)
             } else {
@@ -1293,8 +1339,10 @@ fun PageObjectsOverlayLayer(
                 obj.bounds.leftPt + pageOriginXPt,
                 obj.bounds.topPt + pageOriginYPt
             )
-            val widthPx = (obj.bounds.widthPt * scale).coerceAtLeast(36f)
-            val heightPx = (obj.bounds.heightPt * scale).coerceAtLeast(28f)
+            val minW = if (obj is PageObject.ClozeTapeObject) 18f else 36f
+            val minH = if (obj is PageObject.ClozeTapeObject) 10f else 28f
+            val widthPx = (obj.bounds.widthPt * scale).coerceAtLeast(minW)
+            val heightPx = (obj.bounds.heightPt * scale).coerceAtLeast(minH)
             val isSelected = (obj.id == selectedObjectId)
 
             val density = LocalDensity.current
@@ -1400,12 +1448,28 @@ fun PageObjectsOverlayLayer(
                         imageObject = obj,
                         isSelected = isSelected
                     )
+
+                    is PageObject.CodeBlockObject -> CodeBlockOverlayNode(
+                        codeBlock = obj,
+                        isSelected = isSelected
+                    )
+
+                    is PageObject.ClozeTapeObject -> ClozeTapeOverlayNode(
+                        clozeTape = obj,
+                        isOledMode = isOledMode,
+                        isSelected = isSelected,
+                        isRevealed = obj.id in revealedClozeTapeIds
+                    )
+
+                    is PageObject.TableObject -> Unit
                 }
             }
 
             val boxRotationRadians = when (obj) {
                 is PageObject.GeometricShapeObject -> obj.rotationRadians
                 is PageObject.ImageObject -> obj.rotationRadians
+                is PageObject.CodeBlockObject -> obj.rotationRadians
+                is PageObject.ClozeTapeObject -> obj.rotationRadians
                 else -> null
             }
             if (isSelected && boxRotationRadians != null) {
@@ -1419,6 +1483,8 @@ fun PageObjectsOverlayLayer(
                     pageOriginYPt = pageOriginYPt,
                     widthPx = widthPx,
                     heightPx = heightPx,
+                    minWidthPt = if (obj is PageObject.ClozeTapeObject) 18f else 24f,
+                    minHeightPt = if (obj is PageObject.ClozeTapeObject) 10f else 24f,
                     overlayCoordsProvider = { overlayCoords },
                     onInteractionStart = {
                         handleBaselineObj = latestObj
@@ -1428,6 +1494,8 @@ fun PageObjectsOverlayLayer(
                         val updated = when (val cur = latestObj) {
                             is PageObject.GeometricShapeObject -> cur.copy(bounds = newBounds)
                             is PageObject.ImageObject -> cur.copy(bounds = newBounds)
+                            is PageObject.CodeBlockObject -> cur.copy(bounds = newBounds)
+                            is PageObject.ClozeTapeObject -> cur.copy(bounds = newBounds)
                             else -> cur
                         }
                         val affine = ObjectAttachmentGeometry.computeObjectInteractionAffine(baseline, updated)
@@ -1438,6 +1506,8 @@ fun PageObjectsOverlayLayer(
                         val updated = when (val cur = latestObj) {
                             is PageObject.GeometricShapeObject -> cur.copy(rotationRadians = newAngle)
                             is PageObject.ImageObject -> cur.copy(rotationRadians = newAngle)
+                            is PageObject.CodeBlockObject -> cur.copy(rotationRadians = newAngle)
+                            is PageObject.ClozeTapeObject -> cur.copy(rotationRadians = newAngle)
                             else -> cur
                         }
                         val affine = ObjectAttachmentGeometry.computeObjectInteractionAffine(baseline, updated)
@@ -1459,12 +1529,27 @@ fun PageObjectsOverlayLayer(
                 (obj is PageObject.LatexObject ||
                     obj is PageObject.FormattedTextObject ||
                     obj is PageObject.GeometricShapeObject ||
-                    obj is PageObject.ImageObject)
+                    obj is PageObject.ImageObject ||
+                    obj is PageObject.CodeBlockObject ||
+                    obj is PageObject.ClozeTapeObject)
             ) {
                 FloatingObjectActionPill(
                     obj = obj,
                     screenTopLeft = screenTopLeft,
                     heightPx = heightPx,
+                    containerWidthPx = containerSizePx.width,
+                    containerHeightPx = containerSizePx.height,
+                    isClozeRevealed = obj is PageObject.ClozeTapeObject && obj.id in revealedClozeTapeIds,
+                    onToggleRevealCloze = { onToggleRevealClozeTape(obj.id) },
+                    onEditCodeBlock = {
+                        if (obj is PageObject.CodeBlockObject) onEditCodeBlock(obj)
+                    },
+                    onEditLatex = {
+                        if (obj is PageObject.LatexObject) onEditLatex(obj)
+                    },
+                    onPlotLatexFunction = {
+                        if (obj is PageObject.LatexObject) onPlotLatexFunction(obj)
+                    },
                     onUpdateObject = onUpdateObject,
                     onTransformObject = { beforeObj, afterObj ->
                         if (onCommitObjectInteraction != null) {
@@ -1484,12 +1569,91 @@ fun PageObjectsOverlayLayer(
     }
 }
 
+/**
+ * Pure-Kotlin viewport clamping & above/below flip calculation for [FloatingObjectActionPill],
+ * guaranteeing the floating action bar never clips past screen boundaries.
+ */
+internal fun computeClampedActionPillOffsetPx(
+    anchorLeftPx: Float,
+    anchorTopPx: Float,
+    anchorHeightPx: Float,
+    pillWidthPx: Int,
+    pillHeightPx: Int,
+    viewportWidthPx: Int,
+    viewportHeightPx: Int,
+    marginPx: Int = 12,
+    gapPx: Int = 8
+): IntOffset {
+    val resolvedW = pillWidthPx.coerceAtLeast(1)
+    val resolvedH = pillHeightPx.coerceAtLeast(1)
+    val maxX = if (viewportWidthPx > 0) {
+        (viewportWidthPx - resolvedW - marginPx).coerceAtLeast(marginPx)
+    } else {
+        Int.MAX_VALUE
+    }
+    val clampedX = anchorLeftPx.roundToInt().coerceIn(marginPx, maxX)
+
+    val belowY = (anchorTopPx + anchorHeightPx + gapPx).roundToInt()
+    val aboveY = (anchorTopPx - resolvedH - gapPx).roundToInt()
+    val clampedY = if (viewportHeightPx > 0) {
+        val maxY = (viewportHeightPx - resolvedH - marginPx).coerceAtLeast(marginPx)
+        when {
+            belowY + resolvedH <= viewportHeightPx - marginPx -> belowY.coerceAtLeast(marginPx)
+            aboveY >= marginPx -> aboveY.coerceAtMost(maxY)
+            else -> belowY.coerceIn(marginPx, maxY)
+        }
+    } else {
+        belowY.coerceAtLeast(marginPx)
+    }
+    return IntOffset(x = clampedX, y = clampedY)
+}
+
+/**
+ * Pure-Kotlin cursor-aware LaTeX snippet inserter replacing any active selection and moving
+ * the caret [cursorBackOffset] chars before the snippet end for brace body editing.
+ */
+internal fun insertLatexSnippetAtCursor(
+    current: TextFieldValue,
+    snippet: String,
+    cursorBackOffset: Int = 0
+): TextFieldValue {
+    val text = current.text
+    val start = current.selection.min.coerceIn(0, text.length)
+    val end = current.selection.max.coerceIn(start, text.length)
+    val needLeadingSpace = start > 0 &&
+        !text[start - 1].isWhitespace() &&
+        text[start - 1] != '{' &&
+        text[start - 1] != '(' &&
+        text[start - 1] != '^' &&
+        text[start - 1] != '_' &&
+        !snippet.startsWith("^") &&
+        !snippet.startsWith("_")
+    val prefixSpace = if (needLeadingSpace) " " else ""
+    val before = text.substring(0, start)
+    val after = text.substring(end)
+    val updatedText = before + prefixSpace + snippet + after
+    val endCursor = before.length + prefixSpace.length + snippet.length
+    val targetCursor = (endCursor - cursorBackOffset.coerceAtLeast(0))
+        .coerceIn(before.length + prefixSpace.length, updatedText.length)
+    return TextFieldValue(
+        text = updatedText,
+        selection = TextRange(targetCursor)
+    )
+}
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun FloatingObjectActionPill(
     obj: PageObject,
-    screenTopLeft: hu.bdev.stylusnote.core.math.ScreenPoint,
+    screenTopLeft: ScreenPoint,
     heightPx: Float,
+    containerWidthPx: Int = 0,
+    containerHeightPx: Int = 0,
+    isClozeRevealed: Boolean = false,
+    onToggleRevealCloze: () -> Unit = {},
+    onEditCodeBlock: () -> Unit = {},
+    onEditLatex: () -> Unit = {},
+    onPlotLatexFunction: () -> Unit = {},
     onUpdateObject: (PageObject) -> Unit,
     onTransformObject: (beforeObject: PageObject, afterObject: PageObject) -> Unit,
     onDeleteObject: () -> Unit,
@@ -1500,24 +1664,44 @@ private fun FloatingObjectActionPill(
     val canRestoreOriginal =
         (obj is PageObject.LatexObject && obj.originalStrokes.isNotEmpty()) ||
             (obj is PageObject.FormattedTextObject && obj.originalStrokes.isNotEmpty())
+    val density = LocalDensity.current
+    var pillSizePx by remember { mutableStateOf(IntSize.Zero) }
+    val pillButtonPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+    val maxPillWidthDp = if (containerWidthPx > 0) {
+        with(density) { (containerWidthPx - 24).coerceAtLeast(180).toDp() }
+    } else {
+        560.dp
+    }
     Surface(
-        modifier = Modifier.offset {
-            IntOffset(
-                x = screenTopLeft.xPx.roundToInt().coerceAtLeast(8),
-                y = (screenTopLeft.yPx + heightPx + 8f).roundToInt().coerceAtLeast(8)
-            )
-        },
+        modifier = Modifier
+            .widthIn(max = maxPillWidthDp)
+            .onSizeChanged { pillSizePx = it }
+            .offset {
+                computeClampedActionPillOffsetPx(
+                    anchorLeftPx = screenTopLeft.xPx,
+                    anchorTopPx = screenTopLeft.yPx,
+                    anchorHeightPx = heightPx,
+                    pillWidthPx = pillSizePx.width.takeIf { it > 0 } ?: 320,
+                    pillHeightPx = pillSizePx.height.takeIf { it > 0 } ?: 56,
+                    viewportWidthPx = containerWidthPx,
+                    viewportHeightPx = containerHeightPx
+                )
+            }
+            .testTag("floating_object_action_pill"),
         shape = RoundedCornerShape(14.dp),
         tonalElevation = 6.dp,
         shadowElevation = 8.dp
     ) {
         FlowRow(
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp)
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
         ) {
             if (canRestoreOriginal) {
-                TextButton(onClick = onRestoreOriginalStrokes) {
+                TextButton(
+                    onClick = onRestoreOriginalStrokes,
+                    contentPadding = pillButtonPadding
+                ) {
                     Icon(
                         imageVector = Icons.AutoMirrored.Filled.Undo,
                         contentDescription = null,
@@ -1529,7 +1713,40 @@ private fun FloatingObjectActionPill(
             }
 
             if (obj is PageObject.LatexObject) {
-                TextButton(onClick = { onRequestStepByStep(obj) }) {
+                TextButton(
+                    onClick = onEditLatex,
+                    contentPadding = pillButtonPadding,
+                    modifier = Modifier.testTag("latex_pill_edit_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Edit,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Szerkesztés")
+                }
+                val plottableExpr = remember(obj.latexSource) {
+                    LiveMathSuggestionEngine.extractPlotExpressionFromLatex(obj.latexSource)
+                }
+                if (plottableExpr != null) {
+                    TextButton(
+                        onClick = onPlotLatexFunction,
+                        contentPadding = pillButtonPadding
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ShowChart,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Grafikon")
+                    }
+                }
+                TextButton(
+                    onClick = { onRequestStepByStep(obj) },
+                    contentPadding = pillButtonPadding
+                ) {
                     Icon(
                         imageVector = Icons.Default.AutoAwesome,
                         contentDescription = null,
@@ -1537,6 +1754,54 @@ private fun FloatingObjectActionPill(
                     )
                     Spacer(modifier = Modifier.width(4.dp))
                     Text("Levezetés")
+                }
+            }
+
+            if (obj is PageObject.CodeBlockObject) {
+                TextButton(onClick = onEditCodeBlock) {
+                    Icon(
+                        imageVector = Icons.Default.Edit,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Szerkesztés (${obj.language.badge})")
+                }
+            }
+
+            if (obj is PageObject.ClozeTapeObject) {
+                TextButton(onClick = onToggleRevealCloze) {
+                    Icon(
+                        imageVector = if (isClozeRevealed) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(if (isClozeRevealed) "Visszazárás" else "Felfedés")
+                }
+                ClozeTapePattern.entries.forEach { pattern ->
+                    val selectedPattern = pattern == obj.patternStyle
+                    Surface(
+                        onClick = { onUpdateObject(obj.copy(patternStyle = pattern)) },
+                        shape = RoundedCornerShape(8.dp),
+                        color = if (selectedPattern) {
+                            MaterialTheme.colorScheme.primaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+                        }
+                    ) {
+                        Text(
+                            text = pattern.displayNameHu,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = if (selectedPattern) FontWeight.Bold else FontWeight.Medium,
+                            color = if (selectedPattern) {
+                                MaterialTheme.colorScheme.onPrimaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+                        )
+                    }
                 }
             }
 
@@ -1551,12 +1816,14 @@ private fun FloatingObjectActionPill(
             if (
                 obj is PageObject.LatexObject ||
                 obj is PageObject.FormattedTextObject ||
-                obj is PageObject.GeometricShapeObject
+                obj is PageObject.GeometricShapeObject ||
+                obj is PageObject.ClozeTapeObject
             ) {
                 val currentColor = when (obj) {
                     is PageObject.LatexObject -> obj.canonicalColorArgb
                     is PageObject.FormattedTextObject -> obj.canonicalColorArgb
                     is PageObject.GeometricShapeObject -> obj.canonicalStrokeColorArgb
+                    is PageObject.ClozeTapeObject -> obj.canonicalColorArgb
                     else -> BrushConfig.DEFAULT_INK_COLOR_ARGB
                 }
                 LATEX_COLOR_SWATCHES.forEach { swatchArgb ->
@@ -1580,6 +1847,7 @@ private fun FloatingObjectActionPill(
                                             canonicalFillColorArgb = (swatchArgb and 0x00FFFFFF) or 0x28000000
                                         )
                                     )
+                                    is PageObject.ClozeTapeObject -> onUpdateObject(obj.copy(canonicalColorArgb = swatchArgb))
                                     else -> Unit
                                 }
                             }
@@ -1598,8 +1866,12 @@ private fun FloatingObjectActionPill(
                         is PageObject.FormattedTextObject -> {
                             onUpdateObject(obj.copy(fontSizePt = (obj.fontSizePt + 2f).coerceAtMost(72f)))
                         }
+                        is PageObject.CodeBlockObject -> {
+                            onUpdateObject(obj.copy(fontSizePt = (obj.fontSizePt + 1.5f).coerceAtMost(22f)))
+                        }
                         is PageObject.GeometricShapeObject,
-                        is PageObject.ImageObject -> {
+                        is PageObject.ImageObject,
+                        is PageObject.ClozeTapeObject -> {
                             val cx = obj.bounds.centerXPt
                             val cy = obj.bounds.centerYPt
                             onTransformObject(obj, obj.transform(AffineTransform2D.scalingAround(1.15f, 1.15f, cx, cy)))
@@ -1623,8 +1895,12 @@ private fun FloatingObjectActionPill(
                         is PageObject.FormattedTextObject -> {
                             onUpdateObject(obj.copy(fontSizePt = (obj.fontSizePt - 2f).coerceAtLeast(10f)))
                         }
+                        is PageObject.CodeBlockObject -> {
+                            onUpdateObject(obj.copy(fontSizePt = (obj.fontSizePt - 1.5f).coerceAtLeast(8f)))
+                        }
                         is PageObject.GeometricShapeObject,
-                        is PageObject.ImageObject -> {
+                        is PageObject.ImageObject,
+                        is PageObject.ClozeTapeObject -> {
                             val cx = obj.bounds.centerXPt
                             val cy = obj.bounds.centerYPt
                             onTransformObject(obj, obj.transform(AffineTransform2D.scalingAround(0.87f, 0.87f, cx, cy)))
@@ -1637,13 +1913,20 @@ private fun FloatingObjectActionPill(
                 Icon(Icons.Default.Remove, contentDescription = "Kicsinyítés", modifier = Modifier.size(16.dp))
             }
 
-            if (obj is PageObject.GeometricShapeObject || obj is PageObject.ImageObject) {
+            if (
+                obj is PageObject.GeometricShapeObject ||
+                obj is PageObject.ImageObject ||
+                obj is PageObject.CodeBlockObject ||
+                obj is PageObject.ClozeTapeObject
+            ) {
                 IconButton(
                     onClick = {
                         val stepRad = (15.0 * PI / 180.0).toFloat()
                         val updated = when (obj) {
                             is PageObject.GeometricShapeObject -> obj.copy(rotationRadians = obj.rotationRadians + stepRad)
                             is PageObject.ImageObject -> obj.copy(rotationRadians = obj.rotationRadians + stepRad)
+                            is PageObject.CodeBlockObject -> obj.copy(rotationRadians = obj.rotationRadians + stepRad)
+                            is PageObject.ClozeTapeObject -> obj.copy(rotationRadians = obj.rotationRadians + stepRad)
                             else -> obj
                         }
                         onTransformObject(obj, updated)
@@ -2158,6 +2441,8 @@ private fun RotatableBoxInteractiveHandles(
     pageOriginYPt: Float,
     widthPx: Float,
     heightPx: Float,
+    minWidthPt: Float = 24f,
+    minHeightPt: Float = 24f,
     overlayCoordsProvider: () -> LayoutCoordinates?,
     onResizeBounds: (DocRect) -> Unit,
     onRotateRadians: (Float) -> Unit,
@@ -2234,8 +2519,8 @@ private fun RotatableBoxInteractiveHandles(
                         )
                         val vx = fingerDoc.xPt - oppDocX
                         val vy = fingerDoc.yPt - oppDocY
-                        val newW = ((vx * cosR + vy * sinR) * sx).coerceAtLeast(24f)
-                        val newH = ((-vx * sinR + vy * cosR) * sy).coerceAtLeast(24f)
+                        val newW = ((vx * cosR + vy * sinR) * sx).coerceAtLeast(minWidthPt)
+                        val newH = ((-vx * sinR + vy * cosR) * sy).coerceAtLeast(minHeightPt)
                         val cLocalX = sx * newW * 0.5f
                         val cLocalY = sy * newH * 0.5f
                         val newCx = oppDocX + cLocalX * cosR - cLocalY * sinR
@@ -2322,5 +2607,1040 @@ private fun RotatableBoxInteractiveHandles(
         )
     }
 }
+
+@Composable
+private fun CodeBlockOverlayNode(
+    codeBlock: PageObject.CodeBlockObject,
+    isSelected: Boolean
+) {
+    // Code block content renders beneath ink in DryCanvasView (Layer 2b) so strokes drawn
+    // on top or arrows beside lines remain layered cleanly above. Only the dashed selection
+    // outline renders in Layer 5 while actively selected.
+    if (!isSelected) return
+    val angleDeg = (codeBlock.rotationRadians * 180.0 / PI).toFloat()
+    Canvas(
+        modifier = Modifier
+            .fillMaxSize()
+            .graphicsLayer { rotationZ = angleDeg }
+    ) {
+        drawRect(
+            color = Color(0xFF1A56DB),
+            style = Stroke(
+                width = 1.8.dp.toPx(),
+                pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(
+                    floatArrayOf(10f, 8f),
+                    0f
+                )
+            )
+        )
+    }
+}
+
+@Composable
+private fun ClozeTapeOverlayNode(
+    clozeTape: PageObject.ClozeTapeObject,
+    isOledMode: Boolean,
+    isSelected: Boolean,
+    isRevealed: Boolean
+) {
+    val tapeAlpha by animateFloatAsState(
+        targetValue = if (isRevealed) 0.28f else 1.0f,
+        animationSpec = tween(durationMillis = 160),
+        label = "clozeTapeRevealAlpha"
+    )
+    Canvas(
+        modifier = Modifier
+            .fillMaxSize()
+            .graphicsLayer { alpha = if (isRevealed) tapeAlpha else 1f }
+    ) {
+        drawIntoCanvas { canvas ->
+            ClozeTapeCanvasRenderer.drawClozeTape(
+                canvas = canvas.nativeCanvas,
+                bounds = DocRect(0f, 0f, size.width, size.height),
+                canonicalColorArgb = clozeTape.canonicalColorArgb,
+                patternStyle = clozeTape.patternStyle,
+                rotationRadians = clozeTape.rotationRadians,
+                label = clozeTape.label,
+                isOledMode = isOledMode,
+                isRevealed = isRevealed
+            )
+        }
+        if (isSelected) {
+            val angleDeg = (clozeTape.rotationRadians * 180.0 / PI).toFloat()
+            rotate(degrees = angleDeg, pivot = Offset(size.width * 0.5f, size.height * 0.5f)) {
+                drawRect(
+                    color = Color(0xFF1A56DB),
+                    style = Stroke(
+                        width = 1.6.dp.toPx(),
+                        pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(
+                            floatArrayOf(8f, 6f),
+                            0f
+                        )
+                    )
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Modal editor for [PageObject.CodeBlockObject] zones with language switcher (`SQL | Python | JS/TS | C#`),
+ * monospace text area, line numbers toggle, live syntax-highlighted preview, and Rule-11 ESC +
+ * backdrop dismissal. On save, `bottomPt` expands downward only if needed so annotations outside
+ * the block do not shift.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun CodeBlockEditorDialog(
+    initialBlock: PageObject.CodeBlockObject,
+    isOledMode: Boolean,
+    onDismiss: () -> Unit,
+    onSave: (PageObject.CodeBlockObject) -> Unit
+) {
+    var language by remember(initialBlock.id) { mutableStateOf(initialBlock.language) }
+    var title by remember(initialBlock.id) { mutableStateOf(initialBlock.title) }
+    var codeText by remember(initialBlock.id) { mutableStateOf(initialBlock.codeText) }
+    var fontSizePt by remember(initialBlock.id) { mutableStateOf(initialBlock.fontSizePt.coerceIn(8f, 22f)) }
+    var showLineNumbers by remember(initialBlock.id) { mutableStateOf(initialBlock.showLineNumbers) }
+    val focusRequester = remember { FocusRequester() }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(
+            dismissOnBackPress = true,
+            dismissOnClickOutside = true,
+            usePlatformDefaultWidth = false,
+            decorFitsSystemWindows = false
+        )
+    ) {
+        val windowInfo = LocalWindowInfo.current
+        LaunchedEffect(windowInfo.isWindowFocused) {
+            if (windowInfo.isWindowFocused) {
+                runCatching { focusRequester.requestFocus() }
+            }
+        }
+        LaunchedEffect(Unit) {
+            runCatching { focusRequester.requestFocus() }
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .onPreviewKeyEvent { keyEvent ->
+                    if (keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.Escape) {
+                        onDismiss()
+                        true
+                    } else {
+                        false
+                    }
+                }
+                .focusRequester(focusRequester)
+                .focusable(),
+            contentAlignment = Alignment.Center
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.42f))
+                    .testTag("code_editor_backdrop")
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = onDismiss
+                    )
+            )
+            Surface(
+                modifier = Modifier
+                    .widthIn(min = 360.dp, max = 640.dp)
+                    .heightIn(max = 680.dp)
+                    .padding(16.dp)
+                    .pointerInput(Unit) { detectTapGestures { } },
+                shape = RoundedCornerShape(22.dp),
+                tonalElevation = 8.dp,
+                shadowElevation = 14.dp,
+                color = MaterialTheme.colorScheme.surface
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState())
+                        .padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Beágyazott kódblokk szerkesztése",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                        IconButton(onClick = onDismiss, modifier = Modifier.size(30.dp)) {
+                            Icon(Icons.Default.Close, contentDescription = "Bezárás")
+                        }
+                    }
+
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        CodeLanguage.entries.forEach { lang ->
+                            val selected = lang == language
+                            Surface(
+                                onClick = { language = lang },
+                                shape = RoundedCornerShape(10.dp),
+                                color = if (selected) {
+                                    MaterialTheme.colorScheme.primaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.surfaceVariant
+                                },
+                                border = if (selected) {
+                                    BorderStroke(1.25.dp, MaterialTheme.colorScheme.primary)
+                                } else null,
+                                modifier = Modifier.testTag("code_lang_${lang.name}")
+                            ) {
+                                Text(
+                                    text = lang.displayName,
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (selected) {
+                                        MaterialTheme.colorScheme.onPrimaryContainer
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                    },
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp)
+                                )
+                            }
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedTextField(
+                            value = title,
+                            onValueChange = { title = it },
+                            label = { Text("Címke (opcionális)") },
+                            singleLine = true,
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.weight(1f)
+                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            IconButton(
+                                onClick = { fontSizePt = (fontSizePt - 1f).coerceAtLeast(8f) },
+                                modifier = Modifier.size(30.dp)
+                            ) {
+                                Icon(Icons.Default.Remove, contentDescription = "Betűméret -", modifier = Modifier.size(16.dp))
+                            }
+                            Text(
+                                text = "${fontSizePt.roundToInt()}pt",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            IconButton(
+                                onClick = { fontSizePt = (fontSizePt + 1f).coerceAtMost(22f) },
+                                modifier = Modifier.size(30.dp)
+                            ) {
+                                Icon(Icons.Default.Add, contentDescription = "Betűméret +", modifier = Modifier.size(16.dp))
+                            }
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Sorszámok megjelenítése",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium
+                        )
+                        Switch(
+                            checked = showLineNumbers,
+                            onCheckedChange = { showLineNumbers = it }
+                        )
+                    }
+
+                    OutlinedTextField(
+                        value = codeText,
+                        onValueChange = { codeText = it },
+                        label = { Text("Forráskód (monospace)") },
+                        textStyle = LocalTextStyle.current.copy(
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 13.sp,
+                            lineHeight = 18.sp
+                        ),
+                        minLines = 5,
+                        maxLines = 12,
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("code_editor_input")
+                    )
+
+                    val previewBlock = remember(initialBlock.id, language, title, codeText, fontSizePt, showLineNumbers) {
+                        initialBlock.copy(
+                            bounds = DocRect(0f, 0f, 340f, 120f),
+                            language = language,
+                            title = title,
+                            codeText = codeText,
+                            fontSizePt = fontSizePt,
+                            showLineNumbers = showLineNumbers,
+                            rotationRadians = 0f
+                        )
+                    }
+                    Canvas(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(128.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .testTag("code_editor_preview")
+                    ) {
+                        drawIntoCanvas { canvas ->
+                            val sx = size.width / 340f
+                            val sy = size.height / 120f
+                            canvas.nativeCanvas.save()
+                            canvas.nativeCanvas.scale(sx, sy)
+                            CodeBlockCanvasRenderer.drawCodeBlock(
+                                canvas = canvas.nativeCanvas,
+                                obj = previewBlock,
+                                isOledMode = isOledMode
+                            )
+                            canvas.nativeCanvas.restore()
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        TextButton(onClick = onDismiss) {
+                            Text("Mégse")
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Button(
+                            onClick = {
+                                val lineCount = codeText.lines().size.coerceAtLeast(3)
+                                val headerPt = (fontSizePt * 1.85f).coerceIn(16f, 26f)
+                                val minNeededH = headerPt + 12f + lineCount * (fontSizePt * 1.42f) + 6f
+                                val nextBounds = initialBlock.bounds.copy(
+                                    bottomPt = initialBlock.bounds.topPt +
+                                        maxOf(initialBlock.bounds.heightPt, minNeededH.coerceAtMost(420f))
+                                )
+                                onSave(
+                                    initialBlock.copy(
+                                        bounds = nextBounds,
+                                        language = language,
+                                        title = title.trim(),
+                                        codeText = codeText,
+                                        fontSizePt = fontSizePt,
+                                        showLineNumbers = showLineNumbers
+                                    )
+                                )
+                            },
+                            modifier = Modifier.testTag("code_editor_save")
+                        ) {
+                            Text("Mentés")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Editable LaTeX block modal with live `JLatexMathDrawable` rendering, quick symbol/template chips,
+ * optional 1-tap `Grafikon` launch when extractable via [FunctionEvaluator], and Rule-11 ESC +
+ * backdrop dismissal.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun LatexEditDialog(
+    initialObject: PageObject.LatexObject,
+    isOledMode: Boolean,
+    onDismiss: () -> Unit,
+    onSave: (PageObject.LatexObject) -> Unit,
+    onPlotFunction: (PageObject.LatexObject) -> Unit = {}
+) {
+    val context = LocalContext.current
+    var latexDraftField by remember(initialObject.id) {
+        mutableStateOf(
+            TextFieldValue(
+                text = initialObject.latexSource,
+                selection = TextRange(initialObject.latexSource.length)
+            )
+        )
+    }
+    val latexDraft = latexDraftField.text
+    var fontSizePt by remember(initialObject.id) { mutableStateOf(initialObject.fontSizePt.coerceIn(12f, 48f)) }
+    var selectedColorArgb by remember(initialObject.id) { mutableIntStateOf(initialObject.canonicalColorArgb) }
+    var activePaletteTab by remember(initialObject.id) { mutableIntStateOf(0) }
+    val focusRequester = remember { FocusRequester() }
+
+    val validation = remember(latexDraft) {
+        LatexSyntaxValidator.validate(latexDraft, context)
+    }
+    val renderColorArgb = remember(selectedColorArgb, isOledMode) {
+        if (isOledMode) {
+            ColorLuminanceInverter.invertArgbLuminance(selectedColorArgb)
+        } else {
+            selectedColorArgb
+        }
+    }
+    val previewDrawable = remember(validation.normalizedLatex, validation.isValid, fontSizePt, renderColorArgb) {
+        if (!validation.isValid) null
+        else runCatching {
+            JLatexMathDrawable.builder(validation.normalizedLatex)
+                .textSize((fontSizePt * 1.4f).coerceIn(18f, 64f))
+                .color(renderColorArgb)
+                .padding(8)
+                .build()
+        }.getOrNull()
+    }
+    val plotCandidate = remember(latexDraft) {
+        LiveMathSuggestionEngine.extractPlotExpressionFromLatex(latexDraft)
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(
+            dismissOnBackPress = true,
+            dismissOnClickOutside = true,
+            usePlatformDefaultWidth = false,
+            decorFitsSystemWindows = false
+        )
+    ) {
+        val windowInfo = LocalWindowInfo.current
+        LaunchedEffect(windowInfo.isWindowFocused) {
+            if (windowInfo.isWindowFocused) {
+                runCatching { focusRequester.requestFocus() }
+            }
+        }
+        LaunchedEffect(Unit) {
+            runCatching { focusRequester.requestFocus() }
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .onPreviewKeyEvent { keyEvent ->
+                    if (keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.Escape) {
+                        onDismiss()
+                        true
+                    } else {
+                        false
+                    }
+                }
+                .focusRequester(focusRequester)
+                .focusable(),
+            contentAlignment = Alignment.Center
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.42f))
+                    .testTag("latex_editor_backdrop")
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = onDismiss
+                    )
+            )
+            Surface(
+                modifier = Modifier
+                    .widthIn(min = 360.dp, max = 600.dp)
+                    .heightIn(max = 650.dp)
+                    .padding(16.dp)
+                    .pointerInput(Unit) { detectTapGestures { } },
+                shape = RoundedCornerShape(22.dp),
+                tonalElevation = 8.dp,
+                shadowElevation = 14.dp,
+                color = MaterialTheme.colorScheme.surface
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState())
+                        .padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Functions,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                            Text(
+                                text = "LaTeX képlet szerkesztése",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        IconButton(onClick = onDismiss, modifier = Modifier.size(30.dp)) {
+                            Icon(Icons.Default.Close, contentDescription = "Bezárás")
+                        }
+                    }
+
+                    // Live preview box
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = if (isOledMode) Color(0xFF0E131D) else Color(0xFFF8FAFC),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 104.dp, max = 148.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            if (previewDrawable != null) {
+                                Canvas(
+                                    modifier = Modifier
+                                        .size(
+                                            width = previewDrawable.intrinsicWidth.coerceAtLeast(48).dp.coerceAtMost(500.dp),
+                                            height = previewDrawable.intrinsicHeight.coerceAtLeast(32).dp.coerceAtMost(120.dp)
+                                        )
+                                ) {
+                                    drawIntoCanvas { canvas ->
+                                        val dw = previewDrawable.intrinsicWidth.coerceAtLeast(1)
+                                        val dh = previewDrawable.intrinsicHeight.coerceAtLeast(1)
+                                        val fitScale = minOf(size.width / dw, size.height / dh, 1.8f)
+                                        canvas.nativeCanvas.save()
+                                        canvas.nativeCanvas.translate(
+                                            (size.width - dw * fitScale) * 0.5f,
+                                            (size.height - dh * fitScale) * 0.5f
+                                        )
+                                        canvas.nativeCanvas.scale(fitScale, fitScale)
+                                        previewDrawable.setBounds(0, 0, dw, dh)
+                                        previewDrawable.draw(canvas.nativeCanvas)
+                                        canvas.nativeCanvas.restore()
+                                    }
+                                }
+                            } else {
+                                Text(
+                                    text = validation.errorMessageHu ?: "Írj be érvényes LaTeX kifejezést",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error
+                                )
+                            }
+                        }
+                    }
+
+                    OutlinedTextField(
+                        value = latexDraftField,
+                        onValueChange = { latexDraftField = it },
+                        label = { Text("LaTeX forrás") },
+                        textStyle = LocalTextStyle.current.copy(
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 14.sp
+                        ),
+                        isError = !validation.isValid,
+                        minLines = 2,
+                        maxLines = 6,
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("latex_editor_input")
+                    )
+
+                    val paletteCategories = listOf(
+                        "Törtek / Gyök" to listOf(
+                            Triple("Tört", "\\frac{}{}", 3),
+                            Triple("Gyök", "\\sqrt{}", 1),
+                            Triple("n-gyök", "\\sqrt[]{}", 1),
+                            Triple("xⁿ", "^{}", 1),
+                            Triple("xᵢ", "_{}", 1),
+                            Triple("( )", "\\left(  \\right)", 8)
+                        ),
+                        "Analízis" to listOf(
+                            Triple("∫", "\\int_{a}^{b}  \\, dx", 6),
+                            Triple("Σ", "\\sum_{i=1}^{n}", 0),
+                            Triple("Π", "\\prod_{i=1}^{n}", 0),
+                            Triple("lim", "\\lim_{x \\to 0}", 0),
+                            Triple("d/dx", "\\frac{d}{dx}", 0),
+                            Triple("∂/∂x", "\\frac{\\partial}{\\partial x}", 0)
+                        ),
+                        "Görög" to listOf(
+                            Triple("α", "\\alpha", 0),
+                            Triple("β", "\\beta", 0),
+                            Triple("γ", "\\gamma", 0),
+                            Triple("δ", "\\delta", 0),
+                            Triple("θ", "\\theta", 0),
+                            Triple("λ", "\\lambda", 0),
+                            Triple("μ", "\\mu", 0),
+                            Triple("π", "\\pi", 0),
+                            Triple("σ", "\\sigma", 0),
+                            Triple("φ", "\\phi", 0),
+                            Triple("ω", "\\omega", 0),
+                            Triple("Δ", "\\Delta", 0)
+                        ),
+                        "Relációk" to listOf(
+                            Triple("=", "=", 0),
+                            Triple("≠", "\\ne", 0),
+                            Triple("≈", "\\approx", 0),
+                            Triple("≤", "\\le", 0),
+                            Triple("≥", "\\ge", 0),
+                            Triple("±", "\\pm", 0),
+                            Triple("·", "\\cdot", 0),
+                            Triple("→", "\\to", 0),
+                            Triple("∞", "\\infty", 0),
+                            Triple("∈", "\\in", 0)
+                        )
+                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        paletteCategories.forEachIndexed { idx, (tabLabel, _) ->
+                            val selected = activePaletteTab == idx
+                            Surface(
+                                onClick = { activePaletteTab = idx },
+                                shape = RoundedCornerShape(10.dp),
+                                color = if (selected) {
+                                    MaterialTheme.colorScheme.primaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+                                }
+                            ) {
+                                Text(
+                                    text = tabLabel,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (selected) {
+                                        MaterialTheme.colorScheme.onPrimaryContainer
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                    },
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                                )
+                            }
+                        }
+                    }
+                    val activeChips = paletteCategories.getOrElse(activePaletteTab) { paletteCategories.first() }.second
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        activeChips.forEach { (label, snippet, cursorBackOffset) ->
+                            Surface(
+                                onClick = {
+                                    latexDraftField = insertLatexSnippetAtCursor(
+                                        current = latexDraftField,
+                                        snippet = snippet,
+                                        cursorBackOffset = cursorBackOffset
+                                    )
+                                },
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant,
+                                modifier = Modifier.testTag("latex_snippet_$label")
+                            ) {
+                                Text(
+                                    text = label,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Medium,
+                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp)
+                                )
+                            }
+                        }
+                    }
+
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text("Méret:", style = MaterialTheme.typography.labelLarge)
+                            IconButton(
+                                onClick = { fontSizePt = (fontSizePt - 2f).coerceAtLeast(12f) },
+                                modifier = Modifier.size(30.dp)
+                            ) {
+                                Icon(Icons.Default.Remove, contentDescription = "Kisebb", modifier = Modifier.size(16.dp))
+                            }
+                            Text(
+                                text = "${fontSizePt.roundToInt()} pt",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            IconButton(
+                                onClick = { fontSizePt = (fontSizePt + 2f).coerceAtMost(48f) },
+                                modifier = Modifier.size(30.dp)
+                            ) {
+                                Icon(Icons.Default.Add, contentDescription = "Nagyobb", modifier = Modifier.size(16.dp))
+                            }
+                            Spacer(modifier = Modifier.width(6.dp))
+                            LATEX_COLOR_SWATCHES.forEach { swatchArgb ->
+                                Box(
+                                    modifier = Modifier
+                                        .size(20.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(swatchArgb))
+                                        .border(
+                                            width = if (selectedColorArgb == swatchArgb) 2.dp else 1.dp,
+                                            color = MaterialTheme.colorScheme.outline,
+                                            shape = CircleShape
+                                        )
+                                        .clickable { selectedColorArgb = swatchArgb }
+                                )
+                            }
+                        }
+
+                        if (plotCandidate != null) {
+                            OutlinedButton(
+                                onClick = {
+                                    if (validation.isValid) {
+                                        onPlotFunction(
+                                            initialObject.copy(
+                                                latexSource = validation.normalizedLatex,
+                                                fontSizePt = fontSizePt,
+                                                canonicalColorArgb = selectedColorArgb
+                                            )
+                                        )
+                                    }
+                                },
+                                enabled = validation.isValid
+                            ) {
+                                Icon(Icons.Default.ShowChart, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Grafikon")
+                            }
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        TextButton(onClick = onDismiss) {
+                            Text("Mégse")
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Button(
+                            onClick = {
+                                val nextObj = initialObject.copy(
+                                    latexSource = validation.normalizedLatex,
+                                    fontSizePt = fontSizePt,
+                                    canonicalColorArgb = selectedColorArgb
+                                )
+                                onSave(nextObj)
+                            },
+                            enabled = validation.isValid,
+                            modifier = Modifier.testTag("latex_editor_save")
+                        ) {
+                            Text("Mentés")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Interactive pre-placement draft for a table grid (`N × M`). Users freely move and corner-resize
+ * the grid before clicking `"Lehelyezés"`, at which point it locks into a static Layer-2b
+ * [PageObject.TableObject] so stylus strokes can be drawn cleanly inside cells.
+ */
+data class PendingTableDraft(
+    val pageId: String,
+    val bounds: DocRect,
+    val rows: Int,
+    val columns: Int,
+    val borderStrokeWidthPt: Float,
+    val canonicalBorderColorArgb: Int,
+    val hasHeaderRow: Boolean
+)
+
+private enum class TableCornerHandle { NW, NE, SW, SE }
+
+@Composable
+fun PendingTableDraftOverlay(
+    draft: PendingTableDraft,
+    pageOriginXPt: Float,
+    pageOriginYPt: Float,
+    pageWidthPt: Float,
+    pageHeightPt: Float,
+    transformMatrix: CanvasTransformMatrix,
+    isOledMode: Boolean,
+    onUpdateBounds: (DocRect) -> Unit,
+    onConfirmPlacement: (PendingTableDraft) -> Unit,
+    onCancel: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val palette = LocalStylusSurfacePalette.current
+    val focusRequester = remember { FocusRequester() }
+    val scale = transformMatrix.scale.coerceAtLeast(0.05f)
+    val currentDraft by rememberUpdatedState(draft)
+    val currentScale by rememberUpdatedState(scale)
+
+    LaunchedEffect(Unit) {
+        focusRequester.requestFocus()
+    }
+
+    val minWidthPt = (draft.columns * 24f).coerceAtMost(pageWidthPt * 0.85f).coerceAtLeast(48f)
+    val minHeightPt = (draft.rows * 16f).coerceAtMost(pageHeightPt * 0.85f).coerceAtLeast(36f)
+    val marginPt = 8f
+
+    val topLeftPx = transformMatrix.docToScreen(
+        draft.bounds.leftPt + pageOriginXPt,
+        draft.bounds.topPt + pageOriginYPt
+    )
+    val widthPx = (draft.bounds.widthPt * scale).coerceAtLeast(32f)
+    val heightPx = (draft.bounds.heightPt * scale).coerceAtLeast(24f)
+    val density = LocalDensity.current
+    val widthDp = with(density) { widthPx.toDp() }
+    val heightDp = with(density) { heightPx.toDp() }
+    val handleSizeDp = 22.dp
+    val handleRadiusPx = with(density) { handleSizeDp.toPx() * 0.5f }
+    var containerHeightPx by remember { mutableIntStateOf(0) }
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .onSizeChanged { containerHeightPx = it.height }
+            .background(Color.Black.copy(alpha = 0.05f))
+            .pointerInput(Unit) { detectTapGestures { } }
+            .onPreviewKeyEvent { event ->
+                if (event.type == KeyEventType.KeyDown && event.key == Key.Escape) {
+                    onCancel()
+                    true
+                } else {
+                    false
+                }
+            }
+            .focusRequester(focusRequester)
+            .focusable()
+            .testTag("pending_table_draft_overlay")
+    ) {
+        // Live draggable vector preview frame
+        Box(
+            modifier = Modifier
+                .offset {
+                    IntOffset(
+                        x = topLeftPx.xPx.roundToInt(),
+                        y = topLeftPx.yPx.roundToInt()
+                    )
+                }
+                .size(width = widthDp, height = heightDp)
+                .border(1.8.dp, Color(0xFF2563EB), RoundedCornerShape(2.dp))
+                .background(Color(0xFF2563EB).copy(alpha = 0.04f))
+                .pointerInput(draft.pageId, draft.rows, draft.columns) {
+                    var startBounds: DocRect? = null
+                    var totalDxPt = 0f
+                    var totalDyPt = 0f
+                    detectDragGestures(
+                        onDragStart = {
+                            startBounds = currentDraft.bounds
+                            totalDxPt = 0f
+                            totalDyPt = 0f
+                        },
+                        onDrag = { change, dragAmount ->
+                            change.consume()
+                            val base = startBounds ?: currentDraft.bounds.also { startBounds = it }
+                            val invS = 1f / currentScale.coerceAtLeast(0.05f)
+                            totalDxPt += dragAmount.x * invS
+                            totalDyPt += dragAmount.y * invS
+                            val w = base.widthPt
+                            val h = base.heightPt
+                            val maxLeft = (pageWidthPt - w - marginPt).coerceAtLeast(marginPt)
+                            val maxTop = (pageHeightPt - h - marginPt).coerceAtLeast(marginPt)
+                            val nextLeft = (base.leftPt + totalDxPt).coerceIn(marginPt, maxLeft)
+                            val nextTop = (base.topPt + totalDyPt).coerceIn(marginPt, maxTop)
+                            onUpdateBounds(
+                                DocRect(
+                                    leftPt = nextLeft,
+                                    topPt = nextTop,
+                                    rightPt = nextLeft + w,
+                                    bottomPt = nextTop + h
+                                )
+                            )
+                        },
+                        onDragEnd = { startBounds = null },
+                        onDragCancel = { startBounds = null }
+                    )
+                }
+        ) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val live = currentDraft
+                drawIntoCanvas { composeCanvas ->
+                    val nativeCanvas = composeCanvas.nativeCanvas
+                    nativeCanvas.save()
+                    nativeCanvas.scale(scale, scale)
+                    TableCanvasRenderer.drawTable(
+                        canvas = nativeCanvas,
+                        bounds = DocRect(0f, 0f, live.bounds.widthPt, live.bounds.heightPt),
+                        rows = live.rows,
+                        columns = live.columns,
+                        borderStrokeWidthPt = live.borderStrokeWidthPt,
+                        canonicalBorderColorArgb = live.canonicalBorderColorArgb,
+                        hasHeaderRow = live.hasHeaderRow,
+                        isOledMode = isOledMode
+                    )
+                    nativeCanvas.restore()
+                }
+            }
+        }
+
+        // 4 corner resize handles
+        for (corner in TableCornerHandle.entries) {
+            val cornerX = when (corner) {
+                TableCornerHandle.NW, TableCornerHandle.SW -> topLeftPx.xPx
+                TableCornerHandle.NE, TableCornerHandle.SE -> topLeftPx.xPx + widthPx
+            }
+            val cornerY = when (corner) {
+                TableCornerHandle.NW, TableCornerHandle.NE -> topLeftPx.yPx
+                TableCornerHandle.SW, TableCornerHandle.SE -> topLeftPx.yPx + heightPx
+            }
+            Box(
+                modifier = Modifier
+                    .offset {
+                        IntOffset(
+                            x = (cornerX - handleRadiusPx).roundToInt(),
+                            y = (cornerY - handleRadiusPx).roundToInt()
+                        )
+                    }
+                    .size(handleSizeDp)
+                    .clip(CircleShape)
+                    .background(Color.White)
+                    .border(2.dp, Color(0xFF2563EB), CircleShape)
+                    .testTag("pending_table_handle_${corner.name}")
+                    .pointerInput(draft.pageId, corner) {
+                        var startBounds: DocRect? = null
+                        var totalDxPt = 0f
+                        var totalDyPt = 0f
+                        detectDragGestures(
+                            onDragStart = {
+                                startBounds = currentDraft.bounds
+                                totalDxPt = 0f
+                                totalDyPt = 0f
+                            },
+                            onDrag = { change, dragAmount ->
+                                change.consume()
+                                val base = startBounds ?: currentDraft.bounds.also { startBounds = it }
+                                val invS = 1f / currentScale.coerceAtLeast(0.05f)
+                                totalDxPt += dragAmount.x * invS
+                                totalDyPt += dragAmount.y * invS
+
+                                val left = when (corner) {
+                                    TableCornerHandle.NW, TableCornerHandle.SW ->
+                                        (base.leftPt + totalDxPt).coerceIn(marginPt, base.rightPt - minWidthPt)
+                                    TableCornerHandle.NE, TableCornerHandle.SE -> base.leftPt
+                                }
+                                val right = when (corner) {
+                                    TableCornerHandle.NE, TableCornerHandle.SE ->
+                                        (base.rightPt + totalDxPt).coerceIn(base.leftPt + minWidthPt, pageWidthPt - marginPt)
+                                    TableCornerHandle.NW, TableCornerHandle.SW -> base.rightPt
+                                }
+                                val top = when (corner) {
+                                    TableCornerHandle.NW, TableCornerHandle.NE ->
+                                        (base.topPt + totalDyPt).coerceIn(marginPt, base.bottomPt - minHeightPt)
+                                    TableCornerHandle.SW, TableCornerHandle.SE -> base.topPt
+                                }
+                                val bottom = when (corner) {
+                                    TableCornerHandle.SW, TableCornerHandle.SE ->
+                                        (base.bottomPt + totalDyPt).coerceIn(base.topPt + minHeightPt, pageHeightPt - marginPt)
+                                    TableCornerHandle.NW, TableCornerHandle.NE -> base.bottomPt
+                                }
+                                onUpdateBounds(
+                                    DocRect(
+                                        leftPt = left,
+                                        topPt = top,
+                                        rightPt = right,
+                                        bottomPt = bottom
+                                    )
+                                )
+                            },
+                            onDragEnd = { startBounds = null },
+                            onDragCancel = { startBounds = null }
+                        )
+                    }
+            )
+        }
+
+        // Confirmation bar below preview (falls back above if near bottom edge)
+        val rawBelowY = topLeftPx.yPx + heightPx + 14f
+        val barOffsetY = if (containerHeightPx > 0 && rawBelowY + 62f > containerHeightPx && topLeftPx.yPx > 72f) {
+            (topLeftPx.yPx - 64f).roundToInt()
+        } else {
+            rawBelowY.roundToInt()
+        }
+        Surface(
+            shape = RoundedCornerShape(24.dp),
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
+            tonalElevation = 6.dp,
+            shadowElevation = 10.dp,
+            border = BorderStroke(1.dp, palette.pageBorder),
+            modifier = Modifier
+                .offset {
+                    IntOffset(
+                        x = topLeftPx.xPx.roundToInt().coerceAtLeast(16),
+                        y = barOffsetY.coerceAtLeast(16)
+                    )
+                }
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = "${draft.rows} × ${draft.columns}",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                TextButton(
+                    onClick = onCancel,
+                    modifier = Modifier.testTag("pending_table_cancel")
+                ) {
+                    Text("Mégse")
+                }
+                Button(
+                    onClick = { onConfirmPlacement(currentDraft) },
+                    modifier = Modifier.testTag("pending_table_place")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Check,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Lehelyezés")
+                }
+            }
+        }
+    }
+}
+
+
 
 

@@ -95,7 +95,8 @@ class OcrLineSegmenter(
             BrushToolType.HIGHLIGHTER,
             BrushToolType.VECTOR_ERASER,
             BrushToolType.PRECISION_ERASER,
-            BrushToolType.LASSO -> return false
+            BrushToolType.LASSO,
+            BrushToolType.CLOZE_TAPE -> return false
             BrushToolType.FOUNTAIN_PEN,
             BrushToolType.BALLPOINT_PEN,
             BrushToolType.PENCIL -> Unit
@@ -186,6 +187,40 @@ class OcrLineSegmenter(
                 strokes = orderedStrokes
             )
         }
+    }
+
+    /**
+     * Packages an explicit subset of strokes (e.g., Lasso math selection or left-of-equals expression
+     * strokes) into a single ordered [SegmentedOcrLine] for on-device ML Kit recognition without
+     * splitting fractions/exponents or rejecting large diagrams.
+     */
+    fun buildSingleLineForRecognition(strokes: List<PersistedStrokeRecord>): SegmentedOcrLine? {
+        val inkStrokes = strokes.filter { it.layer == StrokeLayerType.INK && it.samples.isNotEmpty() }
+        if (inkStrokes.isEmpty()) return null
+        val ordered = inkStrokes.sortedWith(
+            compareBy<PersistedStrokeRecord> { it.zOrder }
+                .thenBy { it.samples.firstOrNull()?.elapsedTimeMillis ?: Long.MAX_VALUE }
+                .thenBy { it.bounds.leftPt }
+        )
+        var minL = Float.POSITIVE_INFINITY
+        var minT = Float.POSITIVE_INFINITY
+        var maxR = Float.NEGATIVE_INFINITY
+        var maxB = Float.NEGATIVE_INFINITY
+        for (i in 0 until ordered.size) {
+            val b = ordered[i].bounds
+            minL = min(minL, b.leftPt)
+            minT = min(minT, b.topPt)
+            maxR = max(maxR, b.rightPt)
+            maxB = max(maxB, b.bottomPt)
+        }
+        val bounds = DocRect(minL, minT, maxR, maxB)
+        return SegmentedOcrLine(
+            lineIndex = 0,
+            bounds = bounds,
+            writingAreaWidthPt = max(bounds.widthPt + 24f, MIN_WRITING_AREA_WIDTH_PT),
+            writingAreaHeightPt = max(bounds.heightPt + 16f, 24f),
+            strokes = ordered.map(::toOcrStrokePoints)
+        )
     }
 
     private fun clusterPrimaryStrokes(
@@ -312,12 +347,16 @@ class OcrLineSegmenter(
     private fun isSmallDiacriticCandidate(bounds: DocRect): Boolean =
         bounds.heightPt <= 6.5f && bounds.widthPt <= 18f
 
-    private fun toOcrStrokePoints(record: PersistedStrokeRecord): OcrStrokePoints {
+    private fun toOcrStrokePoints(
+        record: PersistedStrokeRecord,
+        timeOffsetMs: Long = 0L
+    ): OcrStrokePoints {
         val normalized = ArrayList<OcrTimedPoint>(record.samples.size)
         var lastT = Long.MIN_VALUE
         for (sample in record.samples) {
-            val t = if (lastT == Long.MIN_VALUE || sample.elapsedTimeMillis > lastT) {
-                sample.elapsedTimeMillis
+            val rawT = timeOffsetMs + sample.elapsedTimeMillis.coerceAtLeast(0L)
+            val t = if (lastT == Long.MIN_VALUE || rawT > lastT) {
+                rawT
             } else {
                 lastT + 1L
             }
@@ -335,6 +374,59 @@ class OcrLineSegmenter(
             zOrder = record.zOrder,
             bounds = record.bounds,
             points = normalized
+        )
+    }
+
+    /**
+     * Builds one ML Kit Digital Ink sequence specifically for Lasso-selected handwritten math
+     * (`∑ LaTeX`), keeping snapped/freehand line strokes (e.g., `-`, `=`, fraction bars) and
+     * assigning strictly increasing per-stroke timestamps so Digital Ink recognizes multi-stroke
+     * expressions accurately even when individual strokes share `t = 0 ms` start offsets.
+     */
+    fun buildMathLineForRecognition(strokes: List<PersistedStrokeRecord>): SegmentedOcrLine? {
+        val valid = strokes.filter { record ->
+            if (record.samples.isEmpty()) return@filter false
+            if (record.layer != StrokeLayerType.INK) return@filter false
+            when (record.brushConfig.toolType) {
+                BrushToolType.FOUNTAIN_PEN,
+                BrushToolType.BALLPOINT_PEN,
+                BrushToolType.PENCIL -> true
+                else -> false
+            }
+        }
+        if (valid.isEmpty()) return null
+
+        val ordered = valid.sortedWith(
+            compareBy<PersistedStrokeRecord> { it.zOrder }
+                .thenBy { it.bounds.leftPt }
+                .thenBy { it.bounds.topPt }
+        )
+
+        var minL = Float.POSITIVE_INFINITY
+        var minT = Float.POSITIVE_INFINITY
+        var maxR = Float.NEGATIVE_INFINITY
+        var maxB = Float.NEGATIVE_INFINITY
+        val ocrStrokes = ArrayList<OcrStrokePoints>(ordered.size)
+        var cursorTimeMs = 0L
+        for (rec in ordered) {
+            val pts = toOcrStrokePoints(rec, timeOffsetMs = cursorTimeMs)
+            if (pts.points.isEmpty()) continue
+            ocrStrokes.add(pts)
+            cursorTimeMs = pts.points.last().timestampMs + 40L
+            minL = min(minL, rec.bounds.leftPt)
+            minT = min(minT, rec.bounds.topPt)
+            maxR = max(maxR, rec.bounds.rightPt)
+            maxB = max(maxB, rec.bounds.bottomPt)
+        }
+        if (ocrStrokes.isEmpty()) return null
+
+        val bounds = DocRect(minL, minT, max(maxR, minL + 8f), max(maxB, minT + 8f))
+        return SegmentedOcrLine(
+            lineIndex = 0,
+            bounds = bounds,
+            writingAreaWidthPt = max(bounds.widthPt + 24f, MIN_WRITING_AREA_WIDTH_PT),
+            writingAreaHeightPt = max(bounds.heightPt + 16f, 36f),
+            strokes = ocrStrokes
         )
     }
 

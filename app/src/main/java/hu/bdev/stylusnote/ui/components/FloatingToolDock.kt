@@ -15,11 +15,13 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -59,12 +61,15 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.boundsInParent
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
@@ -106,7 +111,10 @@ fun FloatingToolDock(
     onToggleDebugOverlay: () -> Unit,
     onToggleFullScreen: () -> Unit = {},
     onOpenShapes: () -> Unit = {},
+    onOpenTablePicker: () -> Unit = {},
     onInsertImage: () -> Unit = {},
+    isCodeBlockPlaceMode: Boolean = false,
+    onToggleCodeBlockPlaceMode: () -> Unit = {},
     onDockBoundsChanged: (Rect) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
@@ -135,8 +143,27 @@ fun FloatingToolDock(
 
     val surfacePalette = LocalStylusSurfacePalette.current
     val isVertical = dockPrefs.isVertical
+    val isFullWidthHorizontal = !dockPrefs.isCollapsed && !isVertical
+    val fullWidthMaxY = (viewportSize.height - dockSizePx.height).coerceAtLeast(1)
+    val fullWidthRawY = (dockPrefs.yFraction * fullWidthMaxY + if (isDragging) dragDeltaY else 0f)
+        .coerceIn(0f, fullWidthMaxY.toFloat())
+    val resolvedFullWidthY = if (
+        avoidTopLeftRectPx.width > 0f &&
+        avoidTopLeftRectPx.height > 0f &&
+        fullWidthRawY < avoidTopLeftRectPx.bottom
+    ) {
+        avoidTopLeftRectPx.bottom.roundToInt().coerceIn(0, fullWidthMaxY)
+    } else {
+        fullWidthRawY.roundToInt()
+    }
 
-    val dragHandleModifier = Modifier.pointerInput(viewportSize, dockSizePx, dockPrefs, avoidTopLeftRectPx) {
+    val dragHandleModifier = Modifier.pointerInput(
+        viewportSize,
+        dockSizePx,
+        dockPrefs,
+        avoidTopLeftRectPx,
+        isFullWidthHorizontal
+    ) {
         detectDragGestures(
             onDragStart = {
                 isDragging = true
@@ -154,27 +181,37 @@ fun FloatingToolDock(
                 dragDeltaY = 0f
             },
             onDragEnd = {
-                val droppedOrigin = clampDockOriginPx(
-                    desiredLeftPx = marginPx + dockPrefs.xFraction * maxAvailX + dragDeltaX,
-                    desiredTopPx = marginPx + dockPrefs.yFraction * maxAvailY + dragDeltaY,
-                    dockWidthPx = dockSizePx.width,
-                    dockHeightPx = dockSizePx.height,
-                    viewportWidthPx = viewportSize.width,
-                    viewportHeightPx = viewportSize.height,
-                    avoidRectPx = avoidTopLeftRectPx,
-                    marginPx = marginPx
-                )
-                val nextXFraction = ((droppedOrigin.x - marginPx) / maxAvailX).coerceIn(0f, 1f)
-                val nextYFraction = ((droppedOrigin.y - marginPx) / maxAvailY).coerceIn(0f, 1f)
-                isDragging = false
-                dragDeltaX = 0f
-                dragDeltaY = 0f
-                onUpdateDockPrefs(
-                    dockPrefs.copy(
-                        xFraction = nextXFraction,
-                        yFraction = nextYFraction
+                if (isFullWidthHorizontal) {
+                    val droppedY = (dockPrefs.yFraction * fullWidthMaxY + dragDeltaY)
+                        .coerceIn(0f, fullWidthMaxY.toFloat())
+                    val nextYFraction = (droppedY / fullWidthMaxY.toFloat()).coerceIn(0f, 1f)
+                    isDragging = false
+                    dragDeltaX = 0f
+                    dragDeltaY = 0f
+                    onUpdateDockPrefs(dockPrefs.copy(yFraction = nextYFraction))
+                } else {
+                    val droppedOrigin = clampDockOriginPx(
+                        desiredLeftPx = marginPx + dockPrefs.xFraction * maxAvailX + dragDeltaX,
+                        desiredTopPx = marginPx + dockPrefs.yFraction * maxAvailY + dragDeltaY,
+                        dockWidthPx = dockSizePx.width,
+                        dockHeightPx = dockSizePx.height,
+                        viewportWidthPx = viewportSize.width,
+                        viewportHeightPx = viewportSize.height,
+                        avoidRectPx = avoidTopLeftRectPx,
+                        marginPx = marginPx
                     )
-                )
+                    val nextXFraction = ((droppedOrigin.x - marginPx) / maxAvailX).coerceIn(0f, 1f)
+                    val nextYFraction = ((droppedOrigin.y - marginPx) / maxAvailY).coerceIn(0f, 1f)
+                    isDragging = false
+                    dragDeltaX = 0f
+                    dragDeltaY = 0f
+                    onUpdateDockPrefs(
+                        dockPrefs.copy(
+                            xFraction = nextXFraction,
+                            yFraction = nextYFraction
+                        )
+                    )
+                }
             }
         )
     }
@@ -182,12 +219,20 @@ fun FloatingToolDock(
     Box(modifier = modifier.fillMaxSize()) {
         Surface(
             modifier = Modifier
-                .offset { IntOffset(resolvedOrigin.x, resolvedOrigin.y) }
+                .then(if (isFullWidthHorizontal) Modifier.fillMaxWidth() else Modifier)
+                .offset {
+                    if (isFullWidthHorizontal) {
+                        IntOffset(0, resolvedFullWidthY)
+                    } else {
+                        IntOffset(resolvedOrigin.x, resolvedOrigin.y)
+                    }
+                }
                 .onSizeChanged { dockSizePx = it }
                 .onGloballyPositioned { coords -> onDockBoundsChanged(coords.boundsInParent()) }
                 .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
-                .animateContentSize(),
-            shape = RoundedCornerShape(22.dp),
+                .animateContentSize()
+                .testTag("floating_tool_dock_surface"),
+            shape = RectangleShape,
             tonalElevation = 5.dp,
             shadowElevation = if (isDragging) 14.dp else 6.dp,
             color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
@@ -240,11 +285,14 @@ fun FloatingToolDock(
                         isDarkTheme = isDarkTheme,
                         showDebugOverlay = showDebugOverlay,
                         isFullScreen = isFullScreen,
+                        isCodeBlockPlaceMode = isCodeBlockPlaceMode,
                         onUndo = onUndo,
                         onRedo = onRedo,
                         onFitPage = onFitPage,
                         onOpenShapes = onOpenShapes,
+                        onOpenTablePicker = onOpenTablePicker,
                         onInsertImage = onInsertImage,
+                        onToggleCodeBlockPlaceMode = onToggleCodeBlockPlaceMode,
                         onOpenPaperSettings = onOpenPaperSettings,
                         onToggleTheme = onToggleTheme,
                         onToggleDebugOverlay = onToggleDebugOverlay,
@@ -274,66 +322,87 @@ fun FloatingToolDock(
                     }
                 }
             } else {
+                val minExpandedWidthDp = if (viewportSize.width > 0) {
+                    with(LocalDensity.current) { viewportSize.width.toDp() }
+                } else {
+                    0.dp
+                }
                 Row(
                     modifier = Modifier
+                        .fillMaxWidth()
                         .horizontalScroll(rememberScrollState())
+                        .widthIn(min = minExpandedWidthDp)
                         .padding(horizontal = 10.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    DockDragHandle(modifier = dragHandleModifier)
-                    ToolButtonsGroup(
-                        brushConfig = brushConfig,
-                        isVertical = false,
-                        onSelectTool = onSelectTool,
-                        onOpenSettings = onOpenSettings
-                    )
-                    VerticalDivider(
-                        color = MaterialTheme.colorScheme.outlineVariant,
-                        modifier = Modifier
-                            .height(26.dp)
-                            .padding(horizontal = 2.dp)
-                    )
-                    ActionButtonsGroup(
-                        canUndo = canUndo,
-                        canRedo = canRedo,
-                        isDarkTheme = isDarkTheme,
-                        showDebugOverlay = showDebugOverlay,
-                        isFullScreen = isFullScreen,
-                        onUndo = onUndo,
-                        onRedo = onRedo,
-                        onFitPage = onFitPage,
-                        onOpenShapes = onOpenShapes,
-                        onInsertImage = onInsertImage,
-                        onOpenPaperSettings = onOpenPaperSettings,
-                        onToggleTheme = onToggleTheme,
-                        onToggleDebugOverlay = onToggleDebugOverlay,
-                        onToggleFullScreen = onToggleFullScreen
-                    )
-                    IconButton(
-                        onClick = { onUpdateDockPrefs(dockPrefs.copy(isVertical = true)) },
-                        modifier = Modifier.size(34.dp)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(5.dp)
                     ) {
-                        Icon(
-                            imageVector = Icons.Filled.SwapVert,
-                            contentDescription = "Függőleges elrendezés",
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(18.dp)
+                        DockDragHandle(modifier = dragHandleModifier)
+                        ToolButtonsGroup(
+                            brushConfig = brushConfig,
+                            isVertical = false,
+                            onSelectTool = onSelectTool,
+                            onOpenSettings = onOpenSettings
                         )
                     }
-                    IconButton(
-                        onClick = { onUpdateDockPrefs(dockPrefs.copy(isCollapsed = true)) },
-                        modifier = Modifier
-                            .size(34.dp)
-                            .clip(CircleShape)
-                            .background(surfacePalette.groupedCardBackground)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(5.dp),
+                        modifier = Modifier.padding(start = 10.dp)
                     ) {
-                        Icon(
-                            imageVector = Icons.Filled.UnfoldLess,
-                            contentDescription = "Eszköztár összecsukása",
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(18.dp)
+                        VerticalDivider(
+                            color = MaterialTheme.colorScheme.outlineVariant,
+                            modifier = Modifier
+                                .height(26.dp)
+                                .padding(horizontal = 2.dp)
                         )
+                        ActionButtonsGroup(
+                            canUndo = canUndo,
+                            canRedo = canRedo,
+                            isDarkTheme = isDarkTheme,
+                            showDebugOverlay = showDebugOverlay,
+                            isFullScreen = isFullScreen,
+                            isCodeBlockPlaceMode = isCodeBlockPlaceMode,
+                            onUndo = onUndo,
+                            onRedo = onRedo,
+                            onFitPage = onFitPage,
+                            onOpenShapes = onOpenShapes,
+                            onOpenTablePicker = onOpenTablePicker,
+                            onInsertImage = onInsertImage,
+                            onToggleCodeBlockPlaceMode = onToggleCodeBlockPlaceMode,
+                            onOpenPaperSettings = onOpenPaperSettings,
+                            onToggleTheme = onToggleTheme,
+                            onToggleDebugOverlay = onToggleDebugOverlay,
+                            onToggleFullScreen = onToggleFullScreen
+                        )
+                        IconButton(
+                            onClick = { onUpdateDockPrefs(dockPrefs.copy(isVertical = true)) },
+                            modifier = Modifier.size(34.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.SwapVert,
+                                contentDescription = "Függőleges elrendezés",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                        IconButton(
+                            onClick = { onUpdateDockPrefs(dockPrefs.copy(isCollapsed = true)) },
+                            modifier = Modifier
+                                .size(34.dp)
+                                .clip(CircleShape)
+                                .background(surfacePalette.groupedCardBackground)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.UnfoldLess,
+                                contentDescription = "Eszköztár összecsukása",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
                     }
                 }
             }
@@ -356,6 +425,7 @@ private fun CollapsedDockContent(
 ) {
     val activePenTool = when {
         brushConfig.toolType == BrushToolType.HIGHLIGHTER -> BrushToolType.HIGHLIGHTER
+        brushConfig.toolType == BrushToolType.CLOZE_TAPE -> BrushToolType.CLOZE_TAPE
         !brushConfig.toolType.isEraser && brushConfig.toolType != BrushToolType.LASSO -> BrushToolType.FOUNTAIN_PEN
         lastDrawingTool == BrushToolType.HIGHLIGHTER -> BrushToolType.HIGHLIGHTER
         else -> BrushToolType.FOUNTAIN_PEN
@@ -461,6 +531,7 @@ private fun iconForTool(toolType: BrushToolType): ImageVector = when (toolType) 
     BrushToolType.BALLPOINT_PEN -> StylusIcons.BallpointPen
     BrushToolType.PENCIL -> StylusIcons.Pencil
     BrushToolType.HIGHLIGHTER -> StylusIcons.Highlighter
+    BrushToolType.CLOZE_TAPE -> StylusIcons.ClozeTape
     BrushToolType.VECTOR_ERASER -> StylusIcons.VectorEraser
     BrushToolType.PRECISION_ERASER -> StylusIcons.PrecisionEraser
     BrushToolType.LASSO -> StylusIcons.Lasso
@@ -480,6 +551,7 @@ private fun ToolButtonsGroup(
     val toolOrder = listOf(
         BrushToolType.FOUNTAIN_PEN,
         BrushToolType.HIGHLIGHTER,
+        BrushToolType.CLOZE_TAPE,
         BrushToolType.VECTOR_ERASER,
         BrushToolType.PRECISION_ERASER,
         BrushToolType.LASSO
@@ -538,7 +610,12 @@ private fun ToolButtonsGroup(
                     text = if (brushConfig.toolType.isEraser) {
                         "${brushConfig.eraserRadiusDp.roundToInt()}dp"
                     } else {
-                        "${"%.0f".format(brushConfig.clampedSizePt)}pt"
+                        val sz = brushConfig.clampedSizePt
+                        if (kotlin.math.abs(sz - sz.roundToInt()) < 0.05f) {
+                            "${sz.roundToInt()}pt"
+                        } else {
+                            "${"%.1f".format(java.util.Locale.US, sz)}pt"
+                        }
                     },
                     style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.SemiBold,
@@ -586,11 +663,14 @@ private fun ActionButtonsGroup(
     isDarkTheme: Boolean,
     showDebugOverlay: Boolean,
     isFullScreen: Boolean,
+    isCodeBlockPlaceMode: Boolean,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
     onFitPage: () -> Unit,
     onOpenShapes: () -> Unit,
+    onOpenTablePicker: () -> Unit,
     onInsertImage: () -> Unit,
+    onToggleCodeBlockPlaceMode: () -> Unit,
     onOpenPaperSettings: () -> Unit,
     onToggleTheme: () -> Unit,
     onToggleDebugOverlay: () -> Unit,
@@ -627,12 +707,29 @@ private fun ActionButtonsGroup(
         onLongClick = onOpenShapes
     )
     DockToolIconButton(
+        icon = StylusIcons.TableGrid,
+        contentDescription = "Táblázat beszúrása",
+        selected = false,
+        preserveIconColors = true,
+        onClick = onOpenTablePicker,
+        onLongClick = onOpenTablePicker,
+        testTag = "dock_table_button"
+    )
+    DockToolIconButton(
         icon = StylusIcons.InsertImage,
         contentDescription = "Kép beszúrása",
         selected = false,
         preserveIconColors = true,
         onClick = onInsertImage,
         onLongClick = onInsertImage
+    )
+    DockToolIconButton(
+        icon = StylusIcons.CodeBlock,
+        contentDescription = "Beágyazott kódblokk",
+        selected = isCodeBlockPlaceMode,
+        preserveIconColors = true,
+        onClick = onToggleCodeBlockPlaceMode,
+        onLongClick = onToggleCodeBlockPlaceMode
     )
     IconButton(
         onClick = onFitPage,
@@ -690,7 +787,8 @@ private fun DockToolIconButton(
     onLongClick: () -> Unit,
     accentDotColor: Color? = null,
     selectedTintOverride: Color? = null,
-    preserveIconColors: Boolean = false
+    preserveIconColors: Boolean = false,
+    testTag: String? = null
 ) {
     val surfacePalette = LocalStylusSurfacePalette.current
     val shape = RoundedCornerShape(12.dp)
@@ -709,6 +807,7 @@ private fun DockToolIconButton(
 
     Box(
         modifier = Modifier
+            .then(if (testTag != null) Modifier.testTag(testTag) else Modifier)
             .size(36.dp)
             .clip(shape)
             .background(bgColor)

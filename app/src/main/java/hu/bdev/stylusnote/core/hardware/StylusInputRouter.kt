@@ -8,11 +8,14 @@ import androidx.ink.strokes.MutableStrokeInputBatch
 import androidx.ink.strokes.StrokeInput
 import androidx.input.motionprediction.MotionEventPredictor
 import hu.bdev.stylusnote.core.math.CanvasTransformMatrix
+import hu.bdev.stylusnote.core.math.FingerVelocityTracker
 import hu.bdev.stylusnote.core.math.OneEuroFilter
+import hu.bdev.stylusnote.core.math.ScrollFlingState
 import hu.bdev.stylusnote.core.math.TransformSnapshot
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.hypot
+import kotlin.math.max
 import kotlin.math.pow
 
 /**
@@ -312,7 +315,10 @@ class StylusInputRouter<TEvent>(
     private val onHoverStateChanged: (HoverCursorState) -> Unit = {},
     private val onTogglePenEraser: () -> Unit = {},
     private val onCanvasTouchStart: () -> Unit = {},
-    private val onNavigationGestureEnd: () -> Unit = {}
+    private val onNavigationGestureEnd: () -> Unit = {},
+    private val onSingleFingerTap: (xPx: Float, yPx: Float) -> Unit = { _, _ -> },
+    private val onVerticalFling: ((velocityYPxPerSec: Float) -> Boolean)? = null,
+    private val onCancelFling: () -> Unit = {}
 ) {
     companion object {
         const val POST_STYLUS_PALM_GRACE_WINDOW_MS = 850L
@@ -337,6 +343,10 @@ class StylusInputRouter<TEvent>(
     private var prevSinglePointerId: Int = -1
     private var prevSingleXPx: Float = 0f
     private var prevSingleYPx: Float = 0f
+    private var singleFingerDownXPx: Float = 0f
+    private var singleFingerDownYPx: Float = 0f
+    private var singleFingerDownTimeMs: Long = Long.MIN_VALUE
+    private var singleFingerMaxDistPx: Float = 0f
     private var fingerNavStartSnapshot: TransformSnapshot? = null
     private var fingerNavStartTimeMs: Long = Long.MIN_VALUE
     private var stylusSeenInGesture: Boolean = false
@@ -351,6 +361,7 @@ class StylusInputRouter<TEvent>(
     private var prevNavCentroidXPx: Float = 0f
     private var prevNavCentroidYPx: Float = 0f
 
+    private val fingerVelocityTracker = FingerVelocityTracker()
     private var lastObservedStylusButtonMask: Int = 0
 
     val isStylusStrokeActive: Boolean
@@ -482,6 +493,7 @@ class StylusInputRouter<TEvent>(
         }
 
         if (frame.action == StylusAction.DOWN) {
+            onCancelFling()
             onCanvasTouchStart()
         }
 
@@ -856,16 +868,44 @@ class StylusInputRouter<TEvent>(
         }
 
         if (activeFingers.isEmpty()) {
+            val isSingleFingerTap = frame.action == StylusAction.UP &&
+                singleFingerPanActive &&
+                !twoFingerNavActive &&
+                !singleFingerMoved &&
+                !stylusSeenInGesture &&
+                !palmRejectedInCurrentTouchGesture &&
+                singleFingerMaxDistPx < 16f &&
+                singleFingerDownTimeMs != Long.MIN_VALUE &&
+                (frame.eventTimeMs - singleFingerDownTimeMs) in 0L..340L
+            val tapX = singleFingerDownXPx
+            val tapY = singleFingerDownYPx
+            val canFling = frame.action == StylusAction.UP &&
+                singleFingerPanUnlocked &&
+                !twoFingerNavActive &&
+                !stylusSeenInGesture &&
+                !palmRejectedInCurrentTouchGesture
+            val releaseVelocityY = if (canFling) {
+                fingerVelocityTracker.computeVelocityYPxPerSec(frame.eventTimeMs)
+            } else {
+                0f
+            }
             val wasNavigating = twoFingerNavActive || singleFingerMoved
             resetFingerNavigationState(rollbackAppliedTransform = false)
             if (frame.action == StylusAction.UP || frame.action == StylusAction.CANCEL) {
                 stylusSeenInGesture = false
                 palmRejectedInCurrentTouchGesture = false
             }
-            if (wasNavigating) {
+            val startedFling = canFling &&
+                abs(releaseVelocityY) >= ScrollFlingState.MIN_FLING_VELOCITY_PX_PER_S &&
+                (onVerticalFling?.invoke(releaseVelocityY) == true)
+            if (wasNavigating && !startedFling) {
                 onNavigationGestureEnd()
             }
-            return wasNavigating
+            if (isSingleFingerTap) {
+                onSingleFingerTap(tapX, tapY)
+                return true
+            }
+            return wasNavigating || startedFling
         }
 
         val hasOversizedPalm = activeFingers.any { it.touchMajorPx > MAX_FINGER_CONTACT_MAJOR_PX }
@@ -899,6 +939,8 @@ class StylusInputRouter<TEvent>(
                 prevSinglePointerId = f.pointerId
                 prevSingleXPx = f.xPx
                 prevSingleYPx = f.yPx
+                fingerVelocityTracker.reset()
+                fingerVelocityTracker.addSample(f.yPx, frame.eventTimeMs)
                 return true
             }
             if (allowFingerDrawing) {
@@ -919,8 +961,20 @@ class StylusInputRouter<TEvent>(
                 prevSinglePointerId = f.pointerId
                 prevSingleXPx = f.xPx
                 prevSingleYPx = f.yPx
+                singleFingerDownXPx = f.xPx
+                singleFingerDownYPx = f.yPx
+                singleFingerDownTimeMs = frame.eventTimeMs
+                singleFingerMaxDistPx = 0f
+                fingerVelocityTracker.reset()
+                fingerVelocityTracker.addSample(f.yPx, frame.eventTimeMs)
                 return false
             }
+            fingerVelocityTracker.addSample(f.yPx, frame.eventTimeMs)
+            val distFromDown = hypot(
+                (f.xPx - singleFingerDownXPx).toDouble(),
+                (f.yPx - singleFingerDownYPx).toDouble()
+            ).toFloat()
+            singleFingerMaxDistPx = max(singleFingerMaxDistPx, distFromDown)
             val dx = f.xPx - prevSingleXPx
             val dy = f.yPx - prevSingleYPx
             prevSingleXPx = f.xPx
@@ -1018,9 +1072,14 @@ class StylusInputRouter<TEvent>(
         singleFingerAccumulatedDxPx = 0f
         singleFingerAccumulatedDyPx = 0f
         prevSinglePointerId = -1
+        singleFingerDownXPx = 0f
+        singleFingerDownYPx = 0f
+        singleFingerDownTimeMs = Long.MIN_VALUE
+        singleFingerMaxDistPx = 0f
         twoFingerNavActive = false
         prevNavPointerId0 = -1
         prevNavPointerId1 = -1
+        fingerVelocityTracker.reset()
     }
 
     private fun isAcceptedDrawingPointer(

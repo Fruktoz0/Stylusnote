@@ -11,6 +11,7 @@ import hu.bdev.stylusnote.data.local.StrokeJournal
 import hu.bdev.stylusnote.domain.model.BrushConfig
 import hu.bdev.stylusnote.domain.model.CanvasAction
 import hu.bdev.stylusnote.domain.repository.CanvasStateHolder
+import hu.bdev.stylusnote.domain.repository.SelectionImportResult
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -22,6 +23,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Collections
+import java.util.UUID
 import kotlin.math.abs
 import kotlin.math.max
 
@@ -30,7 +32,8 @@ import kotlin.math.max
  */
 data class PageUndoEntry(
     val pageId: String,
-    val action: CanvasAction
+    val action: CanvasAction,
+    val transactionId: String? = null
 )
 
 /**
@@ -45,6 +48,7 @@ class NotebookUndoCoordinator(
     private val lock = Any()
     private val undoStack = ArrayDeque<PageUndoEntry>()
     private val redoStack = ArrayDeque<PageUndoEntry>()
+    private val threadLocalTransactionId = ThreadLocal<String?>()
     private var totalUndoPointCost: Int = 0
 
     val canUndo: Boolean
@@ -59,10 +63,30 @@ class NotebookUndoCoordinator(
     val redoDepth: Int
         get() = synchronized(lock) { redoStack.size }
 
-    fun record(pageId: String, action: CanvasAction) {
+    fun <R> withTransaction(
+        transactionId: String = UUID.randomUUID().toString(),
+        block: () -> R
+    ): R {
+        val prev = threadLocalTransactionId.get()
+        threadLocalTransactionId.set(transactionId)
+        return try {
+            block()
+        } finally {
+            threadLocalTransactionId.set(prev)
+        }
+    }
+
+    fun record(pageId: String, action: CanvasAction, transactionId: String? = null) {
+        val effectiveTxId = transactionId ?: threadLocalTransactionId.get()
         synchronized(lock) {
             redoStack.clear()
-            undoStack.addLast(PageUndoEntry(pageId = pageId, action = action))
+            undoStack.addLast(
+                PageUndoEntry(
+                    pageId = pageId,
+                    action = action,
+                    transactionId = effectiveTxId
+                )
+            )
             totalUndoPointCost += action.estimatedPointCost
             enforceBudgetLocked()
         }
@@ -79,12 +103,60 @@ class NotebookUndoCoordinator(
         entry
     }
 
+    /**
+     * Pops either the latest standalone Undo entry or the entire contiguous group sharing a
+     * non-null `transactionId` so cross-page Lasso moves undo atomically across both pages.
+     */
+    fun popUndoGroup(): List<PageUndoEntry> = synchronized(lock) {
+        val first = undoStack.removeLastOrNull() ?: return emptyList()
+        totalUndoPointCost = max(0, totalUndoPointCost - first.action.estimatedPointCost)
+        redoStack.addLast(first)
+
+        val txId = first.transactionId
+        if (txId == null) return listOf(first)
+
+        val group = ArrayList<PageUndoEntry>(2).apply { add(first) }
+        while (undoStack.lastOrNull()?.transactionId == txId) {
+            val next = undoStack.removeLast()
+            totalUndoPointCost = max(0, totalUndoPointCost - next.action.estimatedPointCost)
+            redoStack.addLast(next)
+            group.add(next)
+        }
+        group
+    }
+
     fun popRedo(): PageUndoEntry? = synchronized(lock) {
         val entry = redoStack.removeLastOrNull() ?: return null
         undoStack.addLast(entry)
         totalUndoPointCost += entry.action.estimatedPointCost
         enforceBudgetLocked()
         entry
+    }
+
+    /**
+     * Pops either the latest standalone Redo entry or the entire contiguous group sharing a
+     * non-null `transactionId` in forward execution order.
+     */
+    fun popRedoGroup(): List<PageUndoEntry> = synchronized(lock) {
+        val first = redoStack.removeLastOrNull() ?: return emptyList()
+        undoStack.addLast(first)
+        totalUndoPointCost += first.action.estimatedPointCost
+
+        val txId = first.transactionId
+        if (txId == null) {
+            enforceBudgetLocked()
+            return listOf(first)
+        }
+
+        val group = ArrayList<PageUndoEntry>(2).apply { add(first) }
+        while (redoStack.lastOrNull()?.transactionId == txId) {
+            val next = redoStack.removeLast()
+            undoStack.addLast(next)
+            totalUndoPointCost += next.action.estimatedPointCost
+            group.add(next)
+        }
+        enforceBudgetLocked()
+        group
     }
 
     fun removePageEntries(pageId: String) {
@@ -105,12 +177,21 @@ class NotebookUndoCoordinator(
 
     private fun enforceBudgetLocked() {
         while (undoStack.size > maxUndoSteps) {
-            val dropped = undoStack.removeFirst()
-            totalUndoPointCost = max(0, totalUndoPointCost - dropped.action.estimatedPointCost)
+            dropOldestUndoGroupLocked()
         }
         while (undoStack.size > minUndoSteps && totalUndoPointCost > maxPointBudget) {
-            val dropped = undoStack.removeFirst()
-            totalUndoPointCost = max(0, totalUndoPointCost - dropped.action.estimatedPointCost)
+            dropOldestUndoGroupLocked()
+        }
+    }
+
+    private fun dropOldestUndoGroupLocked() {
+        if (undoStack.isEmpty()) return
+        val dropped = undoStack.removeFirst()
+        totalUndoPointCost = max(0, totalUndoPointCost - dropped.action.estimatedPointCost)
+        val txId = dropped.transactionId ?: return
+        while (undoStack.firstOrNull()?.transactionId == txId) {
+            val sibling = undoStack.removeFirst()
+            totalUndoPointCost = max(0, totalUndoPointCost - sibling.action.estimatedPointCost)
         }
     }
 }
@@ -369,7 +450,17 @@ data class MultiPageHistoryResult(
     val action: CanvasAction,
     val affectedBoundsLocal: DocRect?,
     val isReadOnly: Boolean,
-    val didRehydratePage: Boolean
+    val didRehydratePage: Boolean,
+    val mutatedPageIds: Set<String> = setOf(pageId)
+)
+
+/** Outcome of atomically transferring selected strokes/objects between two pages. */
+data class CrossPageTransferResult(
+    val sourcePageId: String,
+    val destPageId: String,
+    val importResult: SelectionImportResult,
+    val sourceAffectedBoundsLocal: DocRect?,
+    val destAffectedBoundsLocal: DocRect?
 )
 
 /**
@@ -478,6 +569,121 @@ class MultiPageSessionManager(
 
     fun activePageIdsSnapshot(): Set<String> = pool.activePageIdsSnapshot()
 
+    /**
+     * Ensures [pageId] is present in the sliding-window pool and hydrated from disk so cross-page
+     * copy/move can mutate cold or distant pages cleanly.
+     */
+    suspend fun ensurePageReady(pageId: String): NotebookPageRuntime = pool.ensureHydrated(pageId)
+
+    /**
+     * Synchronous fast-path for cross-page Lasso moves when both [sourcePageId] and [destPageId]
+     * are already hydrated in the sliding window (zero UI-frame flicker on drop).
+     */
+    fun tryTransferSelectionBetweenReadyPagesSync(
+        sourcePageId: String,
+        destPageId: String,
+        strokeIds: Collection<String>,
+        objectIds: Collection<String>,
+        offsetXPt: Float,
+        offsetYPt: Float
+    ): CrossPageTransferResult? {
+        if (sourcePageId == destPageId) return null
+        val sourceRuntime = pool.getReadyRuntime(sourcePageId) ?: return null
+        val destRuntime = pool.getReadyRuntime(destPageId) ?: return null
+        return commitCrossPageTransfer(
+            sourcePageId = sourcePageId,
+            sourceRuntime = sourceRuntime,
+            destPageId = destPageId,
+            destRuntime = destRuntime,
+            strokeIds = strokeIds,
+            objectIds = objectIds,
+            offsetXPt = offsetXPt,
+            offsetYPt = offsetYPt
+        )
+    }
+
+    /**
+     * Hydrates [sourcePageId] and [destPageId] if needed, then atomically migrates the selected
+     * strokes/objects into [destPageId] under a single grouped Undo/Redo transaction.
+     */
+    suspend fun transferSelectionBetweenPages(
+        sourcePageId: String,
+        destPageId: String,
+        strokeIds: Collection<String>,
+        objectIds: Collection<String>,
+        offsetXPt: Float,
+        offsetYPt: Float
+    ): CrossPageTransferResult? {
+        if (sourcePageId == destPageId) return null
+        val sourceRuntime = ensurePageReady(sourcePageId)
+        val destRuntime = ensurePageReady(destPageId)
+        return commitCrossPageTransfer(
+            sourcePageId = sourcePageId,
+            sourceRuntime = sourceRuntime,
+            destPageId = destPageId,
+            destRuntime = destRuntime,
+            strokeIds = strokeIds,
+            objectIds = objectIds,
+            offsetXPt = offsetXPt,
+            offsetYPt = offsetYPt
+        )
+    }
+
+    private fun commitCrossPageTransfer(
+        sourcePageId: String,
+        sourceRuntime: NotebookPageRuntime,
+        destPageId: String,
+        destRuntime: NotebookPageRuntime,
+        strokeIds: Collection<String>,
+        objectIds: Collection<String>,
+        offsetXPt: Float,
+        offsetYPt: Float
+    ): CrossPageTransferResult? {
+        if (sourceRuntime.isReadOnly || destRuntime.isReadOnly) return null
+        val snapshot = sourceRuntime.canvasStateHolder.snapshotSelection(
+            sourcePageId = sourcePageId,
+            strokeIds = strokeIds,
+            objectIds = objectIds
+        )
+        if (snapshot.isEmpty) return null
+
+        val (removeAction, sourceBounds) = sourceRuntime.canvasStateHolder
+            .removeSelectionExternal(strokeIds, objectIds)
+            ?: return null
+
+        val insertedPair = destRuntime.canvasStateHolder.insertSelectionSnapshotExternal(
+            snapshot = snapshot,
+            dxPt = offsetXPt,
+            dyPt = offsetYPt
+        )
+        if (insertedPair == null) {
+            // Roll back source removal cleanly if destination insertion produced no entities.
+            sourceRuntime.canvasStateHolder.applyExternalActionInverse(removeAction)
+            return null
+        }
+
+        val (addAction, importResult) = insertedPair
+        val txId = UUID.randomUUID().toString()
+        undoCoordinator.record(sourcePageId, removeAction, transactionId = txId)
+        undoCoordinator.record(destPageId, addAction, transactionId = txId)
+
+        sourceBounds?.let { sourceRuntime.dryInkRasterCache.invalidateDocRect(it) }
+        importResult.affectedBounds?.let { destRuntime.dryInkRasterCache.invalidateDocRect(it) }
+
+        sourceRuntime.strokeJournal.enqueueCanvasActionForward(removeAction)
+        destRuntime.strokeJournal.enqueueCanvasActionForward(addAction)
+        onLocalMutationCommitted(sourcePageId)
+        onLocalMutationCommitted(destPageId)
+
+        return CrossPageTransferResult(
+            sourcePageId = sourcePageId,
+            destPageId = destPageId,
+            importResult = importResult,
+            sourceAffectedBoundsLocal = sourceBounds,
+            destAffectedBoundsLocal = importResult.affectedBounds
+        )
+    }
+
     fun notifyPageDeleted(pageId: String) {
         undoCoordinator.removePageEntries(pageId)
     }
@@ -487,32 +693,49 @@ class MultiPageSessionManager(
     suspend fun applyRedo(): MultiPageHistoryResult? = applyHistoryTransition(isUndo = false)
 
     private suspend fun applyHistoryTransition(isUndo: Boolean): MultiPageHistoryResult? {
-        val entry = (if (isUndo) undoCoordinator.popUndo() else undoCoordinator.popRedo())
-            ?: return null
+        val group = (if (isUndo) undoCoordinator.popUndoGroup() else undoCoordinator.popRedoGroup())
+            .ifEmpty { return null }
 
-        val wasWarm = pool.isReady(entry.pageId)
-        val runtime = pool.ensureHydrated(entry.pageId)
-        val affectedBounds = if (isUndo) {
-            runtime.canvasStateHolder.applyExternalActionInverse(entry.action)
-        } else {
-            runtime.canvasStateHolder.applyExternalActionForward(entry.action)
-        }
-        affectedBounds?.let { runtime.dryInkRasterCache.invalidateDocRect(it) }
+        val mutatedIds = LinkedHashSet<String>(group.size)
+        var anyRehydrated = false
+        var anchorEntry = group.last()
+        var anchorBounds: DocRect? = null
+        var anchorReadOnly = false
 
-        if (!runtime.isReadOnly) {
-            if (isUndo) {
-                runtime.strokeJournal.enqueueCanvasActionInverse(entry.action)
+        for (i in 0 until group.size) {
+            val entry = group[i]
+            val wasWarm = pool.isReady(entry.pageId)
+            if (!wasWarm) anyRehydrated = true
+            val runtime = pool.ensureHydrated(entry.pageId)
+            val affectedBounds = if (isUndo) {
+                runtime.canvasStateHolder.applyExternalActionInverse(entry.action)
             } else {
-                runtime.strokeJournal.enqueueCanvasActionForward(entry.action)
+                runtime.canvasStateHolder.applyExternalActionForward(entry.action)
+            }
+            affectedBounds?.let { runtime.dryInkRasterCache.invalidateDocRect(it) }
+
+            if (!runtime.isReadOnly) {
+                if (isUndo) {
+                    runtime.strokeJournal.enqueueCanvasActionInverse(entry.action)
+                } else {
+                    runtime.strokeJournal.enqueueCanvasActionForward(entry.action)
+                }
+            }
+            mutatedIds.add(entry.pageId)
+            if (i == group.lastIndex) {
+                anchorEntry = entry
+                anchorBounds = affectedBounds
+                anchorReadOnly = runtime.isReadOnly
             }
         }
 
         return MultiPageHistoryResult(
-            pageId = entry.pageId,
-            action = entry.action,
-            affectedBoundsLocal = affectedBounds,
-            isReadOnly = runtime.isReadOnly,
-            didRehydratePage = !wasWarm
+            pageId = anchorEntry.pageId,
+            action = anchorEntry.action,
+            affectedBoundsLocal = anchorBounds,
+            isReadOnly = anchorReadOnly,
+            didRehydratePage = anyRehydrated,
+            mutatedPageIds = mutatedIds
         )
     }
 

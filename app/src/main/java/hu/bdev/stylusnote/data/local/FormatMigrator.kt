@@ -102,6 +102,7 @@ object FormatMigrator {
             5 -> BrushToolType.VECTOR_ERASER
             6 -> BrushToolType.PRECISION_ERASER
             7 -> BrushToolType.LASSO
+            8 -> BrushToolType.CLOZE_TAPE
             else -> null
         }
         return if (matched != null) {
@@ -119,6 +120,7 @@ object FormatMigrator {
         BrushToolType.VECTOR_ERASER -> 5
         BrushToolType.PRECISION_ERASER -> 6
         BrushToolType.LASSO -> 7
+        BrushToolType.CLOZE_TAPE -> 8
     }
 }
 

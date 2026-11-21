@@ -215,3 +215,47 @@ flowchart LR
     FAST -- Nem --> BATCH["toStylusMotionFrame + OneEuroFilter + monoton predikció + offsetXPt/YPT toStrokeInputBatch"]
 ```
 
+---
+
+## 14. Kitakaró Szalag, Kódblokk Zónák & Élő LaTeX/Matek Munkafolyamatok (XII. Ütem)
+
+```mermaid
+flowchart LR
+    TAPE["Cloze eszköz / szalaghúzás → PageObject.ClozeTapeObject (5b réteg)"] --> REVEAL["1-ujjas / Cloze koppintás → revealedClozeTapeIds felfedés / visszazárás"]
+    CODE["Eszköztár </> → drag/tap zóna → CodeBlockEditorDialog (SQL/Py/JS-TS/C#)"] --> CODE2B["2b réteg monospace (tördelésmentes) + rárajzolt tinta horgonyozva marad"]
+    LASSO["Lasszó kijelölés → ∑ LaTeX"] --> LMOD["BYOK Gemini / offline ML Kit → szerkeszthető LatexEditDialog + Grafikon"]
+    EQ["Kézírás végén '=' jel (600 ms)"] --> DET["EqualsGestureDetector → offline ML Kit + FunctionEvaluator"]
+    DET -- Számtani / függvény --> GHOST["Halvány sugallat-pirula: '= eredmény ✓' vagy 'Grafikon' / opcionális '✨ AI megoldás'"]
+```
+
+---
+
+## 15. Oldalközi Lasszó Áthelyezés/Vágólap & Statikus `N × M` Táblázat (XIII. Ütem)
+
+```mermaid
+flowchart LR
+    L1["Lasszó kijelölés forrásoldalon"] --> DRAG["Áthúzás szomszédos oldalra → resolveDropDestinationSlot"]
+    DRAG --> XFER["MultiPageSessionManager átviszi a lokális koordinátákat + csoportos Undo (transactionId)"]
+    L1 --> COPY["Másolás gomb → füzetszintű lassoClipboard + lebegő Beillesztés sáv"]
+    COPY --> SCROLL["Görgetés távoli oldalra → Beillesztés viewport-középre (vagy Duplikálás helyben)"]
+    DOCK["Eszköztár Táblázat gomb"] --> POP["TablePickerPopover (6×6 rács / 1..20×1..12 léptetők + fejléc/szín)"]
+    POP --> DRAFT["PendingTableDraftOverlay: mozgatás + 4 sarok méretezés"]
+    DRAFT -- Lehelyezés --> LOCK["TableObject (2b réteg) + cella-tinta horgonyzás"]
+    LOCK -- 1 cella szűk lasszó --> CELL["Csak a cellabeli szám/írás mozdul"]
+    LOCK -- Táblázatot átfogó lasszó --> WHOLE["Teljes táblázat + összes cella-tinta együtt mozdul/másolható (forgatás nélkül)"]
+```
+
+---
+
+## 16. Finomított `∑ LaTeX`, Teljes Szélességű Eszköztár & Tehetetlenségi Görgetés (XIV. Ütem)
+
+```mermaid
+flowchart LR
+    INK["Kézzel írt képlet lasszózása"] --> CONVERT["∑ LaTeX → forrástoll szerializálás + tört/AI elemzés (nincs x^2+1 fallback)"]
+    CONVERT --> NODE["Formázott LaTeXObject kijelölve (szerkesztő még nem nyílik)"]
+    NODE --> PILL["Viewport-határolt FloatingObjectActionPill (fent/lent átbillenő)"]
+    PILL -- Szerkesztés --> DIALOG["LatexEditDialog: kurzortudatos beillesztés + 4 kategória + szín + előnézet"]
+    FLING["1-ujjas függőleges legyintés"] --> VEL["FingerVelocityTracker → ScrollFlingState (120/144 Hz exponenciális kifutás, határon megáll)"]
+```
+
+

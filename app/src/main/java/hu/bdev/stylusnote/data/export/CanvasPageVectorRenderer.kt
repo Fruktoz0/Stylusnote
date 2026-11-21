@@ -17,9 +17,13 @@ import hu.bdev.stylusnote.core.ai.FunctionEvaluator
 import hu.bdev.stylusnote.core.math.ColorLuminanceInverter
 import hu.bdev.stylusnote.core.math.GeometricShapeRenderer
 import hu.bdev.stylusnote.domain.model.BrushConfig
+import hu.bdev.stylusnote.domain.model.ObjectAttachmentGeometry
 import hu.bdev.stylusnote.domain.model.PageObject
 import hu.bdev.stylusnote.domain.model.PersistedStrokeRecord
 import hu.bdev.stylusnote.domain.model.StrokeLayerType
+import hu.bdev.stylusnote.ui.canvas.ClozeTapeCanvasRenderer
+import hu.bdev.stylusnote.ui.canvas.CodeBlockCanvasRenderer
+import hu.bdev.stylusnote.ui.canvas.TableCanvasRenderer
 import ru.noties.jlatexmath.JLatexMathDrawable
 import java.io.File
 import kotlin.math.PI
@@ -72,10 +76,10 @@ object CanvasPageVectorRenderer {
         val sortedObjects = if (objects.size > 1) objects.sortedBy { it.zOrder } else objects
         val sortedStrokes = if (strokes.size > 1) strokes.sortedBy { it.zOrder } else strokes
 
-        // Layer 2b: Under-ink embedded raster images so strokes drawn onto images render above them.
+        // Layer 2b: Under-ink embedded raster images, code blocks, and locked table grids.
         for (i in 0 until sortedObjects.size) {
             val obj = sortedObjects[i]
-            if (obj is PageObject.ImageObject) {
+            if (ObjectAttachmentGeometry.isUnderInkRenderedObject(obj)) {
                 drawPageObject(
                     canvas = canvas,
                     obj = obj,
@@ -122,10 +126,12 @@ object CanvasPageVectorRenderer {
             canvas.drawPath(path, fillPaint)
         }
 
-        // Layer 5: Embedded non-image page objects above ink.
+        // Layer 5a: Embedded page objects above ink (excluding under-ink objects and Layer 5b Cloze tapes).
         for (i in 0 until sortedObjects.size) {
             val obj = sortedObjects[i]
-            if (obj is PageObject.ImageObject) continue
+            if (ObjectAttachmentGeometry.isUnderInkRenderedObject(obj) ||
+                obj is PageObject.ClozeTapeObject
+            ) continue
             drawPageObject(
                 canvas = canvas,
                 obj = obj,
@@ -134,6 +140,21 @@ object CanvasPageVectorRenderer {
                 imageBitmapResolver = imageBitmapResolver,
                 recycleResolvedImageBitmaps = recycleResolvedImageBitmaps
             )
+        }
+
+        // Layer 5b: Cloze masking tapes on top of all objects & strokes.
+        for (i in 0 until sortedObjects.size) {
+            val obj = sortedObjects[i]
+            if (obj is PageObject.ClozeTapeObject) {
+                drawPageObject(
+                    canvas = canvas,
+                    obj = obj,
+                    isOledMode = isOledMode,
+                    context = context,
+                    imageBitmapResolver = imageBitmapResolver,
+                    recycleResolvedImageBitmaps = recycleResolvedImageBitmaps
+                )
+            }
         }
     }
 
@@ -285,6 +306,27 @@ object CanvasPageVectorRenderer {
                         resolvedBitmap.recycle()
                     }
                 }
+            }
+
+            is PageObject.CodeBlockObject -> {
+                CodeBlockCanvasRenderer.drawCodeBlock(canvas, obj, isOledMode)
+            }
+
+            is PageObject.TableObject -> {
+                TableCanvasRenderer.drawTable(canvas, obj, isOledMode)
+            }
+
+            is PageObject.ClozeTapeObject -> {
+                ClozeTapeCanvasRenderer.drawClozeTape(
+                    canvas = canvas,
+                    bounds = obj.bounds,
+                    canonicalColorArgb = obj.canonicalColorArgb,
+                    patternStyle = obj.patternStyle,
+                    rotationRadians = obj.rotationRadians,
+                    label = obj.label,
+                    isOledMode = isOledMode,
+                    isRevealed = false
+                )
             }
         }
     }
