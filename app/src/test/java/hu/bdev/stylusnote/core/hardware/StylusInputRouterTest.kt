@@ -5,6 +5,8 @@ import android.view.MotionEvent
 import androidx.ink.brush.InputToolType
 import hu.bdev.stylusnote.core.math.CanvasTransformMatrix
 import hu.bdev.stylusnote.core.math.OneEuroFilter
+import hu.bdev.stylusnote.domain.model.BrushConfig
+import hu.bdev.stylusnote.ui.canvas.shouldRequestUnbufferedDispatchForEvent
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -829,6 +831,212 @@ class StylusInputRouterTest {
         assertEquals(1.0f, transform.scale, 1e-6f)
         assertEquals(0f, transform.panXPx, 1e-4f)
         assertEquals(0f, transform.panYPx, 1e-4f)
+    }
+
+    @Test
+    fun rawMoveFastPathRoutesDirectlyAndRecyclesPredictionWhileFallingBackOnButtonOrCancel() {
+        val sink = FakeWetStrokeSink()
+        val predictor = FakePredictorBridge().apply {
+            nextPredictedSamples = listOf(
+                RawScreenSample(260f, 240f, 118L, 118_000_000L, 0.5f, 0f, 0f)
+            )
+        }
+        val router = StylusInputRouter(
+            transformMatrix = CanvasTransformMatrix(),
+            oneEuroFilter = OneEuroFilter(0f),
+            wetStrokeSink = sink,
+            predictorBridge = predictor
+        )
+
+        assertTrue(
+            router.processTouchFrame(
+                StylusMotionFrame(
+                    action = StylusAction.DOWN,
+                    actionIndex = 0,
+                    flags = 0,
+                    buttonState = 0,
+                    eventTimeMs = 100L,
+                    eventTimeNanos = 100_000_000L,
+                    pointers = listOf(
+                        StylusPointerSnapshot(7, MotionEvent.TOOL_TYPE_STYLUS, 200f, 200f, 0.5f, 0f, 0f)
+                    ),
+                    rawEvent = FakeEvent("down")
+                )
+            )
+        )
+
+        assertTrue(
+            router.tryProcessActiveRawMove(
+                rawEvent = FakeEvent("fast-move"),
+                actionMasked = MotionEvent.ACTION_MOVE,
+                flags = 0,
+                buttonState = 0,
+                eventTimeMs = 110L,
+                hasActivePointer = true
+            )
+        )
+        assertEquals(1, sink.rawMoveCount)
+        assertEquals(1, predictor.createdPredictions.size)
+        assertTrue(predictor.createdPredictions.single().recycled)
+
+        // Any cancel flag, button-state change, missing active pointer, or >0% filter must fall back.
+        assertFalse(
+            router.tryProcessActiveRawMove(
+                rawEvent = FakeEvent("canceled"),
+                actionMasked = MotionEvent.ACTION_MOVE,
+                flags = MotionEvent.FLAG_CANCELED,
+                buttonState = 0,
+                eventTimeMs = 115L,
+                hasActivePointer = true
+            )
+        )
+        assertFalse(
+            router.tryProcessActiveRawMove(
+                rawEvent = FakeEvent("btn-edge"),
+                actionMasked = MotionEvent.ACTION_MOVE,
+                flags = 0,
+                buttonState = MotionEvent.BUTTON_STYLUS_PRIMARY,
+                eventTimeMs = 116L,
+                hasActivePointer = true
+            )
+        )
+        assertFalse(
+            router.tryProcessActiveRawMove(
+                rawEvent = FakeEvent("missing-ptr"),
+                actionMasked = MotionEvent.ACTION_MOVE,
+                flags = 0,
+                buttonState = 0,
+                eventTimeMs = 117L,
+                hasActivePointer = false
+            )
+        )
+        router.setStabilizationPercent(25f)
+        assertFalse(
+            router.tryProcessActiveRawMove(
+                rawEvent = FakeEvent("filtered"),
+                actionMasked = MotionEvent.ACTION_MOVE,
+                flags = 0,
+                buttonState = 0,
+                eventTimeMs = 118L,
+                hasActivePointer = true
+            )
+        )
+        assertEquals(1, sink.rawMoveCount)
+    }
+
+    @Test
+    fun batchPathDropsNonMonotonicPredictedTimestampsAndAppliesBatchOffsets() {
+        val predictor = FakePredictorBridge().apply {
+            nextPredictedSamples = listOf(
+                RawScreenSample(215f, 215f, 105L, 105_000_000L, 0.5f, 0f, 0f),
+                RawScreenSample(245f, 245f, 125L, 125_000_000L, 0.5f, 0f, 0f)
+            )
+        }
+        val sink = FakeWetStrokeSink()
+        val router = StylusInputRouter(
+            transformMatrix = CanvasTransformMatrix(),
+            oneEuroFilter = OneEuroFilter(30f),
+            wetStrokeSink = sink,
+            predictorBridge = predictor
+        )
+
+        router.processTouchFrame(
+            StylusMotionFrame(
+                action = StylusAction.DOWN,
+                actionIndex = 0,
+                flags = 0,
+                buttonState = 0,
+                eventTimeMs = 100L,
+                eventTimeNanos = 100_000_000L,
+                pointers = listOf(
+                    StylusPointerSnapshot(1, MotionEvent.TOOL_TYPE_STYLUS, 200f, 200f, 0.5f, 0f, 0f)
+                )
+            )
+        )
+        router.processTouchFrame(
+            StylusMotionFrame(
+                action = StylusAction.MOVE,
+                actionIndex = 0,
+                flags = 0,
+                buttonState = 0,
+                eventTimeMs = 112L,
+                eventTimeNanos = 112_000_000L,
+                pointers = listOf(
+                    StylusPointerSnapshot(1, MotionEvent.TOOL_TYPE_STYLUS, 225f, 225f, 0.55f, 0f, 0f)
+                )
+            )
+        )
+
+        assertEquals(1, sink.batchPredictedMoves.size)
+        assertEquals(245f, sink.batchPredictedMoves.single().xPt, 1e-3f)
+
+        val shifted = computeShiftedStrokeInputPoint(120f, 350f, offsetXPt = -20f, offsetYPt = -150f)!!
+        assertEquals(100f, shifted.first, 1e-3f)
+        assertEquals(200f, shifted.second, 1e-3f)
+        assertEquals(null, computeShiftedStrokeInputPoint(Float.NaN, 10f, 0f, 0f))
+    }
+
+    @Test
+    fun unbufferedDispatchHelperTargetsStylusAndSingleFingerDrawingOnly() {
+        assertEquals(0f, BrushConfig.DEFAULT_STABILIZATION_PERCENT, 1e-6f)
+
+        assertTrue(
+            shouldRequestUnbufferedDispatchForEvent(
+                actionMasked = MotionEvent.ACTION_DOWN,
+                actionToolType = MotionEvent.TOOL_TYPE_STYLUS,
+                pointerCount = 1,
+                allowFingerDrawing = false
+            )
+        )
+        assertTrue(
+            shouldRequestUnbufferedDispatchForEvent(
+                actionMasked = MotionEvent.ACTION_POINTER_DOWN,
+                actionToolType = MotionEvent.TOOL_TYPE_ERASER,
+                pointerCount = 2,
+                allowFingerDrawing = false
+            )
+        )
+        assertTrue(
+            shouldRequestUnbufferedDispatchForEvent(
+                actionMasked = MotionEvent.ACTION_DOWN,
+                actionToolType = MotionEvent.TOOL_TYPE_FINGER,
+                pointerCount = 1,
+                allowFingerDrawing = true
+            )
+        )
+
+        assertFalse(
+            shouldRequestUnbufferedDispatchForEvent(
+                actionMasked = MotionEvent.ACTION_DOWN,
+                actionToolType = MotionEvent.TOOL_TYPE_FINGER,
+                pointerCount = 1,
+                allowFingerDrawing = false
+            )
+        )
+        assertFalse(
+            shouldRequestUnbufferedDispatchForEvent(
+                actionMasked = MotionEvent.ACTION_POINTER_DOWN,
+                actionToolType = MotionEvent.TOOL_TYPE_FINGER,
+                pointerCount = 2,
+                allowFingerDrawing = true
+            )
+        )
+        assertFalse(
+            shouldRequestUnbufferedDispatchForEvent(
+                actionMasked = MotionEvent.ACTION_MOVE,
+                actionToolType = MotionEvent.TOOL_TYPE_STYLUS,
+                pointerCount = 1,
+                allowFingerDrawing = false
+            )
+        )
+        assertFalse(
+            shouldRequestUnbufferedDispatchForEvent(
+                actionMasked = MotionEvent.ACTION_UP,
+                actionToolType = MotionEvent.TOOL_TYPE_STYLUS,
+                pointerCount = 1,
+                allowFingerDrawing = false
+            )
+        )
     }
 }
 

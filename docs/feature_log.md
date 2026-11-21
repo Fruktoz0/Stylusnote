@@ -344,3 +344,20 @@ flowchart TD
   - `.\gradlew testDebugUnitTest --no-daemon`: **131/131** JVM unit teszt sikeres **26** tesztosztályban (`0` hiba, `0` kihagyás — benne a `StylusInputRouterTest` repeat-kulcs vizsgálattal és az új 6 tételes `XPhaseValidationUnitTest`-tel).
   - `.\gradlew :app:connectedDebugAndroidTest --no-daemon`: **28/28** műszerezett teszt sikeres (`TEST-25097RP43G - 16-_app-.xml`: `0` hiba, `0` errors, `0` kihagyás — köztük a 4 új `XPhaseValidationInstrumentedTest` teszt: Room `MIGRATION_3_4` + `updatedAtEpochMs` védelem, késleltetett metaadatú vegyes/fekvő PDF középre igazítása, Page 3 + ~220% lokális szakasz visszatöltése újranyitáskor, és élő `StylusDrawingSurface` hardvergomb/hover + `StylusToggleDebouncer` váltás).
   - `.\gradlew :app:installDebug --no-daemon` + élő ellenőrzés (`25097RP43G`): Hidegindítás (`LAUNCH_STATE: COLD`, `TotalTime: 803 ms`, `AndroidRuntime:E` / `FATAL:E` hiba nélkül), füzetnyitás + Debug HUD + visszatérés ellenőrizve.
+
+---
+
+### [2026-11-20] — XI. Ütem (`Lépés 79–82`): Alacsony Késleltetésű Stylus Input Pipeline Optimalizálás
+
+- **Unbuffered Dispatch & `input-motionprediction:1.0.1` (`Lépés 79` — `libs.versions.toml`, `StylusDrawingSurface.kt`):**
+  - `androidx.input:input-motionprediction` frissítve `1.0.0` → `1.0.1`-re (`AXIS_RZ` stylus tengelytámogatás).
+  - Az `InProgressStrokesView` (`wetView`) ablakhoz csatoláskor (`onViewAttachedToWindow`) API 34+ esetén kéri a tartós `requestUnbufferedDispatch(InputDevice.SOURCE_STYLUS)` módot, a `setOnTouchListener` pedig `ACTION_DOWN`/`ACTION_POINTER_DOWN` esetén — kizárólag stylus/radír vagy engedélyezett 1-ujjas rajz esetén (`shouldRequestUnbufferedDispatchForEvent`) — meghívja a `view.requestUnbufferedDispatch(event)` API-t, míg az 1-ujjas görgetés és 2-ujjas pinch/zoom VSYNC-szinkron marad.
+- **Zero-Allocation `MOVE` Gyorsítósáv & Batch Optimalizálás (`Lépés 80` — `StylusInputRouter.kt`, `StylusDrawingSurface.kt`):**
+  - `tryProcessActiveRawMove`: `0%` stabilizálásnál, aktív vonás közben, `FLAG_CANCELED == 0` és változatlan `buttonState` mellett kikerüli a `StylusMotionFrame`, `ArrayList`, `StylusPointerSnapshot` és `deviceMeta` per-frame allokációit, a `predictorBridge?.record(event)` → `predict()` → `wetStrokeSink.onAddToRawStroke` → `finally { recycle() }` lánc közvetlen meghívásával.
+  - `toStrokeInputBatch(toolType, offsetXPt, offsetYPt)` + `computeShiftedStrokeInputPoint`: megszüntette a batch ág `shiftSamples` és `dropLast(1)` listamásolásait laponkénti eltoláskor; az `addMoveToStroke` kiszűri a visszafelé ugró OEM prediktált időbélyegeket (`p.eventTimeMs < frame.eventTimeMs`).
+- **Alapértelmezett Minimális Késleltetés (`Lépés 81` — `BrushConfig.kt`, `BrushSettingsPopover.kt`):**
+  - `BrushConfig.DEFAULT_STABILIZATION_PERCENT` `25f` → `0f`-ra módosítva (a kiemelő `40f` marad, meglévő mentett felhasználói DataStore beállítások felülírása nélkül), az 1. kedvenc töltőtoll preset `0f` lett, a csúszka fejléce pedig `0%` esetén `"0% (min. késleltetés)"` jelzést mutat.
+- **XI. Ütem Verifikáció (`Lépés 82` — `25097RP43G` Xiaomi Pad 8, Android 16):**
+  - `.\gradlew testDebugUnitTest --no-daemon`: **134/134** JVM unit teszt sikeres **26** tesztosztályban (`0` hiba, `0` kihagyás — benne a 3 új teszt a `StylusInputRouterTest`-ben).
+  - `.\gradlew :app:connectedDebugAndroidTest --no-daemon`: **29/29** műszerezett teszt sikeres (`TEST-25097RP43G - 16-_app-.xml`: `0` hiba, `0` errors, `0` kihagyás — köztük az `unbufferedStylusDownMoveUpDrawsThroughLiveWetViewWithoutCrash` [`1,154 s`] élő stylus `ACTION_DOWN→MOVE→UP` + natív `toStrokeInputBatch` eltolás teszttel és az összes korábbi X-fázis + L68–71 + felhőszinkron + folytonos scroll teszttel).
+  - `.\gradlew :app:installDebug --no-daemon` + élő hidegindítási ellenőrzés (`25097RP43G`): `LaunchState: COLD`, `TotalTime: 831 ms` (`WaitTime: 839 ms`), `AndroidRuntime:E` / `FATAL:E` / `DEBUG:E` logcat hiba nélkül.

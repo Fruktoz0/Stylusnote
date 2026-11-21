@@ -80,12 +80,25 @@ data class RawScreenSample(
     val orientationRadians: Float
 )
 
+internal fun computeShiftedStrokeInputPoint(
+    xPt: Float,
+    yPt: Float,
+    offsetXPt: Float,
+    offsetYPt: Float
+): Pair<Float, Float>? {
+    val shiftedX = xPt + offsetXPt
+    val shiftedY = yPt + offsetYPt
+    return if (shiftedX.isFinite() && shiftedY.isFinite()) shiftedX to shiftedY else null
+}
+
 /**
  * Converts a sequence of [StylusPointSample] points into a [MutableStrokeInputBatch],
  * enforcing Ink's monotonic time, tilt `[0, PI/2]`, and orientation `[0, 2*PI)` invariants.
  */
 fun List<StylusPointSample>.toStrokeInputBatch(
-    toolType: InputToolType = InputToolType.STYLUS
+    toolType: InputToolType = InputToolType.STYLUS,
+    offsetXPt: Float = 0f,
+    offsetYPt: Float = 0f
 ): MutableStrokeInputBatch {
     val batch = MutableStrokeInputBatch()
     if (isEmpty()) return batch
@@ -97,7 +110,12 @@ fun List<StylusPointSample>.toStrokeInputBatch(
 
     for (i in 0 until size) {
         val sample = this[i]
-        if (!sample.xPt.isFinite() || !sample.yPt.isFinite()) continue
+        val (shiftedX, shiftedY) = computeShiftedStrokeInputPoint(
+            xPt = sample.xPt,
+            yPt = sample.yPt,
+            offsetXPt = offsetXPt,
+            offsetYPt = offsetYPt
+        ) ?: continue
         val safeElapsed = maxOf(lastElapsedMs, sample.elapsedTimeMillis.coerceAtLeast(0L))
         lastElapsedMs = safeElapsed
 
@@ -108,8 +126,8 @@ fun List<StylusPointSample>.toStrokeInputBatch(
         val safeOrientation = if (wrappedOrientation >= twoPi) 0f else wrappedOrientation
 
         reusableInput.update(
-            x = sample.xPt,
-            y = sample.yPt,
+            x = shiftedX,
+            y = shiftedY,
             elapsedTimeMillis = safeElapsed,
             toolType = toolType,
             pressure = safePressure,
@@ -343,6 +361,50 @@ class StylusInputRouter<TEvent>(
 
     fun setStabilizationPercent(percent: Float) {
         oneEuroFilter.setStabilizationPercent(percent)
+    }
+
+    internal val isStabilizationBypassed: Boolean
+        get() = oneEuroFilter.isBypassed
+
+    internal fun needsDeviceMetaForButtonState(buttonState: Int): Boolean =
+        buttonState != lastObservedStylusButtonMask
+
+    /**
+     * Zero-allocation hot path for active `ACTION_MOVE` strokes when stabilization is 0% (`isBypassed`),
+     * button state has not changed, and no cancellation flag is present.
+     */
+    internal fun tryProcessActiveRawMove(
+        rawEvent: TEvent,
+        actionMasked: Int,
+        flags: Int,
+        buttonState: Int,
+        eventTimeMs: Long,
+        hasActivePointer: Boolean
+    ): Boolean {
+        if (actionMasked != MotionEvent.ACTION_MOVE) return false
+        if ((flags and MotionEvent.FLAG_CANCELED) != 0) return false
+        val pointerId = activeStrokePointerId ?: return false
+        if (!oneEuroFilter.isBypassed) return false
+        if (buttonState != lastObservedStylusButtonMask) return false
+        if (!hasActivePointer) return false
+
+        if (activeStrokeIsStylus) {
+            lastStylusActivityTimeMs = eventTimeMs
+            isStylusHovering = false
+        }
+        val predictedEvent = predictorBridge?.predict()
+        try {
+            wetStrokeSink.onAddToRawStroke(
+                realEvent = rawEvent,
+                predictedEvent = predictedEvent,
+                pointerId = pointerId
+            )
+        } finally {
+            if (predictedEvent != null) {
+                predictorBridge?.recycle(predictedEvent)
+            }
+        }
+        return true
     }
 
     /**
@@ -650,6 +712,7 @@ class StylusInputRouter<TEvent>(
                     ArrayList<StylusPointSample>(rawPredicted.size).apply {
                         for (i in 0 until rawPredicted.size) {
                             val p = rawPredicted[i]
+                            if (p.eventTimeMs < frame.eventTimeMs) continue
                             add(
                                 toFilteredDocSample(
                                     xPx = p.xPx,
@@ -1016,7 +1079,11 @@ class StylusInputRouter<TEvent>(
     }
 }
 
-private fun MotionEvent.toStylusMotionFrame(trackedPointerId: Int?): StylusMotionFrame<MotionEvent> {
+private fun MotionEvent.toStylusMotionFrame(
+    trackedPointerId: Int?,
+    includeHistory: Boolean = true,
+    includeDeviceMeta: Boolean = true
+): StylusMotionFrame<MotionEvent> {
     val mappedAction = when (actionMasked) {
         MotionEvent.ACTION_DOWN -> StylusAction.DOWN
         MotionEvent.ACTION_POINTER_DOWN -> StylusAction.POINTER_DOWN
@@ -1056,7 +1123,7 @@ private fun MotionEvent.toStylusMotionFrame(trackedPointerId: Int?): StylusMotio
         )
     }
 
-    val historySamples = if (trackedPointerId != null && historySize > 0) {
+    val historySamples = if (includeHistory && trackedPointerId != null && historySize > 0) {
         val idx = findPointerIndex(trackedPointerId)
         if (idx >= 0) {
             ArrayList<RawScreenSample>(historySize).apply {
@@ -1095,7 +1162,7 @@ private fun MotionEvent.toStylusMotionFrame(trackedPointerId: Int?): StylusMotio
         eventTimeNanos = eventTime * 1_000_000L,
         pointers = pointers,
         historyForActivePointer = historySamples,
-        deviceMeta = device.toStylusDeviceMeta(source),
+        deviceMeta = if (includeDeviceMeta) device.toStylusDeviceMeta(source) else null,
         rawEvent = this
     )
 }
@@ -1104,7 +1171,7 @@ private fun MotionEvent.toStylusMotionFrame(trackedPointerId: Int?): StylusMotio
  * Type-safe Android `MotionEvent` entry points for [StylusInputRouter]<[MotionEvent]>.
  */
 fun StylusInputRouter<MotionEvent>.onTouchEvent(event: MotionEvent): Boolean {
-    // Record raw MotionEvent BEFORE any filtering when it involves a drawing pointer.
+    // Record raw MotionEvent BEFORE any filtering or fast path when it involves a drawing pointer.
     val hasAcceptedTool = hasAcceptedToolForPrediction(event)
     if (hasAcceptedTool &&
         event.actionMasked != MotionEvent.ACTION_CANCEL &&
@@ -1113,12 +1180,33 @@ fun StylusInputRouter<MotionEvent>.onTouchEvent(event: MotionEvent): Boolean {
     ) {
         predictorBridge?.record(event)
     }
-    val frame = event.toStylusMotionFrame(activeStrokePointerId)
+    val activePtrId = activeStrokePointerId
+    if (activePtrId != null &&
+        tryProcessActiveRawMove(
+            rawEvent = event,
+            actionMasked = event.actionMasked,
+            flags = event.flags,
+            buttonState = event.buttonState,
+            eventTimeMs = event.eventTime,
+            hasActivePointer = event.findPointerIndex(activePtrId) >= 0
+        )
+    ) {
+        return true
+    }
+    val frame = event.toStylusMotionFrame(
+        trackedPointerId = activePtrId,
+        includeHistory = !isStabilizationBypassed,
+        includeDeviceMeta = needsDeviceMetaForButtonState(event.buttonState)
+    )
     return processTouchFrame(frame)
 }
 
 fun StylusInputRouter<MotionEvent>.onHoverEvent(event: MotionEvent): Boolean {
-    val frame = event.toStylusMotionFrame(trackedPointerId = null)
+    val frame = event.toStylusMotionFrame(
+        trackedPointerId = null,
+        includeHistory = false,
+        includeDeviceMeta = needsDeviceMetaForButtonState(event.buttonState)
+    )
     return processHoverFrame(frame)
 }
 

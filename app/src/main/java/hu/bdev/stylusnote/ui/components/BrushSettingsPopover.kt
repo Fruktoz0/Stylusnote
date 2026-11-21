@@ -143,7 +143,7 @@ class BrushPresetStore(private val context: Context) {
                 sizePt = 2.0f,
                 colorArgb = 0xFF14171C.toInt(),
                 opacity = 1.0f,
-                stabilizationPercent = 25f
+                stabilizationPercent = 0f
             ),
             BrushConfig(
                 toolType = BrushToolType.FOUNTAIN_PEN,
@@ -837,9 +837,10 @@ fun BrushSettingsPopover(
                                         modifier = Modifier.padding(vertical = 2.dp),
                                         color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
                                     )
+                                    val stabInt = currentConfig.clampedStabilizationPercent.roundToInt()
                                     SettingSliderHeader(
                                         title = "1€ Stabilizálás",
-                                        valueBadge = "${currentConfig.clampedStabilizationPercent.roundToInt()}%"
+                                        valueBadge = if (stabInt == 0) "0% (min. késleltetés)" else "$stabInt%"
                                     )
                                     Slider(
                                         value = currentConfig.clampedStabilizationPercent,

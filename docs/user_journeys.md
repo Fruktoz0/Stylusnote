@@ -201,3 +201,17 @@ flowchart LR
     PEN["Stylus gomb / Focus Pen Pro 0x0022:0x5081"] --> DET["StylusHardwareShortcutDetector + StylusToggleDebouncer (180 ms) → Toll ↔ Radír + Debug HUD napló"]
 ```
 
+---
+
+## 13. Alacsony Késleltetésű Unbuffered & Zero-Allocation Stylus Pipeline (XI. Ütem)
+
+```mermaid
+flowchart LR
+    ATT["InProgressStrokesView csatolás (API 34+)"] --> SRC["requestUnbufferedDispatch(SOURCE_STYLUS)"]
+    DOWN["ACTION_DOWN / POINTER_DOWN (stylus/radír)"] --> UNB["view.requestUnbufferedDispatch(event) — 2-ujjas zoom VSYNC marad"]
+    MOVE["ACTION_MOVE"] --> REC["MotionEventPredictor (1.0.1) record(event)"]
+    REC --> FAST{"0% stabilizálás, ép jel & változatlan gombok?"}
+    FAST -- Igen --> ZERO["tryProcessActiveRawMove (zero-alloc) → onAddToRawStroke + predict() → recycle()"]
+    FAST -- Nem --> BATCH["toStylusMotionFrame + OneEuroFilter + monoton predikció + offsetXPt/YPT toStrokeInputBatch"]
+```
+

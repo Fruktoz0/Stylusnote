@@ -4,8 +4,10 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Matrix
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
@@ -254,6 +256,22 @@ fun computeStrokeDocBounds(stroke: Stroke): DocRect {
     }
     val pad = stroke.brush.size.coerceAtLeast(1f)
     return DocRect(minX - pad, minY - pad, maxX + pad, maxY + pad)
+}
+
+internal fun shouldRequestUnbufferedDispatchForEvent(
+    actionMasked: Int,
+    actionToolType: Int,
+    pointerCount: Int,
+    allowFingerDrawing: Boolean
+): Boolean {
+    if (actionMasked != MotionEvent.ACTION_DOWN &&
+        actionMasked != MotionEvent.ACTION_POINTER_DOWN
+    ) {
+        return false
+    }
+    return actionToolType == MotionEvent.TOOL_TYPE_STYLUS ||
+        actionToolType == MotionEvent.TOOL_TYPE_ERASER ||
+        (allowFingerDrawing && actionToolType == MotionEvent.TOOL_TYPE_FINGER && pointerCount == 1)
 }
 
 /**
@@ -1071,11 +1089,11 @@ fun StylusDrawingSurface(
                 return pts
             }
 
-            private fun shiftSamples(samples: List<StylusPointSample>): List<StylusPointSample> {
+            private fun shiftSingleSample(sample: StylusPointSample): StylusPointSample {
                 val ox = activeBatchOriginXPt
                 val oy = activeBatchOriginYPt
-                if (ox == 0f && oy == 0f) return samples
-                return samples.map { it.copy(xPt = it.xPt - ox, yPt = it.yPt - oy) }
+                if (ox == 0f && oy == 0f) return sample
+                return sample.copy(xPt = sample.xPt - ox, yPt = sample.yPt - oy)
             }
 
             override fun onStartRawStroke(
@@ -1303,16 +1321,16 @@ fun StylusDrawingSurface(
                         val strokeId = activeStrokeId ?: return
                         if (realSamples.isEmpty() && predictedSamples.isEmpty()) return
 
-                        val shiftedReal = shiftSamples(realSamples)
-                        val shiftedPred = shiftSamples(predictedSamples)
-                        if (shiftedReal.isNotEmpty()) {
-                            lastBatchSample = shiftedReal.last()
+                        realSamples.lastOrNull()?.let { latest ->
+                            lastBatchSample = shiftSingleSample(latest)
                         }
-                        val realBatch = shiftedReal.toStrokeInputBatch(toolType)
-                        val predBatch = if (shiftedPred.isEmpty()) {
+                        val ox = -activeBatchOriginXPt
+                        val oy = -activeBatchOriginYPt
+                        val realBatch = realSamples.toStrokeInputBatch(toolType, offsetXPt = ox, offsetYPt = oy)
+                        val predBatch = if (predictedSamples.isEmpty()) {
                             ImmutableStrokeInputBatch.EMPTY
                         } else {
-                            shiftedPred.toStrokeInputBatch(toolType)
+                            predictedSamples.toStrokeInputBatch(toolType, offsetXPt = ox, offsetYPt = oy)
                         }
                         view.addToStroke(
                             inputs = realBatch,
@@ -1354,16 +1372,19 @@ fun StylusDrawingSurface(
                         val view = inProgressViewRef ?: return
                         val strokeId = activeStrokeId ?: return
 
-                        val shiftedFinal = shiftSamples(finalSamples)
-                        if (shiftedFinal.size > 1) {
-                            val intermediateBatch = shiftedFinal.dropLast(1).toStrokeInputBatch(toolType)
+                        val ox = -activeBatchOriginXPt
+                        val oy = -activeBatchOriginYPt
+                        if (finalSamples.size > 1) {
+                            val intermediateBatch = finalSamples
+                                .subList(0, finalSamples.size - 1)
+                                .toStrokeInputBatch(toolType, offsetXPt = ox, offsetYPt = oy)
                             view.addToStroke(
                                 inputs = intermediateBatch,
                                 strokeId = strokeId,
                                 prediction = ImmutableStrokeInputBatch.EMPTY
                             )
                         }
-                        val terminalSample = shiftedFinal.lastOrNull() ?: lastBatchSample
+                        val terminalSample = finalSamples.lastOrNull()?.let(::shiftSingleSample) ?: lastBatchSample
                         if (terminalSample != null) {
                             view.finishStroke(
                                 input = terminalSample.toSingleStrokeInput(toolType),
@@ -1990,7 +2011,12 @@ fun StylusDrawingSurface(
                         }
                     }
                     addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
-                        override fun onViewAttachedToWindow(v: View) = Unit
+                        override fun onViewAttachedToWindow(v: View) {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                                v.requestUnbufferedDispatch(InputDevice.SOURCE_STYLUS)
+                            }
+                        }
+
                         override fun onViewDetachedFromWindow(v: View) {
                             v.removeCallbacks(settleRunnable)
                         }
@@ -2061,11 +2087,28 @@ fun StylusDrawingSurface(
                     }
 
                     setOnTouchListener { view, event ->
-                        // Always claim ACTION_DOWN/POINTER_DOWN so Android delivers 2nd-finger pinch/pan events.
-                        if (event.actionMasked == MotionEvent.ACTION_DOWN ||
-                            event.actionMasked == MotionEvent.ACTION_POINTER_DOWN
+                        // Always claim ACTION_DOWN/POINTER_DOWN so Android delivers 2nd-finger pinch/pan events,
+                        // and opt drawing pointers into unbuffered dispatch while keeping navigation VSYNC-synced.
+                        val actionMasked = event.actionMasked
+                        if (actionMasked == MotionEvent.ACTION_DOWN ||
+                            actionMasked == MotionEvent.ACTION_POINTER_DOWN
                         ) {
                             view.parent?.requestDisallowInterceptTouchEvent(true)
+                            val actionIdx = event.actionIndex
+                            val actionTool = if (actionIdx in 0 until event.pointerCount) {
+                                event.getToolType(actionIdx)
+                            } else {
+                                MotionEvent.TOOL_TYPE_UNKNOWN
+                            }
+                            if (shouldRequestUnbufferedDispatchForEvent(
+                                    actionMasked = actionMasked,
+                                    actionToolType = actionTool,
+                                    pointerCount = event.pointerCount,
+                                    allowFingerDrawing = router.allowFingerDrawing
+                                )
+                            ) {
+                                view.requestUnbufferedDispatch(event)
+                            }
                         }
                         router.onTouchEvent(event)
                         true

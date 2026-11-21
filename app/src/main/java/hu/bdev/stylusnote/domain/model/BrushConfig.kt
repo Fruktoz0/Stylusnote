@@ -110,7 +110,7 @@ data class BrushConfig(
         const val MIN_BRUSH_SIZE_PT: Float = 0.5f
         const val MAX_BRUSH_SIZE_PT: Float = 40.0f
         const val DEFAULT_BRUSH_SIZE_PT: Float = 2.5f
-        const val DEFAULT_STABILIZATION_PERCENT: Float = 25f
+        const val DEFAULT_STABILIZATION_PERCENT: Float = 0f
         const val DEFAULT_ERASER_RADIUS_DP: Float = 18f
         const val HIGHLIGHTER_OPACITY: Float = 0.35f
         const val MIN_OPACITY: Float = 0.10f

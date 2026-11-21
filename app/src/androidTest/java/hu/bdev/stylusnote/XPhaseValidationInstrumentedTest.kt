@@ -22,11 +22,15 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.unit.IntSize
 import androidx.ink.authoring.InProgressStrokesView
+import androidx.ink.brush.InputToolType
+import androidx.ink.strokes.StrokeInput
 import androidx.room.Room
 import androidx.room.testing.MigrationTestHelper
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import hu.bdev.stylusnote.core.hardware.StylusPointSample
 import hu.bdev.stylusnote.core.hardware.StylusToggleDebouncer
+import hu.bdev.stylusnote.core.hardware.toStrokeInputBatch
 import hu.bdev.stylusnote.core.math.CanvasTransformMatrix
 import hu.bdev.stylusnote.core.math.ContinuousPageLayout
 import hu.bdev.stylusnote.core.math.PageDimensionsPt
@@ -40,6 +44,7 @@ import hu.bdev.stylusnote.domain.model.CanvasMode
 import hu.bdev.stylusnote.domain.model.PagePaperConfig
 import hu.bdev.stylusnote.domain.model.PageSizePreset
 import hu.bdev.stylusnote.domain.model.PaperTemplateType
+import hu.bdev.stylusnote.domain.repository.CanvasStateHolder
 import hu.bdev.stylusnote.ui.canvas.MultiPageSessionManager
 import hu.bdev.stylusnote.ui.canvas.StylusDrawingSurface
 import hu.bdev.stylusnote.ui.theme.StylusNoteTheme
@@ -552,6 +557,107 @@ class XPhaseValidationInstrumentedTest {
             hoverHeld.recycle()
             assertEquals(3, toggleCount)
         }
+    }
+
+    @Test
+    fun unbufferedStylusDownMoveUpDrawsThroughLiveWetViewWithoutCrash() {
+        val dryStore = CanvasStateHolder()
+        val transformMatrix = CanvasTransformMatrix()
+        var rootHostView: View? = null
+        var vpSize by mutableStateOf(IntSize.Zero)
+
+        composeRule.setContent {
+            rootHostView = LocalView.current
+            StylusNoteTheme {
+                StylusDrawingSurface(
+                    transformMatrix = transformMatrix,
+                    brushConfig = BrushConfig(),
+                    dryStrokeStore = dryStore,
+                    onViewportSizeChanged = { vpSize = it },
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+        }
+
+        composeRule.waitUntil(timeoutMillis = 5_000L) {
+            findInProgressViews(rootHostView).size == 1 &&
+                vpSize.width > 0 &&
+                vpSize.height > 0 &&
+                (transformMatrix.panXPx != 0f || transformMatrix.panYPx != 0f)
+        }
+        val wetView = findInProgressViews(rootHostView).single()
+
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val downTime = 20_000L
+            fun stylusEvent(action: Int, stepOffsetMs: Long, xPx: Float, yPx: Float, pressure: Float): MotionEvent =
+                MotionEvent.obtain(
+                    downTime,
+                    downTime + stepOffsetMs,
+                    action,
+                    1,
+                    arrayOf(
+                        MotionEvent.PointerProperties().apply {
+                            id = 1
+                            toolType = MotionEvent.TOOL_TYPE_STYLUS
+                        }
+                    ),
+                    arrayOf(
+                        MotionEvent.PointerCoords().apply {
+                            x = xPx
+                            y = yPx
+                            this.pressure = pressure
+                        }
+                    ),
+                    0,
+                    0,
+                    1f,
+                    1f,
+                    0,
+                    0,
+                    InputDevice.SOURCE_STYLUS,
+                    0
+                )
+
+            val events = listOf(
+                stylusEvent(MotionEvent.ACTION_DOWN, 0L, 300f, 300f, 0.55f),
+                stylusEvent(MotionEvent.ACTION_MOVE, 7L, 340f, 325f, 0.65f),
+                stylusEvent(MotionEvent.ACTION_MOVE, 14L, 390f, 355f, 0.70f),
+                stylusEvent(MotionEvent.ACTION_MOVE, 21L, 445f, 390f, 0.72f),
+                stylusEvent(MotionEvent.ACTION_MOVE, 28L, 500f, 420f, 0.60f),
+                stylusEvent(MotionEvent.ACTION_UP, 35L, 515f, 430f, 0f)
+            )
+            try {
+                for (ev in events) {
+                    wetView.dispatchTouchEvent(ev)
+                }
+            } finally {
+                for (ev in events) {
+                    ev.recycle()
+                }
+            }
+        }
+
+        composeRule.waitUntil(timeoutMillis = 5_000L) {
+            dryStore.allStrokesSorted().size == 1
+        }
+        val committed = dryStore.allStrokesSorted().single()
+        assertTrue(
+            "Expected committed stroke to preserve stylus points, was ${committed.stroke.inputs.size}",
+            committed.stroke.inputs.size >= 5
+        )
+
+        val shiftedBatch = listOf(
+            StylusPointSample(120f, 350f, 10L, 0.5f, 0f, 0f, false)
+        ).toStrokeInputBatch(
+            toolType = InputToolType.STYLUS,
+            offsetXPt = -20f,
+            offsetYPt = -150f
+        )
+        assertEquals(1, shiftedBatch.size)
+        val scratch = StrokeInput()
+        shiftedBatch.populate(0, scratch)
+        assertEquals(100f, scratch.x, 1e-3f)
+        assertEquals(200f, scratch.y, 1e-3f)
     }
 
     private fun createMixedOrientationPdfBytes(): ByteArray {

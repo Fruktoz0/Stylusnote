@@ -11,7 +11,7 @@ kotlinxSerialization = "1.8.1"
 
 # Google Jetpack Ink API (1.1.0-alpha10 pinned for experimental Stroke.subtract/split and BrushFamily)
 ink = "1.1.0-alpha10"
-motionPrediction = "1.0.0"
+motionPrediction = "1.0.1"
 
 # Local storage & background processing
 room = "2.8.5"
