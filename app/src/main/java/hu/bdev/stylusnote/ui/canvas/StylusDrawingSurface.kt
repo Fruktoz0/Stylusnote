@@ -407,6 +407,7 @@ fun StylusDrawingSurface(
     onToggleRevealClozeTapeAtPoint: ((pageId: String?, localDocPt: DocPoint) -> Boolean)? = null,
     onCodeBlockZonePlacedInPage: ((pageId: String?, bounds: DocRect) -> Unit)? = null,
     onStylusHoverTopLeftZoneChanged: (Boolean) -> Unit = {},
+    onCursorScreenPositionChanged: (Offset) -> Unit = {},
     onConvertLassoToLatexInPage: ((pageId: String?, selectedIds: Set<String>, onDone: (clearSelection: Boolean) -> Unit) -> Unit)? = null,
     onStrokeCommittedInPage: (pageId: String?) -> Unit = {},
     lassoClipboard: SelectionTransferSnapshot? = null,
@@ -730,6 +731,8 @@ fun StylusDrawingSurface(
                 onCodeBlockZonePlacedInPage
             var onStylusHoverTopLeftZoneChangedCallback: (Boolean) -> Unit =
                 onStylusHoverTopLeftZoneChanged
+            var onCursorScreenPositionChangedCallback: (Offset) -> Unit =
+                onCursorScreenPositionChanged
             var onStrokeCommittedInPageCallback: (String?) -> Unit =
                 onStrokeCommittedInPage
         }
@@ -776,6 +779,7 @@ fun StylusDrawingSurface(
         onToggleRevealClozeTapeAtPointCallback = onToggleRevealClozeTapeAtPoint
         onCodeBlockZonePlacedInPageCallback = onCodeBlockZonePlacedInPage
         onStylusHoverTopLeftZoneChangedCallback = onStylusHoverTopLeftZoneChanged
+        onCursorScreenPositionChangedCallback = onCursorScreenPositionChanged
         onStrokeCommittedInPageCallback = onStrokeCommittedInPage
     }
 
@@ -1459,6 +1463,12 @@ fun StylusDrawingSurface(
                 isEraserTool: Boolean
             ) {
                 activeStrokeRejected = false
+                val ptrIdx = event.findPointerIndex(pointerId)
+                if (ptrIdx >= 0) {
+                    routerConfigHolder.onCursorScreenPositionChangedCallback(
+                        Offset(event.getX(ptrIdx), event.getY(ptrIdx))
+                    )
+                }
                 activeToolType = resolveToolForGesture(isEraserTool)
                 activeMode = modeForTool(activeToolType, isEraserTool)
 
@@ -2528,6 +2538,11 @@ fun StylusDrawingSurface(
                                 postDelayed(settleRunnable, DryInkRasterCache.SETTLE_DEBOUNCE_MS)
                             },
                             onHoverStateChanged = { state ->
+                            if (state.isVisible) {
+                                routerConfigHolder.onCursorScreenPositionChangedCallback(
+                                    Offset(state.screenXPx, state.screenYPx)
+                                )
+                            }
                             if (state.isVisible || hoverStateHolder.current.isVisible) {
                                 hoverStateHolder.current = state
                                 hoverDrawTick.longValue++

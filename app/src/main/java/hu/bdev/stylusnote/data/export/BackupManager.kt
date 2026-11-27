@@ -61,7 +61,8 @@ data class BackupManifest(
         const val MANIFEST_VERSION_V1: Int = 1
         const val MANIFEST_VERSION_V2: Int = 2
         const val MANIFEST_VERSION_V3: Int = 3
-        const val CURRENT_MANIFEST_VERSION: Int = MANIFEST_VERSION_V3
+        const val MANIFEST_VERSION_V4: Int = 4
+        const val CURRENT_MANIFEST_VERSION: Int = MANIFEST_VERSION_V4
         const val DEFAULT_APP_VERSION: String = "0.1.0-alpha"
     }
 }
@@ -112,6 +113,10 @@ class BackupManager(
             writeUtf(out, f.name)
             out.writeInt(f.accentColorArgb)
             out.writeInt(f.sortOrder)
+            if (manifest.formatVersion >= BackupManifest.MANIFEST_VERSION_V4) {
+                writeNullableUtf(out, f.drivePdfFolderId)
+                writeNullableUtf(out, f.drivePdfFolderName)
+            }
             out.writeLong(f.createdAtEpochMs)
             out.writeLong(f.updatedAtEpochMs)
         }
@@ -243,6 +248,16 @@ class BackupManager(
                     name = readUtf(input),
                     accentColorArgb = input.readInt(),
                     sortOrder = input.readInt(),
+                    drivePdfFolderId = if (formatVersion >= BackupManifest.MANIFEST_VERSION_V4) {
+                        readNullableUtf(input)
+                    } else {
+                        null
+                    },
+                    drivePdfFolderName = if (formatVersion >= BackupManifest.MANIFEST_VERSION_V4) {
+                        readNullableUtf(input)
+                    } else {
+                        null
+                    },
                     createdAtEpochMs = input.readLong(),
                     updatedAtEpochMs = input.readLong()
                 )

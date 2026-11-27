@@ -21,6 +21,16 @@ private val Context.toolDockDataStore: DataStore<Preferences> by preferencesData
 )
 
 /**
+ * How the Focus Pen Pro / stylus barrel button triggers [RadialPieMenuOverlay].
+ * Short tap always retains Pen ↔ Eraser toggle unless [OFF] makes even `DOWN` immediate.
+ */
+enum class StylusPieMenuTriggerMode(val labelHu: String) {
+    LONG_PRESS("Hosszú nyomás"),
+    DOUBLE_PRESS("Dupla nyomás"),
+    OFF("Kikapcsolva")
+}
+
+/**
  * App-wide persisted state of [FloatingToolDock] shared uniformly across every notebook:
  * normalized viewport position, collapsed 3-button mode vs full bar, vertical orientation,
  * left pull-tab Y fraction, and per-tool independent brush/eraser configurations.
@@ -33,7 +43,8 @@ data class ToolDockPrefs(
     val leftTabYFraction: Float = 0.5f,
     val perToolConfigsRaw: String = "",
     val highlighterAutoSize: Boolean = true,
-    val topToolbarAutoHide: Boolean = false
+    val topToolbarAutoHide: Boolean = false,
+    val pieMenuTriggerMode: StylusPieMenuTriggerMode = StylusPieMenuTriggerMode.LONG_PRESS
 )
 
 class ToolDockPreferencesStore(private val context: Context) {
@@ -47,7 +58,10 @@ class ToolDockPreferencesStore(private val context: Context) {
             leftTabYFraction = (prefs[KEY_LEFT_TAB_Y_FRACTION] ?: 0.5f).coerceIn(0.08f, 0.92f),
             perToolConfigsRaw = prefs[KEY_PER_TOOL_CONFIGS] ?: "",
             highlighterAutoSize = prefs[KEY_HIGHLIGHTER_AUTO_SIZE] ?: true,
-            topToolbarAutoHide = prefs[KEY_TOP_TOOLBAR_AUTO_HIDE] ?: false
+            topToolbarAutoHide = prefs[KEY_TOP_TOOLBAR_AUTO_HIDE] ?: false,
+            pieMenuTriggerMode = prefs[KEY_PIE_MENU_TRIGGER_MODE]
+                ?.let { raw -> StylusPieMenuTriggerMode.entries.firstOrNull { it.name == raw } }
+                ?: StylusPieMenuTriggerMode.LONG_PRESS
         )
     }
 
@@ -63,6 +77,13 @@ class ToolDockPreferencesStore(private val context: Context) {
             }
             prefs[KEY_HIGHLIGHTER_AUTO_SIZE] = next.highlighterAutoSize
             prefs[KEY_TOP_TOOLBAR_AUTO_HIDE] = next.topToolbarAutoHide
+            prefs[KEY_PIE_MENU_TRIGGER_MODE] = next.pieMenuTriggerMode.name
+        }
+    }
+
+    suspend fun savePieMenuTriggerMode(mode: StylusPieMenuTriggerMode) {
+        context.toolDockDataStore.edit { prefs ->
+            prefs[KEY_PIE_MENU_TRIGGER_MODE] = mode.name
         }
     }
 
@@ -100,6 +121,7 @@ class ToolDockPreferencesStore(private val context: Context) {
         private val KEY_PER_TOOL_CONFIGS = stringPreferencesKey("per_tool_configs_v1")
         private val KEY_HIGHLIGHTER_AUTO_SIZE = booleanPreferencesKey("highlighter_auto_size_v1")
         private val KEY_TOP_TOOLBAR_AUTO_HIDE = booleanPreferencesKey("top_toolbar_auto_hide_v1")
+        private val KEY_PIE_MENU_TRIGGER_MODE = stringPreferencesKey("pie_menu_trigger_mode_v1")
 
         fun defaultToolConfig(toolType: BrushToolType): BrushConfig = when (toolType) {
             BrushToolType.FOUNTAIN_PEN -> BrushConfig(

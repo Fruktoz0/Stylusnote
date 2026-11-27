@@ -86,6 +86,8 @@ data class FolderEntity(
     val name: String,
     val accentColorArgb: Int = 0xFF3F51B5.toInt(),
     val sortOrder: Int = 0,
+    val drivePdfFolderId: String? = null,
+    val drivePdfFolderName: String? = null,
     val createdAtEpochMs: Long,
     val updatedAtEpochMs: Long
 )
@@ -305,6 +307,35 @@ data class CloudSyncedAssetEntity(
     val lastSyncedEpochMs: Long
 )
 
+/**
+ * Tracks readable PDF exports synced automatically in the background into each category's linked
+ * Google Drive folder so updates patch/rename the existing Drive file instead of duplicating it.
+ */
+@Entity(
+    tableName = "category_pdf_sync_records",
+    indices = [Index("folderId")]
+)
+data class CategoryPdfSyncRecordEntity(
+    @PrimaryKey val notebookId: String,
+    val folderId: String,
+    val driveFolderId: String,
+    val remoteDriveFileId: String,
+    val remoteFileName: String,
+    val lastExportedUpdatedAtMs: Long,
+    val lastSyncedEpochMs: Long
+)
+
+/**
+ * Queues linked Google Drive category folders for trashing when the user deletes a category while
+ * offline or during immediate background cleanup.
+ */
+@Entity(tableName = "pending_drive_folder_deletions")
+data class PendingDriveFolderDeletionEntity(
+    @PrimaryKey val driveFolderId: String,
+    val folderName: String,
+    val queuedAtEpochMs: Long
+)
+
 data class PageSearchHit(
     val pageId: String,
     val notebookId: String,
@@ -372,6 +403,25 @@ interface FolderDao {
 
     @Query("SELECT * FROM folders WHERE id = :folderId LIMIT 1")
     suspend fun getFolderById(folderId: String): FolderEntity?
+
+    @Query("SELECT * FROM folders WHERE drivePdfFolderId IS NOT NULL AND drivePdfFolderId != ''")
+    suspend fun getFoldersWithDrivePdfMapping(): List<FolderEntity>
+
+    @Query(
+        """
+        UPDATE folders
+        SET drivePdfFolderId = :drivePdfFolderId,
+            drivePdfFolderName = :drivePdfFolderName,
+            updatedAtEpochMs = :updatedAtEpochMs
+        WHERE id = :folderId
+        """
+    )
+    suspend fun updateFolderDrivePdfMapping(
+        folderId: String,
+        drivePdfFolderId: String?,
+        drivePdfFolderName: String?,
+        updatedAtEpochMs: Long
+    )
 
     @Upsert
     suspend fun upsertFolder(folder: FolderEntity)
@@ -620,6 +670,36 @@ interface SyncMetadataDao {
     suspend fun clearAllSyncedAssets()
 }
 
+@Dao
+interface CategoryPdfSyncDao {
+    @Query("SELECT * FROM category_pdf_sync_records WHERE notebookId = :notebookId LIMIT 1")
+    suspend fun getByNotebookId(notebookId: String): CategoryPdfSyncRecordEntity?
+
+    @Query("SELECT * FROM category_pdf_sync_records")
+    suspend fun getAll(): List<CategoryPdfSyncRecordEntity>
+
+    @Upsert
+    suspend fun upsert(record: CategoryPdfSyncRecordEntity)
+
+    @Query("DELETE FROM category_pdf_sync_records WHERE notebookId = :notebookId")
+    suspend fun deleteByNotebookId(notebookId: String)
+
+    @Query("DELETE FROM category_pdf_sync_records WHERE folderId = :folderId")
+    suspend fun deleteByFolderId(folderId: String)
+}
+
+@Dao
+interface PendingDriveFolderDeletionDao {
+    @Query("SELECT * FROM pending_drive_folder_deletions ORDER BY queuedAtEpochMs ASC")
+    suspend fun getAll(): List<PendingDriveFolderDeletionEntity>
+
+    @Upsert
+    suspend fun upsert(item: PendingDriveFolderDeletionEntity)
+
+    @Query("DELETE FROM pending_drive_folder_deletions WHERE driveFolderId = :driveFolderId")
+    suspend fun deleteById(driveFolderId: String)
+}
+
 /**
  * Primary Room database for StylusNote hierarchy, metadata, covers, tags, bookmarks, and FTS4
  * OCR search (Section 2 & 8). Explicit migrations only (`fallbackToDestructiveMigration` forbidden).
@@ -635,9 +715,11 @@ interface SyncMetadataDao {
         BookmarkEntity::class,
         PageTextFtsEntity::class,
         SyncTombstoneEntity::class,
-        CloudSyncedAssetEntity::class
+        CloudSyncedAssetEntity::class,
+        CategoryPdfSyncRecordEntity::class,
+        PendingDriveFolderDeletionEntity::class
     ],
-    version = 4,
+    version = 5,
     exportSchema = true
 )
 @TypeConverters(StylusNoteDatabaseConverters::class)
@@ -650,6 +732,8 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun bookmarkDao(): BookmarkDao
     abstract fun pageTextSearchDao(): PageTextSearchDao
     abstract fun syncMetadataDao(): SyncMetadataDao
+    abstract fun categoryPdfSyncDao(): CategoryPdfSyncDao
+    abstract fun pendingDriveFolderDeletionDao(): PendingDriveFolderDeletionDao
 
     /**
      * Deletes an entity while atomically recording a [SyncTombstoneEntity] so cloud sync
@@ -742,9 +826,46 @@ abstract class AppDatabase : RoomDatabase() {
         }
 
         /**
-         * Explicit forward migration registry (`v1 -> v2 -> v3 -> v4`). Destructive fallback is never enabled.
+         * Adds category Google Drive PDF folder mappings + PDF export tracking & deletion queue for v5.
          */
-        val ALL_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+        val MIGRATION_4_5: Migration = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE folders ADD COLUMN drivePdfFolderId TEXT")
+                db.execSQL("ALTER TABLE folders ADD COLUMN drivePdfFolderName TEXT")
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `category_pdf_sync_records` (
+                        `notebookId` TEXT NOT NULL,
+                        `folderId` TEXT NOT NULL,
+                        `driveFolderId` TEXT NOT NULL,
+                        `remoteDriveFileId` TEXT NOT NULL,
+                        `remoteFileName` TEXT NOT NULL,
+                        `lastExportedUpdatedAtMs` INTEGER NOT NULL,
+                        `lastSyncedEpochMs` INTEGER NOT NULL,
+                        PRIMARY KEY(`notebookId`)
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_category_pdf_sync_records_folderId` ON `category_pdf_sync_records` (`folderId`)"
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `pending_drive_folder_deletions` (
+                        `driveFolderId` TEXT NOT NULL,
+                        `folderName` TEXT NOT NULL,
+                        `queuedAtEpochMs` INTEGER NOT NULL,
+                        PRIMARY KEY(`driveFolderId`)
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
+        /**
+         * Explicit forward migration registry (`v1 -> v2 -> v3 -> v4 -> v5`). Destructive fallback is never enabled.
+         */
+        val ALL_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
 
         @Volatile
         private var instance: AppDatabase? = null

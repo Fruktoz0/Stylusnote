@@ -41,7 +41,9 @@ import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.CloudSync
 import androidx.compose.material.icons.filled.CloudUpload
+import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.FolderZip
+import androidx.compose.material.icons.filled.RestoreFromTrash
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material.icons.outlined.Cloud
@@ -70,6 +72,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.key.Key
@@ -77,8 +81,12 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalWindowInfo
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
@@ -89,6 +97,7 @@ import androidx.compose.ui.window.DialogProperties
 import com.google.android.gms.auth.api.identity.Identity
 import hu.bdev.stylusnote.data.export.BackupManager
 import hu.bdev.stylusnote.data.export.CloudProviderType
+import hu.bdev.stylusnote.data.export.CloudSyncEngine
 import hu.bdev.stylusnote.data.export.CloudSyncPreferencesStore
 import hu.bdev.stylusnote.data.export.CloudSyncRuntimeStatus
 import hu.bdev.stylusnote.data.export.CloudSyncScheduleMode
@@ -99,6 +108,7 @@ import hu.bdev.stylusnote.data.export.DriveAuthOutcome
 import hu.bdev.stylusnote.data.export.GoogleDriveAuthorizationHelper
 import hu.bdev.stylusnote.data.export.RemoteCloudSummary
 import hu.bdev.stylusnote.data.export.SyncExecutionMode
+import hu.bdev.stylusnote.data.export.TrashedNotebookRecord
 import hu.bdev.stylusnote.data.local.AppDatabase
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -263,6 +273,7 @@ fun CloudBackupDialog(
     var feedbackIsError by remember { mutableStateOf(false) }
     var discoveredRemoteBackup by remember { mutableStateOf<RemoteCloudSummary?>(null) }
     var confirmOverwriteRestore by remember { mutableStateOf(false) }
+    var showTrashRestoreDialog by remember { mutableStateOf(false) }
 
     suspend fun probeAfterConnect() {
         runCatching {
@@ -856,6 +867,21 @@ fun CloudBackupDialog(
                                 Text("Visszaállítás", maxLines = 1, overflow = TextOverflow.Ellipsis)
                             }
                         }
+                        OutlinedButton(
+                            enabled = !isSyncing && busyActionMessage == null,
+                            onClick = { showTrashRestoreDialog = true },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("cloud_trash_open_button")
+                        ) {
+                            Icon(Icons.Filled.RestoreFromTrash, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.size(6.dp))
+                            Text(
+                                "Törölt jegyzetek helyreállítása (7 napos lomtár)",
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
                         if (confirmOverwriteRestore) {
                             Surface(
                                 shape = RoundedCornerShape(10.dp),
@@ -934,6 +960,314 @@ fun CloudBackupDialog(
                             Icon(Icons.Filled.UploadFile, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(Modifier.size(6.dp))
                             Text("Import (.zip)", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (showTrashRestoreDialog) {
+        CloudTrashRestoreDialog(
+            database = database,
+            settings = settings,
+            prefsStore = prefsStore,
+            onRestoredNotebook = { title ->
+                val msg = "\"$title\" helyreállítva a felhőből."
+                feedbackMessage = msg
+                feedbackIsError = false
+                onBackupNotice(msg)
+            },
+            onDismiss = { showTrashRestoreDialog = false }
+        )
+    }
+}
+
+/**
+ * Recovery modal listing notebooks retained in the 7-day cloud trash (`cloud-trash.json`),
+ * showing remaining retention days/hours and allowing 1-tap restore or permanent deletion.
+ * Supports ESC key and backdrop click dismissal.
+ */
+@Composable
+fun CloudTrashRestoreDialog(
+    database: AppDatabase,
+    settings: CloudSyncSettings,
+    prefsStore: CloudSyncPreferencesStore,
+    onRestoredNotebook: (String) -> Unit,
+    onDismiss: () -> Unit,
+    preloadedEntriesForPreview: List<TrashedNotebookRecord>? = null,
+    onRestoreActionOverride: (suspend (TrashedNotebookRecord) -> Unit)? = null,
+    onPermanentDeleteActionOverride: (suspend (TrashedNotebookRecord) -> Unit)? = null
+) {
+    val context = LocalContext.current
+    val appContext = context.applicationContext
+    val scope = rememberCoroutineScope()
+    var entries by remember { mutableStateOf(preloadedEntriesForPreview ?: emptyList()) }
+    var isLoading by remember { mutableStateOf(preloadedEntriesForPreview == null) }
+    var actionInProgressId by remember { mutableStateOf<String?>(null) }
+    var statusError by remember { mutableStateOf<String?>(null) }
+    val focusRequester = remember { FocusRequester() }
+
+    suspend fun reloadTrashEntries() {
+        if (preloadedEntriesForPreview != null) {
+            isLoading = false
+            return
+        }
+        isLoading = true
+        statusError = null
+        runCatching {
+            val remoteClient = CloudSyncScheduler.createRemoteClient(appContext, settings, prefsStore)
+            CloudSyncEngine(appContext.filesDir, database).listTrashedNotebooks(remoteClient)
+        }.onSuccess { loaded ->
+            entries = loaded
+        }.onFailure { err ->
+            statusError = err.message ?: "Nem sikerült lekérdezni a felhős lomtárat."
+        }
+        isLoading = false
+    }
+
+    LaunchedEffect(preloadedEntriesForPreview, settings) {
+        if (preloadedEntriesForPreview == null) {
+            reloadTrashEntries()
+        }
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            dismissOnBackPress = true,
+            dismissOnClickOutside = true
+        )
+    ) {
+        val windowInfo = LocalWindowInfo.current
+        LaunchedEffect(windowInfo.isWindowFocused) {
+            if (windowInfo.isWindowFocused) {
+                runCatching { focusRequester.requestFocus() }
+            }
+        }
+        LaunchedEffect(Unit) {
+            runCatching { focusRequester.requestFocus() }
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .onPreviewKeyEvent { keyEvent ->
+                    if (keyEvent.key == Key.Escape && keyEvent.type == KeyEventType.KeyDown) {
+                        onDismiss()
+                        true
+                    } else {
+                        false
+                    }
+                }
+                .focusRequester(focusRequester)
+                .focusable(),
+            contentAlignment = Alignment.Center
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.45f))
+                    .testTag("cloud_trash_backdrop")
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = onDismiss
+                    )
+            )
+            Surface(
+                modifier = Modifier
+                    .padding(horizontal = 24.dp, vertical = 16.dp)
+                    .widthIn(min = 340.dp, max = 560.dp)
+                    .heightIn(max = 680.dp)
+                    .pointerInput(Unit) { detectTapGestures { } }
+                    .testTag("cloud_trash_dialog"),
+                shape = RoundedCornerShape(20.dp),
+                color = MaterialTheme.colorScheme.surface,
+                tonalElevation = 8.dp,
+                shadowElevation = 14.dp
+            ) {
+                Column(
+                    modifier = Modifier
+                        .verticalScroll(rememberScrollState())
+                        .padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Törölt jegyzetek helyreállítása",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "A törölt jegyzetek 7 napig megmaradnak a felhőben, utána szinkronkor automatikusan törlődnek.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        IconButton(onClick = onDismiss) {
+                            Icon(Icons.Filled.Close, contentDescription = "Bezárás (ESC)")
+                        }
+                    }
+
+                    HorizontalDivider()
+
+                    if (!statusError.isNullOrBlank()) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.errorContainer,
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = statusError.orEmpty(),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.padding(10.dp)
+                            )
+                        }
+                    }
+
+                    when {
+                        isLoading -> {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 20.dp),
+                                horizontalArrangement = Arrangement.Center,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                CircularProgressIndicator(modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
+                                Spacer(Modifier.size(10.dp))
+                                Text("Lomtár lekérdezése...", style = MaterialTheme.typography.bodyMedium)
+                            }
+                        }
+                        entries.isEmpty() -> {
+                            Text(
+                                text = "Nincs 7 napon belül törölt jegyzet a felhős lomtárban.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(vertical = 18.dp)
+                            )
+                        }
+                        else -> {
+                            val nowMs = System.currentTimeMillis()
+                            entries.forEach { rec ->
+                                val busyHere = actionInProgressId == rec.notebookId
+                                Surface(
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = MaterialTheme.colorScheme.surfaceContainerLow,
+                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("cloud_trash_item_${rec.notebookId}")
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(12.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = rec.title,
+                                                style = MaterialTheme.typography.titleSmall,
+                                                fontWeight = FontWeight.SemiBold,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            Text(
+                                                text = "${rec.pageCount} oldal • Törölve: ${formatEpochDateTime(rec.deletedAtEpochMs)}",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                            Text(
+                                                text = "${rec.formatRemainingTimeHu(nowMs)} (lejárat: ${formatEpochDateTime(rec.expiresAtEpochMs)})",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.primary
+                                            )
+                                        }
+                                        Button(
+                                            enabled = actionInProgressId == null,
+                                            onClick = {
+                                                scope.launch {
+                                                    actionInProgressId = rec.notebookId
+                                                    statusError = null
+                                                    runCatching {
+                                                        val customRestore = onRestoreActionOverride
+                                                        if (customRestore != null) {
+                                                            customRestore(rec)
+                                                        } else {
+                                                            val client = CloudSyncScheduler.createRemoteClient(
+                                                                appContext,
+                                                                settings,
+                                                                prefsStore
+                                                            )
+                                                            CloudSyncEngine(appContext.filesDir, database)
+                                                                .restoreTrashedNotebook(client, rec.notebookId)
+                                                        }
+                                                    }.onSuccess {
+                                                        entries = entries.filterNot { it.notebookId == rec.notebookId }
+                                                        CloudSyncScheduler.notifyDatabaseMetadataChanged(appContext)
+                                                        onRestoredNotebook(rec.title)
+                                                    }.onFailure { err ->
+                                                        statusError = err.message ?: "Helyreállítás sikertelen."
+                                                    }
+                                                    actionInProgressId = null
+                                                }
+                                            },
+                                            modifier = Modifier.testTag("cloud_trash_restore_${rec.notebookId}")
+                                        ) {
+                                            if (busyHere) {
+                                                CircularProgressIndicator(
+                                                    modifier = Modifier.size(16.dp),
+                                                    strokeWidth = 2.dp
+                                                )
+                                            } else {
+                                                Text("Visszaállít")
+                                            }
+                                        }
+                                        IconButton(
+                                            enabled = actionInProgressId == null,
+                                            onClick = {
+                                                scope.launch {
+                                                    actionInProgressId = rec.notebookId
+                                                    statusError = null
+                                                    runCatching {
+                                                        val customDel = onPermanentDeleteActionOverride
+                                                        if (customDel != null) {
+                                                            customDel(rec)
+                                                        } else {
+                                                            val client = CloudSyncScheduler.createRemoteClient(
+                                                                appContext,
+                                                                settings,
+                                                                prefsStore
+                                                            )
+                                                            CloudSyncEngine(appContext.filesDir, database)
+                                                                .permanentlyDeleteTrashedNotebook(client, rec.notebookId)
+                                                        }
+                                                    }.onSuccess {
+                                                        entries = entries.filterNot { it.notebookId == rec.notebookId }
+                                                    }.onFailure { err ->
+                                                        statusError = err.message ?: "Végleges törlés sikertelen."
+                                                    }
+                                                    actionInProgressId = null
+                                                }
+                                            },
+                                            modifier = Modifier.testTag("cloud_trash_purge_${rec.notebookId}")
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Filled.DeleteForever,
+                                                contentDescription = "Végleges törlés",
+                                                tint = MaterialTheme.colorScheme.error
+                                            )
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }

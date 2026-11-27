@@ -100,7 +100,15 @@ class BackupAndExportTest {
         val manifest = BackupManifest(
             createdAtEpochMs = 1700000000000L,
             folders = listOf(
-                FolderEntity(folderId, null, "Egyetem", 0xFF1A56DB.toInt(), 0, 100L, 200L)
+                FolderEntity(
+                    id = folderId,
+                    parentId = null,
+                    name = "Egyetem",
+                    accentColorArgb = 0xFF1A56DB.toInt(),
+                    sortOrder = 0,
+                    createdAtEpochMs = 100L,
+                    updatedAtEpochMs = 200L
+                )
             ),
             notebooks = listOf(
                 NotebookEntity(

@@ -28,6 +28,7 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 const val DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
+const val DRIVE_FULL_SCOPE = "https://www.googleapis.com/auth/drive"
 const val CLOUD_BACKUP_FOLDER_NAME = "StylusNote Backups"
 const val WEBDAV_BACKUP_SUBDIR = "StylusNoteBackups"
 const val REMOTE_MANIFEST_FILE_NAME = "manifest_v2.bin"
@@ -91,7 +92,7 @@ data class RemoteSyncIndex(
             )
         }
 
-        private fun quoteJson(value: String): String = buildString(value.length + 2) {
+        internal fun quoteJson(value: String): String = buildString(value.length + 2) {
             append('"')
             for (ch in value) {
                 when (ch) {
@@ -114,7 +115,7 @@ data class RemoteSyncIndex(
     }
 }
 
-private class MiniJsonObjectParser(private val src: String) {
+internal class MiniJsonObjectParser(private val src: String) {
     private var pos = 0
 
     fun parseObject(): Map<String, Any?> {
@@ -145,10 +146,35 @@ private class MiniJsonObjectParser(private val src: String) {
         }
     }
 
+    private fun parseArray(): List<Any?> {
+        skipWs()
+        expect('[')
+        skipWs()
+        val result = ArrayList<Any?>()
+        if (peek() == ']') {
+            pos++
+            return result
+        }
+        while (true) {
+            skipWs()
+            result.add(parseValue())
+            skipWs()
+            when (peek()) {
+                ',' -> pos++
+                ']' -> {
+                    pos++
+                    return result
+                }
+                else -> throw IOException("Hibás JSON tömb szintaxis ($pos)")
+            }
+        }
+    }
+
     private fun parseValue(): Any? {
         skipWs()
         return when (val ch = peek()) {
             '{' -> parseObject()
+            '[' -> parseArray()
             '"' -> parseString()
             't' -> {
                 pos += 4
@@ -254,7 +280,7 @@ sealed interface DriveAuthOutcome {
 object GoogleDriveAuthorizationHelper {
     suspend fun authorize(context: Context): DriveAuthOutcome {
         val request = AuthorizationRequest.Builder()
-            .setRequestedScopes(listOf(Scope(DRIVE_FILE_SCOPE)))
+            .setRequestedScopes(listOf(Scope(DRIVE_FULL_SCOPE)))
             .build()
         val result = Identity.getAuthorizationClient(context)
             .authorize(request)
@@ -596,6 +622,209 @@ class GoogleDriveRestClient(
                 fileIdCache[remoteName] = found
             }
             return@withLock found
+        }
+    }
+
+    private fun escapeDriveQuery(value: String): String =
+        value.replace("\\", "\\\\").replace("'", "\\'")
+}
+
+data class GoogleDriveFolderItem(
+    val id: String,
+    val name: String,
+    val parentId: String? = null
+)
+
+/**
+ * Full-Drive REST v3 helper (`drive` scope) powering interactive category folder browsing,
+ * readable per-category PDF upsert/overwrite without creating duplicates, and folder trashing.
+ */
+class GoogleDriveFolderClient(
+    private val accessTokenProvider: suspend () -> String,
+    private val okHttpClient: OkHttpClient = OkHttpClient()
+) {
+    suspend fun listSubfolders(parentFolderId: String = "root"): List<GoogleDriveFolderItem> =
+        withContext(Dispatchers.IO) {
+            val token = accessTokenProvider()
+            val folders = ArrayList<GoogleDriveFolderItem>()
+            var pageToken: String? = null
+            do {
+                val safeParent = escapeDriveQuery(parentFolderId)
+                val q = "'$safeParent' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+                val urlBuilder = "https://www.googleapis.com/drive/v3/files".toHttpUrl().newBuilder()
+                    .addQueryParameter("q", q)
+                    .addQueryParameter("spaces", "drive")
+                    .addQueryParameter("fields", "nextPageToken,files(id,name,parents)")
+                    .addQueryParameter("orderBy", "name_natural")
+                    .addQueryParameter("pageSize", "100")
+                if (!pageToken.isNullOrBlank()) {
+                    urlBuilder.addQueryParameter("pageToken", pageToken)
+                }
+                val request = Request.Builder()
+                    .url(urlBuilder.build())
+                    .header("Authorization", "Bearer $token")
+                    .get()
+                    .build()
+                okHttpClient.newCall(request).execute().use { response ->
+                    if (response.code == 401) {
+                        throw CloudAuthRequiredException("Google Drive jogosultság lejárt (HTTP 401).")
+                    }
+                    if (!response.isSuccessful) {
+                        throw CloudSyncRemoteException(
+                            "Google Drive mappák listázása sikertelen: HTTP ${response.code}",
+                            httpCode = response.code
+                        )
+                    }
+                    val json = JSONObject(response.body?.string().orEmpty())
+                    val files = json.optJSONArray("files")
+                    if (files != null) {
+                        for (i in 0 until files.length()) {
+                            val obj = files.optJSONObject(i) ?: continue
+                            val id = obj.optString("id")
+                            val name = obj.optString("name")
+                            if (id.isBlank() || name.isBlank()) continue
+                            val parent = obj.optJSONArray("parents")?.optString(0)?.takeIf { it.isNotBlank() }
+                            folders.add(GoogleDriveFolderItem(id = id, name = name, parentId = parent))
+                        }
+                    }
+                    pageToken = json.optString("nextPageToken").takeIf { it.isNotBlank() }
+                }
+            } while (pageToken != null)
+            folders
+        }
+
+    suspend fun createSubfolder(
+        parentFolderId: String = "root",
+        folderName: String
+    ): GoogleDriveFolderItem = withContext(Dispatchers.IO) {
+        val cleanName = folderName.trim().ifEmpty { "StylusNote Mappa" }
+        val token = accessTokenProvider()
+        val payload = JSONObject()
+            .put("name", cleanName)
+            .put("mimeType", "application/vnd.google-apps.folder")
+            .put("parents", org.json.JSONArray().put(parentFolderId))
+            .toString()
+        val request = Request.Builder()
+            .url("https://www.googleapis.com/drive/v3/files?fields=id,name,parents")
+            .header("Authorization", "Bearer $token")
+            .post(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .build()
+        okHttpClient.newCall(request).execute().use { response ->
+            if (response.code == 401) {
+                throw CloudAuthRequiredException("Google Drive jogosultság lejárt (HTTP 401).")
+            }
+            if (!response.isSuccessful) {
+                throw CloudSyncRemoteException(
+                    "Google Drive mappa létrehozása sikertelen: HTTP ${response.code}",
+                    httpCode = response.code
+                )
+            }
+            val obj = JSONObject(response.body?.string().orEmpty())
+            val id = obj.optString("id")
+            if (id.isBlank()) {
+                throw CloudSyncRemoteException("Google Drive nem adott vissza mappa-azonosítót.")
+            }
+            GoogleDriveFolderItem(
+                id = id,
+                name = obj.optString("name", cleanName),
+                parentId = parentFolderId
+            )
+        }
+    }
+
+    /**
+     * Overwrites & renames [existingFileId] in-place inside [folderId] via multipart `PATCH` so
+     * updated notebooks get the new date suffix without leaving duplicate PDFs; falls back to
+     * creating a new PDF when [existingFileId] is null or missing (HTTP 404).
+     */
+    suspend fun uploadOrReplacePdfInFolder(
+        folderId: String,
+        existingFileId: String?,
+        fileName: String,
+        pdfBytes: ByteArray
+    ): String = withContext(Dispatchers.IO) {
+        val token = accessTokenProvider()
+        if (!existingFileId.isNullOrBlank()) {
+            val metaJson = JSONObject().put("name", fileName).toString()
+            val patchMultipart = MultipartBody.Builder()
+                .setType("multipart/related".toMediaType())
+                .addPart(metaJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                .addPart(pdfBytes.toRequestBody("application/pdf".toMediaType()))
+                .build()
+            val patchReq = Request.Builder()
+                .url("https://www.googleapis.com/upload/drive/v3/files/$existingFileId?uploadType=multipart&fields=id,name,trashed")
+                .header("Authorization", "Bearer $token")
+                .patch(patchMultipart)
+                .build()
+            okHttpClient.newCall(patchReq).execute().use { response ->
+                when (response.code) {
+                    in 200..299 -> {
+                        val parsed = JSONObject(response.body?.string().orEmpty())
+                        if (!parsed.optBoolean("trashed", false)) {
+                            return@withContext parsed.optString("id").takeIf { it.isNotBlank() } ?: existingFileId
+                        }
+                    }
+                    401 -> throw CloudAuthRequiredException("Google Drive jogosultság lejárt (HTTP 401).")
+                    404 -> Unit // Create a fresh PDF below
+                    else -> throw CloudSyncRemoteException(
+                        "Google Drive PDF frissítés sikertelen ($fileName): HTTP ${response.code}",
+                        httpCode = response.code
+                    )
+                }
+            }
+        }
+
+        val createMeta = JSONObject()
+            .put("name", fileName)
+            .put("parents", org.json.JSONArray().put(folderId))
+            .toString()
+        val createMultipart = MultipartBody.Builder()
+            .setType("multipart/related".toMediaType())
+            .addPart(createMeta.toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .addPart(pdfBytes.toRequestBody("application/pdf".toMediaType()))
+            .build()
+        val createReq = Request.Builder()
+            .url("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name")
+            .header("Authorization", "Bearer $token")
+            .post(createMultipart)
+            .build()
+        okHttpClient.newCall(createReq).execute().use { response ->
+            if (response.code == 401) {
+                throw CloudAuthRequiredException("Google Drive jogosultság lejárt (HTTP 401).")
+            }
+            if (!response.isSuccessful) {
+                throw CloudSyncRemoteException(
+                    "Google Drive PDF feltöltés sikertelen ($fileName): HTTP ${response.code}",
+                    httpCode = response.code
+                )
+            }
+            val id = JSONObject(response.body?.string().orEmpty()).optString("id")
+            if (id.isBlank()) {
+                throw CloudSyncRemoteException("Google Drive nem adott vissza fájl-azonosítót a PDF-hez.")
+            }
+            id
+        }
+    }
+
+    /** Moves [folderId] to Google Drive Trash (HTTP 404 treated as already deleted). */
+    suspend fun trashFolder(folderId: String): Unit = withContext(Dispatchers.IO) {
+        if (folderId.isBlank()) return@withContext
+        val token = accessTokenProvider()
+        val payload = JSONObject().put("trashed", true).toString()
+        val request = Request.Builder()
+            .url("https://www.googleapis.com/drive/v3/files/$folderId")
+            .header("Authorization", "Bearer $token")
+            .patch(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .build()
+        okHttpClient.newCall(request).execute().use { response ->
+            when (response.code) {
+                401 -> throw CloudAuthRequiredException("Google Drive jogosultság lejárt (HTTP 401).")
+                404, in 200..299 -> Unit
+                else -> throw CloudSyncRemoteException(
+                    "Google Drive mappa törlése sikertelen: HTTP ${response.code}",
+                    httpCode = response.code
+                )
+            }
         }
     }
 

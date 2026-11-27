@@ -7,6 +7,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.Choreographer
 import android.view.Display
 import android.view.FrameMetrics
@@ -32,9 +33,12 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.ui.platform.LocalView
+import hu.bdev.stylusnote.core.hardware.StylusButtonGestureAction
+import hu.bdev.stylusnote.core.hardware.StylusButtonGestureStateMachine
 import hu.bdev.stylusnote.core.hardware.StylusHardwareShortcutDetector
 import hu.bdev.stylusnote.core.hardware.StylusShortcutDebugBus
 import hu.bdev.stylusnote.core.hardware.toStylusDeviceMeta
+import hu.bdev.stylusnote.ui.components.StylusPieMenuTriggerMode
 import hu.bdev.stylusnote.core.telemetry.FrameTimingAccumulator
 import hu.bdev.stylusnote.core.telemetry.FrameTimingSnapshot
 import androidx.compose.runtime.Composable
@@ -77,7 +81,55 @@ class MainActivity : ComponentActivity() {
     private var lockedRefreshRateHz by mutableFloatStateOf(60f)
     private var reportedRefreshRateHz by mutableFloatStateOf(60f)
     private var penButtonToggleTick by mutableLongStateOf(0L)
+    private var pieMenuOpenTick by mutableLongStateOf(0L)
+    private var pieMenuCommitTick by mutableLongStateOf(0L)
+    private var pieMenuTriggerMode by mutableStateOf(StylusPieMenuTriggerMode.LONG_PRESS)
     private var isNotebookWorkspaceActive by mutableStateOf(false)
+    private val buttonGestureMachine = StylusButtonGestureStateMachine()
+    private val buttonTimerHandler = Handler(Looper.getMainLooper())
+    private val buttonTimerRunnable = Runnable {
+        val action = buttonGestureMachine.onTimerElapsed(SystemClock.uptimeMillis(), pieMenuTriggerMode)
+        handleStylusGestureAction(action)
+    }
+
+    private fun handleStylusGestureAction(action: StylusButtonGestureAction) {
+        when (action) {
+            StylusButtonGestureAction.NONE -> Unit
+            StylusButtonGestureAction.TOGGLE_ERASER -> penButtonToggleTick++
+            StylusButtonGestureAction.OPEN_PIE_MENU -> pieMenuOpenTick++
+            StylusButtonGestureAction.COMMIT_PIE_MENU_ON_RELEASE -> pieMenuCommitTick++
+        }
+    }
+
+    private fun handleStylusButtonDown() {
+        val nowMs = SystemClock.uptimeMillis()
+        buttonTimerHandler.removeCallbacks(buttonTimerRunnable)
+        val action = buttonGestureMachine.onButtonDown(nowMs, pieMenuTriggerMode)
+        handleStylusGestureAction(action)
+        if (pieMenuTriggerMode == StylusPieMenuTriggerMode.LONG_PRESS &&
+            action == StylusButtonGestureAction.NONE
+        ) {
+            buttonTimerHandler.postDelayed(
+                buttonTimerRunnable,
+                buttonGestureMachine.longPressThresholdMs
+            )
+        }
+    }
+
+    private fun handleStylusButtonUp() {
+        val nowMs = SystemClock.uptimeMillis()
+        buttonTimerHandler.removeCallbacks(buttonTimerRunnable)
+        val action = buttonGestureMachine.onButtonUp(nowMs, pieMenuTriggerMode)
+        handleStylusGestureAction(action)
+        if (pieMenuTriggerMode == StylusPieMenuTriggerMode.DOUBLE_PRESS &&
+            action == StylusButtonGestureAction.NONE
+        ) {
+            buttonTimerHandler.postDelayed(
+                buttonTimerRunnable,
+                buttonGestureMachine.doublePressWindowMs
+            )
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -97,6 +149,8 @@ class MainActivity : ComponentActivity() {
             ) {
                 StylusNoteAppRoot(
                     penButtonToggleTick = penButtonToggleTick,
+                    pieMenuOpenTick = pieMenuOpenTick,
+                    pieMenuCommitTick = pieMenuCommitTick,
                     benchmarkStrokeCount = benchmarkStrokeCount,
                     isDarkTheme = isDarkTheme,
                     onToggleTheme = { isDarkTheme = !isDarkTheme },
@@ -105,7 +159,14 @@ class MainActivity : ComponentActivity() {
                     lockedRefreshRateHz = lockedRefreshRateHz,
                     reportedRefreshRateHz = reportedRefreshRateHz,
                     currentDisplayHzProvider = { resolveActiveDisplay()?.refreshRate ?: reportedRefreshRateHz },
-                    onWorkspaceActiveChanged = { isActive -> isNotebookWorkspaceActive = isActive }
+                    onPieMenuTriggerModeChanged = { mode -> pieMenuTriggerMode = mode },
+                    onWorkspaceActiveChanged = { isActive ->
+                        isNotebookWorkspaceActive = isActive
+                        if (!isActive) {
+                            buttonTimerHandler.removeCallbacks(buttonTimerRunnable)
+                            buttonGestureMachine.reset()
+                        }
+                    }
                 )
             }
         }
@@ -113,12 +174,15 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        CloudSyncScheduler.cancelCategoryPdfSync(this)
         applyImmersiveFullscreen()
         configureHighRefreshRateDisplay()
     }
 
     override fun onStop() {
         super.onStop()
+        buttonTimerHandler.removeCallbacks(buttonTimerRunnable)
+        buttonGestureMachine.reset()
         CloudSyncScheduler.onAppBackgrounded(this)
     }
 
@@ -149,13 +213,13 @@ class MainActivity : ComponentActivity() {
      * Product 0x5081`) before view focus consumes them.
      */
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val deviceMeta = event.device.toStylusDeviceMeta(event.source)
+        val isStylusToggleKey = StylusHardwareShortcutDetector.shouldToggleEraserForKeyDown(
+            keyCode = event.keyCode,
+            repeatCount = 0,
+            deviceMeta = deviceMeta
+        )
         if (event.action == KeyEvent.ACTION_DOWN) {
-            val deviceMeta = event.device.toStylusDeviceMeta(event.source)
-            val isStylusToggleKey = StylusHardwareShortcutDetector.shouldToggleEraserForKeyDown(
-                keyCode = event.keyCode,
-                repeatCount = 0,
-                deviceMeta = deviceMeta
-            )
             val matchedToggle = isStylusToggleKey && event.repeatCount == 0
             if (StylusShortcutDebugBus.captureEnabled &&
                 event.repeatCount == 0 &&
@@ -165,10 +229,13 @@ class MainActivity : ComponentActivity() {
             }
             if (isNotebookWorkspaceActive && isStylusToggleKey) {
                 if (event.repeatCount == 0) {
-                    penButtonToggleTick++
+                    handleStylusButtonDown()
                 }
                 return true
             }
+        } else if (event.action == KeyEvent.ACTION_UP && isNotebookWorkspaceActive && isStylusToggleKey) {
+            handleStylusButtonUp()
+            return true
         }
         return super.dispatchKeyEvent(event)
     }
@@ -186,7 +253,13 @@ class MainActivity : ComponentActivity() {
                 StylusShortcutDebugBus.recordMotionButtonEvent(ev.actionButton, deviceMeta, matchedToggle)
             }
             if (isNotebookWorkspaceActive && matchedToggle) {
-                penButtonToggleTick++
+                handleStylusButtonDown()
+                return true
+            }
+        } else if (ev.actionMasked == MotionEvent.ACTION_BUTTON_RELEASE && isNotebookWorkspaceActive) {
+            val deviceMeta = ev.device.toStylusDeviceMeta(ev.source)
+            if (StylusHardwareShortcutDetector.shouldHandleActionButtonRelease(ev.actionButton, deviceMeta)) {
+                handleStylusButtonUp()
                 return true
             }
         }
@@ -204,11 +277,26 @@ class MainActivity : ComponentActivity() {
             )
         ) {
             if (repeatCount == 0) {
-                penButtonToggleTick++
+                handleStylusButtonDown()
             }
             return true
         }
         return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
+        val deviceMeta = event?.device?.toStylusDeviceMeta(event.source)
+        if (isNotebookWorkspaceActive &&
+            StylusHardwareShortcutDetector.shouldToggleEraserForKeyDown(
+                keyCode = keyCode,
+                repeatCount = 0,
+                deviceMeta = deviceMeta
+            )
+        ) {
+            handleStylusButtonUp()
+            return true
+        }
+        return super.onKeyUp(keyCode, event)
     }
 
     /**
@@ -258,6 +346,8 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun StylusNoteAppRoot(
     penButtonToggleTick: Long,
+    pieMenuOpenTick: Long,
+    pieMenuCommitTick: Long,
     benchmarkStrokeCount: Int,
     isDarkTheme: Boolean,
     onToggleTheme: () -> Unit,
@@ -266,6 +356,7 @@ private fun StylusNoteAppRoot(
     lockedRefreshRateHz: Float,
     reportedRefreshRateHz: Float,
     currentDisplayHzProvider: () -> Float,
+    onPieMenuTriggerModeChanged: (StylusPieMenuTriggerMode) -> Unit,
     onWorkspaceActiveChanged: (Boolean) -> Unit
 ) {
     val context = LocalContext.current
@@ -339,6 +430,9 @@ private fun StylusNoteAppRoot(
                 database = database,
                 target = activePrimary,
                 penButtonToggleTick = penButtonToggleTick,
+                pieMenuOpenTick = pieMenuOpenTick,
+                pieMenuCommitTick = pieMenuCommitTick,
+                onPieMenuTriggerModeChanged = onPieMenuTriggerModeChanged,
                 isDarkTheme = isDarkTheme,
                 onToggleTheme = onToggleTheme,
                 onSelectPageTarget = { nextTarget ->

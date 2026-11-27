@@ -40,6 +40,22 @@ class CloudSyncWorker(
                 mode = mode
             )
             prefsStore.recordSyncSucceeded(report.syncedAtEpochMs)
+            if (settings.providerType == CloudProviderType.GOOGLE_DRIVE &&
+                inputData.getString(CloudSyncScheduler.KEY_TRIGGER_REASON) == "periodic"
+            ) {
+                runCatching {
+                    val folderClient = GoogleDriveFolderClient(
+                        accessTokenProvider = {
+                            GoogleDriveAuthorizationHelper.requireSilentAccessToken(applicationContext)
+                        }
+                    )
+                    CategoryPdfSyncEngine.syncNow(
+                        context = applicationContext,
+                        database = database,
+                        driveFolderClient = folderClient
+                    )
+                }
+            }
             Result.success()
         } catch (ce: CancellationException) {
             throw ce

@@ -258,4 +258,20 @@ flowchart LR
     FLING["1-ujjas függőleges legyintés"] --> VEL["FingerVelocityTracker → ScrollFlingState (120/144 Hz exponenciális kifutás, határon megáll)"]
 ```
 
+---
+
+## 17. 7 Napos Felhős Lomtár, Kategória Drive PDF Mentés & Radiális Kör-Menü (XV. Ütem)
+
+```mermaid
+flowchart LR
+    DELNB["Füzet törlése tableten"] --> SY["CloudSyncEngine → cloud-trash.json (7 napos védelem)"]
+    SY -- "< 7 nap" --> RES["Felhő → Lomtár (CloudTrashRestoreDialog): Visszaállít / Végleges törlés"]
+    SY -- "≥ 7 nap" --> PRG["Automatikus távoli blob + rekord törlés következő szinkronkor"]
+    CAT["Kategória → Drive-mappa tallózása (DriveFolderPickerDialog)"] --> BG["App háttérbe lép (onStop) / periodikus szinkron"]
+    BG --> EX["CategoryPdfSyncEngine → <Cím>_YYYY-MM-DD.pdf felülírása helyben"]
+    DELC["Kategória törlése"] --> WARN["DeleteCategoryConfirmDialog emlékeztető → Drive mappa kukázása (offline sorral)"]
+    PEN["Focus Pen Pro hosszú/dupla nyomás"] --> PIE["RadialPieMenuOverlay a tollhegy alatt (8 szelet: eszközök + színek + vastagság)"]
+    PEN -- "Rövid nyomás" --> TOG["Gyors Toll ↔ Radír váltás"]
+```
+
 

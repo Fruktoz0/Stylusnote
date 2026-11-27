@@ -1,6 +1,7 @@
 package hu.bdev.stylusnote.data.export
 
 import androidx.room.withTransaction
+import hu.bdev.stylusnote.data.local.AccentNormalizer
 import hu.bdev.stylusnote.data.local.AppDatabase
 import hu.bdev.stylusnote.data.local.CloudSyncedAssetEntity
 import hu.bdev.stylusnote.data.local.SyncTombstoneEntity
@@ -12,6 +13,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.IOException
 import java.nio.charset.StandardCharsets
+import java.util.Base64
 import java.util.TreeMap
 
 enum class SyncExecutionMode {
@@ -52,6 +54,7 @@ interface SyncManifestStore {
     suspend fun deleteSyncedAsset(assetKey: String)
     suspend fun isUntouchedStarterWorkspace(filesDir: File): Boolean
     suspend fun clearStarterWorkspaceWithoutTombstone(filesDir: File)
+    suspend fun restoreNotebookFromSnapshot(snapshot: BackupManifest, restoredAtEpochMs: Long)
 }
 
 class DatabaseSyncManifestStore(
@@ -131,6 +134,59 @@ class DatabaseSyncManifestStore(
                 if (dir.exists()) dir.deleteRecursively()
             }
         }
+
+    override suspend fun restoreNotebookFromSnapshot(
+        snapshot: BackupManifest,
+        restoredAtEpochMs: Long
+    ) {
+        database.withTransaction {
+            val tagDao = database.tagDao()
+            val syncDao = database.syncMetadataDao()
+            for (tag in snapshot.tags) {
+                syncDao.deleteTombstone(SyncTombstoneEntity.key(SyncTombstoneEntity.TYPE_TAG, tag.id))
+                tagDao.upsertTag(tag)
+            }
+            for (nb in snapshot.notebooks) {
+                val validFolderId = nb.folderId?.takeIf { database.folderDao().getFolderById(it) != null }
+                syncDao.deleteTombstone(SyncTombstoneEntity.key(SyncTombstoneEntity.TYPE_NOTEBOOK, nb.id))
+                database.notebookDao().upsertNotebook(
+                    nb.copy(
+                        folderId = validFolderId,
+                        updatedAtEpochMs = restoredAtEpochMs
+                    )
+                )
+            }
+            for (ch in snapshot.chapters) {
+                syncDao.deleteTombstone(SyncTombstoneEntity.key(SyncTombstoneEntity.TYPE_CHAPTER, ch.id))
+                database.chapterDao().upsertChapter(ch)
+            }
+            for (p in snapshot.pages) {
+                syncDao.deleteTombstone(SyncTombstoneEntity.key(SyncTombstoneEntity.TYPE_PAGE, p.id))
+                database.pageDao().upsertPage(p.copy(updatedAtEpochMs = restoredAtEpochMs))
+            }
+            for (link in snapshot.tagLinks) {
+                syncDao.deleteTombstone(
+                    SyncTombstoneEntity.key(
+                        SyncTombstoneEntity.TYPE_TAG_LINK,
+                        SyncTombstoneEntity.tagLinkId(link.notebookId, link.tagId)
+                    )
+                )
+                tagDao.attachTagToNotebook(link)
+            }
+            for (bm in snapshot.bookmarks) {
+                syncDao.deleteTombstone(SyncTombstoneEntity.key(SyncTombstoneEntity.TYPE_BOOKMARK, bm.id))
+                database.bookmarkDao().upsertBookmark(bm)
+            }
+            for (fts in snapshot.ftsEntries) {
+                val raw = fts.rawText.ifBlank { AccentNormalizer.foldToAscii(fts.asciiFoldedText) }
+                database.pageTextSearchDao().replacePageOcrText(
+                    pageId = fts.pageId,
+                    notebookId = fts.notebookId,
+                    recognizedText = raw
+                )
+            }
+        }
+    }
 }
 
 /**
@@ -207,9 +263,82 @@ class CloudSyncEngine internal constructor(
         }
 
         val mergedManifest = mergeResult.mergedManifest
+        val activeNotebookIds = mergedManifest.notebooks.mapTo(HashSet()) { it.id }
         val activeAssetKeys = collectActiveAssetKeys(mergedManifest)
         val remoteAssets = remoteIndex?.assets ?: emptyMap()
         val localSyncedMap = manifestStore.getAllSyncedAssets().associateBy { it.assetPath }
+
+        // Read 7-day cloud trash ledger, purge expired items, and retain newly deleted notebooks
+        val remoteTrash = remoteClient.readFile(REMOTE_TRASH_FILE_NAME)?.let {
+            runCatching { RemoteTrashIndex.decodeFromUtf8Bytes(it) }.getOrNull()
+        } ?: RemoteTrashIndex()
+        val trashMap = LinkedHashMap<String, TrashedNotebookRecord>()
+        val expiredTrashEntries = ArrayList<TrashedNotebookRecord>()
+        var trashDirty = false
+        for (entry in remoteTrash.entries) {
+            when {
+                entry.isExpiredAt(nowEpochMs) -> {
+                    expiredTrashEntries.add(entry)
+                    trashDirty = true
+                }
+                entry.notebookId in activeNotebookIds -> {
+                    trashDirty = true
+                }
+                else -> trashMap[entry.notebookId] = entry
+            }
+        }
+        if (remoteManifest != null && mode != SyncExecutionMode.RESTORE_FROM_CLOUD) {
+            for (remoteNb in remoteManifest.notebooks) {
+                if (remoteNb.id !in activeNotebookIds && !trashMap.containsKey(remoteNb.id)) {
+                    val deletedAt = mergedManifest.tombstones
+                        .firstOrNull {
+                            it.entityType == SyncTombstoneEntity.TYPE_NOTEBOOK && it.entityId == remoteNb.id
+                        }?.deletedAtEpochMs ?: nowEpochMs
+                    val expiresAt = deletedAt + TRASH_RETENTION_MS
+                    if (nowEpochMs < expiresAt) {
+                        val nbChapters = remoteManifest.chapters.filter { it.notebookId == remoteNb.id }
+                        val nbPages = remoteManifest.pages.filter { it.notebookId == remoteNb.id }
+                        val nbBookmarks = remoteManifest.bookmarks.filter { it.notebookId == remoteNb.id }
+                        val nbTagLinks = remoteManifest.tagLinks.filter { it.notebookId == remoteNb.id }
+                        val tagIds = nbTagLinks.mapTo(HashSet()) { it.tagId }
+                        val nbTags = remoteManifest.tags.filter { it.id in tagIds }
+                        val nbFts = remoteManifest.ftsEntries.filter { it.notebookId == remoteNb.id }
+                        val snapshotManifest = BackupManifest(
+                            createdAtEpochMs = nowEpochMs,
+                            notebooks = listOf(remoteNb),
+                            chapters = nbChapters,
+                            pages = nbPages,
+                            tags = nbTags,
+                            tagLinks = nbTagLinks,
+                            bookmarks = nbBookmarks,
+                            ftsEntries = nbFts
+                        )
+                        val snapshotB64 = Base64.getEncoder().encodeToString(
+                            backupManager.encodeManifest(snapshotManifest)
+                        )
+                        val nbAssetEntries = LinkedHashMap<String, RemoteAssetEntry>()
+                        for (assetKey in collectActiveAssetKeys(snapshotManifest)) {
+                            remoteAssets[assetKey]?.let { nbAssetEntries[assetKey] = it }
+                        }
+                        trashMap[remoteNb.id] = TrashedNotebookRecord(
+                            notebookId = remoteNb.id,
+                            title = remoteNb.title,
+                            folderId = remoteNb.folderId,
+                            pageCount = nbPages.size,
+                            deletedAtEpochMs = deletedAt,
+                            expiresAtEpochMs = expiresAt,
+                            manifestSnapshotBase64 = snapshotB64,
+                            assetEntries = nbAssetEntries
+                        )
+                        trashDirty = true
+                    }
+                }
+            }
+        }
+        val protectedTrashAssets = HashSet<String>()
+        for (entry in trashMap.values) {
+            protectedTrashAssets.addAll(entry.assetEntries.keys)
+        }
 
         var downloadedAssets = 0
         for (assetKey in activeAssetKeys) {
@@ -258,10 +387,22 @@ class CloudSyncEngine internal constructor(
         for ((remoteKey, remoteEntry) in remoteAssets) {
             if (remoteKey in activeAssetKeys) {
                 nextRemoteAssets[remoteKey] = remoteEntry
-            } else {
+            } else if (remoteKey !in protectedTrashAssets) {
                 remoteClient.deleteFile(remoteEntry.blobName)
                 manifestStore.deleteSyncedAsset(remoteKey)
                 deletedRemoteAssets++
+            }
+        }
+        for (expired in expiredTrashEntries) {
+            for ((assetKey, assetEntry) in expired.assetEntries) {
+                if (assetKey !in activeAssetKeys &&
+                    assetKey !in protectedTrashAssets &&
+                    !nextRemoteAssets.containsKey(assetKey)
+                ) {
+                    remoteClient.deleteFile(assetEntry.blobName)
+                    manifestStore.deleteSyncedAsset(assetKey)
+                    deletedRemoteAssets++
+                }
             }
         }
 
@@ -328,6 +469,19 @@ class CloudSyncEngine internal constructor(
             )
         }
 
+        if (trashDirty) {
+            val nextTrash = RemoteTrashIndex(
+                formatVersion = 1,
+                updatedAtMs = nowEpochMs,
+                entries = trashMap.values.sortedByDescending { it.deletedAtEpochMs }
+            )
+            remoteClient.writeFile(
+                remoteName = REMOTE_TRASH_FILE_NAME,
+                bytes = nextTrash.encodeToUtf8Bytes(),
+                contentType = "application/json"
+            )
+        }
+
         return@withLock CloudSyncReport(
             syncedAtEpochMs = nowEpochMs,
             totalNotebooks = finalManifest.notebooks.size,
@@ -339,6 +493,121 @@ class CloudSyncEngine internal constructor(
             replacedStarterWorkspace = replacedStarter,
             uploadedManifest = shouldUploadManifest
         )
+    }
+
+    /**
+     * Lists non-expired notebooks currently preserved in the 7-day remote trash (`cloud-trash.json`).
+     */
+    suspend fun listTrashedNotebooks(
+        remoteClient: CloudSyncRemoteClient,
+        nowEpochMs: Long = System.currentTimeMillis()
+    ): List<TrashedNotebookRecord> {
+        val raw = remoteClient.readFile(REMOTE_TRASH_FILE_NAME) ?: return emptyList()
+        val parsed = runCatching { RemoteTrashIndex.decodeFromUtf8Bytes(raw) }.getOrNull() ?: return emptyList()
+        return parsed.entries
+            .filter { !it.isExpiredAt(nowEpochMs) }
+            .sortedByDescending { it.deletedAtEpochMs }
+    }
+
+    /**
+     * Restores a 7-day-retained notebook from [REMOTE_TRASH_FILE_NAME] back into the local workspace,
+     * downloads its protected blobs, clears tombstones, updates `cloud-trash.json`, and syncs.
+     */
+    suspend fun restoreTrashedNotebook(
+        remoteClient: CloudSyncRemoteClient,
+        notebookId: String,
+        nowEpochMs: Long = System.currentTimeMillis()
+    ): TrashedNotebookRecord? {
+        val restoredRecord = syncMutex.withLock {
+            val raw = remoteClient.readFile(REMOTE_TRASH_FILE_NAME) ?: return@withLock null
+            val currentTrash = runCatching { RemoteTrashIndex.decodeFromUtf8Bytes(raw) }.getOrNull()
+                ?: return@withLock null
+            val target = currentTrash.entries.firstOrNull {
+                it.notebookId == notebookId && !it.isExpiredAt(nowEpochMs)
+            } ?: return@withLock null
+
+            val snapshotBytes = Base64.getDecoder().decode(target.manifestSnapshotBase64)
+            val snapshotManifest = backupManager.decodeManifest(snapshotBytes)
+            for ((assetKey, remoteEntry) in target.assetEntries) {
+                val localZip = packageAssetKeyToZipBytes(assetKey)
+                val localSha = localZip?.let { BackupManager.sha256Hex(it) }
+                if (localSha != remoteEntry.sha256) {
+                    val blob = remoteClient.readFile(remoteEntry.blobName) ?: continue
+                    backupManager.extractRelativeSubdirZipBytes(blob, allowedPrefix = assetKey)
+                }
+            }
+            manifestStore.restoreNotebookFromSnapshot(snapshotManifest, restoredAtEpochMs = nowEpochMs)
+
+            val remaining = currentTrash.entries.filter {
+                it.notebookId != notebookId && !it.isExpiredAt(nowEpochMs)
+            }
+            val updatedTrash = RemoteTrashIndex(
+                formatVersion = 1,
+                updatedAtMs = nowEpochMs,
+                entries = remaining
+            )
+            remoteClient.writeFile(
+                remoteName = REMOTE_TRASH_FILE_NAME,
+                bytes = updatedTrash.encodeToUtf8Bytes(),
+                contentType = "application/json"
+            )
+            target
+        } ?: return null
+
+        syncNow(remoteClient, mode = SyncExecutionMode.BIDIRECTIONAL_MERGE, nowEpochMs = nowEpochMs + 1L)
+        return restoredRecord
+    }
+
+    /**
+     * Permanently removes a soft-deleted notebook from the 7-day cloud trash and deletes any
+     * orphaned remote blobs no longer referenced by active or other trashed notebooks.
+     */
+    suspend fun permanentlyDeleteTrashedNotebook(
+        remoteClient: CloudSyncRemoteClient,
+        notebookId: String,
+        nowEpochMs: Long = System.currentTimeMillis()
+    ): Boolean = syncMutex.withLock {
+        val raw = remoteClient.readFile(REMOTE_TRASH_FILE_NAME) ?: return@withLock false
+        val currentTrash = runCatching { RemoteTrashIndex.decodeFromUtf8Bytes(raw) }.getOrNull()
+            ?: return@withLock false
+        val removed = currentTrash.entries.filter {
+            it.notebookId == notebookId || it.isExpiredAt(nowEpochMs)
+        }
+        if (removed.none { it.notebookId == notebookId }) return@withLock false
+
+        val kept = currentTrash.entries.filter {
+            it.notebookId != notebookId && !it.isExpiredAt(nowEpochMs)
+        }
+        val activeKeys = collectActiveAssetKeys(manifestStore.collectManifest()).toSet()
+        val remoteIndexKeys = remoteClient.readFile(REMOTE_INDEX_FILE_NAME)?.let {
+            runCatching { RemoteSyncIndex.decodeFromUtf8Bytes(it).assets.keys }.getOrNull()
+        } ?: emptySet()
+        val stillProtected = HashSet<String>()
+        kept.forEach { stillProtected.addAll(it.assetEntries.keys) }
+
+        for (item in removed) {
+            for ((assetKey, remoteEntry) in item.assetEntries) {
+                if (assetKey !in activeKeys &&
+                    assetKey !in remoteIndexKeys &&
+                    assetKey !in stillProtected
+                ) {
+                    remoteClient.deleteFile(remoteEntry.blobName)
+                    manifestStore.deleteSyncedAsset(assetKey)
+                }
+            }
+        }
+
+        val updatedTrash = RemoteTrashIndex(
+            formatVersion = 1,
+            updatedAtMs = nowEpochMs,
+            entries = kept
+        )
+        remoteClient.writeFile(
+            remoteName = REMOTE_TRASH_FILE_NAME,
+            bytes = updatedTrash.encodeToUtf8Bytes(),
+            contentType = "application/json"
+        )
+        true
     }
 
     private suspend fun packageAssetKeyToZipBytes(assetKey: String): ByteArray? =

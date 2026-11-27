@@ -75,6 +75,7 @@ object CloudSyncScheduler {
     const val UNIQUE_AUTO_SYNC_WORK = "stylusnote_cloud_auto_sync"
     const val UNIQUE_PERIODIC_SYNC_WORK = "stylusnote_cloud_periodic_sync"
     const val UNIQUE_MANUAL_SYNC_WORK = "stylusnote_cloud_manual_sync"
+    const val UNIQUE_CATEGORY_PDF_SYNC_WORK = "stylusnote_category_pdf_sync"
 
     internal const val KEY_SYNC_MODE = "sync_mode"
     internal const val KEY_TRIGGER_REASON = "trigger_reason"
@@ -193,8 +194,35 @@ object CloudSyncScheduler {
                         reason = "app_stop"
                     )
                 }
+                if (settings.isConfigured && settings.providerType == CloudProviderType.GOOGLE_DRIVE) {
+                    enqueueCategoryPdfSync(appContext, settings)
+                }
             }
         }
+    }
+
+    fun cancelCategoryPdfSync(context: Context) {
+        WorkManager.getInstance(context.applicationContext)
+            .cancelUniqueWork(UNIQUE_CATEGORY_PDF_SYNC_WORK)
+    }
+
+    private fun enqueueCategoryPdfSync(
+        context: Context,
+        settings: CloudSyncSettings
+    ) {
+        val constraints = Constraints.Builder()
+            .setRequiredNetworkType(CloudSyncPolicy.resolveBackgroundNetworkType(settings))
+            .build()
+        val request = OneTimeWorkRequestBuilder<CategoryPdfSyncWorker>()
+            .setConstraints(constraints)
+            .setInitialDelay(4L, TimeUnit.SECONDS)
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 1, TimeUnit.MINUTES)
+            .build()
+        WorkManager.getInstance(context).enqueueUniqueWork(
+            UNIQUE_CATEGORY_PDF_SYNC_WORK,
+            ExistingWorkPolicy.REPLACE,
+            request
+        )
     }
 
     fun triggerImmediateManualSync(

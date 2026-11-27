@@ -335,6 +335,8 @@ fun BrushSettingsPopover(
     revealedClozeCount: Int = 0,
     totalClozeCount: Int = 0,
     onToggleRevealAllCloze: (Boolean) -> Unit = {},
+    pieMenuTriggerMode: StylusPieMenuTriggerMode = StylusPieMenuTriggerMode.LONG_PRESS,
+    onPieMenuTriggerModeChange: (StylusPieMenuTriggerMode) -> Unit = {},
     onConfigChange: (BrushConfig) -> Unit,
     onSavePresetSlot: (Int, BrushConfig) -> Unit,
     onApplyPreset: (BrushConfig) -> Unit,
@@ -1247,6 +1249,63 @@ fun BrushSettingsPopover(
                                                 onConfigChange(currentConfig.copy(holdToSnapEnabled = enabled))
                                             }
                                         )
+                                    }
+
+                                    HorizontalDivider(
+                                        modifier = Modifier.padding(vertical = 2.dp),
+                                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+                                    )
+
+                                    Text(
+                                        text = "Focus Pen kör-menü (Pie Menu)",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                    Text(
+                                        text = "Rövid nyomás: Toll ↔ Radír; a választott gesztus nyitja a kurzor alatti kör-menüt",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        StylusPieMenuTriggerMode.entries.forEach { mode ->
+                                            val selected = pieMenuTriggerMode == mode
+                                            Surface(
+                                                onClick = { onPieMenuTriggerModeChange(mode) },
+                                                shape = RoundedCornerShape(10.dp),
+                                                color = if (selected) {
+                                                    surfacePalette.activePillBackground
+                                                } else {
+                                                    MaterialTheme.colorScheme.surface
+                                                },
+                                                border = BorderStroke(
+                                                    width = if (selected) 1.25.dp else 0.75.dp,
+                                                    color = if (selected) {
+                                                        MaterialTheme.colorScheme.primary
+                                                    } else {
+                                                        MaterialTheme.colorScheme.outlineVariant
+                                                    }
+                                                ),
+                                                modifier = Modifier
+                                                    .weight(1f)
+                                                    .testTag("pie_trigger_mode_${mode.name}")
+                                            ) {
+                                                Text(
+                                                    text = mode.labelHu,
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                                    maxLines = 1,
+                                                    color = if (selected) {
+                                                        MaterialTheme.colorScheme.primary
+                                                    } else {
+                                                        MaterialTheme.colorScheme.onSurface
+                                                    },
+                                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 7.dp)
+                                                )
+                                            }
+                                        }
                                     }
                                 }
                                 }

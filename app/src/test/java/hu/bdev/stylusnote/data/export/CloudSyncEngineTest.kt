@@ -558,5 +558,37 @@ class CloudSyncEngineTest {
         override suspend fun clearStarterWorkspaceWithoutTombstone(filesDir: File) {
             manifest = BackupManifest()
         }
+
+        override suspend fun restoreNotebookFromSnapshot(
+            snapshot: BackupManifest,
+            restoredAtEpochMs: Long
+        ) {
+            val nbIds = snapshot.notebooks.mapTo(HashSet()) { it.id }
+            val chIds = snapshot.chapters.mapTo(HashSet()) { it.id }
+            val pIds = snapshot.pages.mapTo(HashSet()) { it.id }
+            val bmIds = snapshot.bookmarks.mapTo(HashSet()) { it.id }
+            val existingFolderIds = manifest.folders.mapTo(HashSet()) { it.id }
+
+            val cleanedTombstones = manifest.tombstones.filterNot { t ->
+                (t.entityType == SyncTombstoneEntity.TYPE_NOTEBOOK && t.entityId in nbIds) ||
+                    (t.entityType == SyncTombstoneEntity.TYPE_CHAPTER && t.entityId in chIds) ||
+                    (t.entityType == SyncTombstoneEntity.TYPE_PAGE && t.entityId in pIds) ||
+                    (t.entityType == SyncTombstoneEntity.TYPE_BOOKMARK && t.entityId in bmIds)
+            }
+            val restoredNbs = snapshot.notebooks.map { nb ->
+                nb.copy(
+                    folderId = nb.folderId?.takeIf { it in existingFolderIds },
+                    updatedAtEpochMs = restoredAtEpochMs
+                )
+            }
+            val restoredPages = snapshot.pages.map { p -> p.copy(updatedAtEpochMs = restoredAtEpochMs) }
+            manifest = manifest.copy(
+                notebooks = manifest.notebooks.filterNot { it.id in nbIds } + restoredNbs,
+                chapters = manifest.chapters.filterNot { it.id in chIds } + snapshot.chapters,
+                pages = manifest.pages.filterNot { it.id in pIds } + restoredPages,
+                bookmarks = manifest.bookmarks.filterNot { it.id in bmIds } + snapshot.bookmarks,
+                tombstones = cleanedTombstones
+            )
+        }
     }
 }

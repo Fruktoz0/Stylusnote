@@ -59,6 +59,8 @@ import androidx.compose.material.icons.filled.BookmarkBorder
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.CloudDone
+import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.Delete
@@ -129,6 +131,18 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.drawscope.Stroke as ComposeDrawStroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.boundsInParent
 import androidx.compose.ui.layout.boundsInWindow
@@ -182,8 +196,13 @@ import hu.bdev.stylusnote.core.math.PageLayoutSlot
 import hu.bdev.stylusnote.core.math.SavedViewportAnchor
 import hu.bdev.stylusnote.core.math.ShapeMeta
 import hu.bdev.stylusnote.core.math.ShapeRecognizer
+import hu.bdev.stylusnote.data.export.CloudProviderType
+import hu.bdev.stylusnote.data.export.CloudSyncPreferencesStore
 import hu.bdev.stylusnote.data.export.CloudSyncScheduler
+import hu.bdev.stylusnote.data.export.CloudSyncSettings
 import hu.bdev.stylusnote.data.export.ExportablePdfPage
+import hu.bdev.stylusnote.data.export.GoogleDriveAuthorizationHelper
+import hu.bdev.stylusnote.data.export.GoogleDriveFolderClient
 import hu.bdev.stylusnote.data.export.PdfExportManager
 import hu.bdev.stylusnote.data.export.PdfTileRenderer
 import hu.bdev.stylusnote.data.local.AppDatabase
@@ -194,6 +213,7 @@ import hu.bdev.stylusnote.data.local.NotebookEntity
 import hu.bdev.stylusnote.data.local.NotebookTagCrossRef
 import hu.bdev.stylusnote.data.local.PageEntity
 import hu.bdev.stylusnote.data.local.PageSearchHit
+import hu.bdev.stylusnote.data.local.PendingDriveFolderDeletionEntity
 import hu.bdev.stylusnote.data.local.StrokeBinarySerializer
 import hu.bdev.stylusnote.data.local.StrokeJournal
 import hu.bdev.stylusnote.data.local.SyncTombstoneEntity
@@ -244,8 +264,10 @@ import hu.bdev.stylusnote.ui.components.ConsentDialog
 import hu.bdev.stylusnote.ui.components.FloatingToolDock
 import hu.bdev.stylusnote.ui.components.InNotebookSearchToolbarSection
 import hu.bdev.stylusnote.ui.components.PaperSettingsDialog
+import hu.bdev.stylusnote.ui.components.RadialPieMenuOverlay
 import hu.bdev.stylusnote.ui.components.SearchHighlightCanvasOverlay
 import hu.bdev.stylusnote.ui.components.ShapePickerPopover
+import hu.bdev.stylusnote.ui.components.StylusPieMenuTriggerMode
 import hu.bdev.stylusnote.ui.components.TableCreationConfig
 import hu.bdev.stylusnote.ui.components.TablePickerPopover
 import hu.bdev.stylusnote.ui.components.ToolDockPreferencesStore
@@ -376,7 +398,11 @@ fun BookshelfScreen(
     var notebookLmExportTarget by remember { mutableStateOf<NotebookEntity?>(null) }
     var bookPdfExportTarget by remember { mutableStateOf<NotebookEntity?>(null) }
     var showCloudBackupDialog by remember { mutableStateOf(false) }
+    var drivePickerTargetFolder by remember { mutableStateOf<FolderEntity?>(null) }
+    var deleteConfirmFolder by remember { mutableStateOf<FolderEntity?>(null) }
     var shelfNoticeHu by remember { mutableStateOf<String?>(null) }
+    val cloudPrefsStore = remember(context) { CloudSyncPreferencesStore(context.applicationContext) }
+    val cloudSettings by cloudPrefsStore.settingsFlow.collectAsState(initial = CloudSyncSettings())
 
     val bookExportLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/pdf")
@@ -752,25 +778,19 @@ fun BookshelfScreen(
                                 selected = isSelected,
                                 isDropHovered = isHovered,
                                 onClick = { sidebarSelection = ShelfSidebarSelection.Category(folder.id) },
+                                drivePdfLinkedName = folder.drivePdfFolderName,
+                                onConfigureDriveFolder = {
+                                    if (cloudSettings.providerType == CloudProviderType.GOOGLE_DRIVE &&
+                                        cloudSettings.isConfigured
+                                    ) {
+                                        drivePickerTargetFolder = folder
+                                    } else {
+                                        shelfNoticeHu = "Először csatlakoztass egy Google Drive fiókot a Felhő menüben."
+                                        showCloudBackupDialog = true
+                                    }
+                                },
                                 onDelete = {
-                                    if (isSelected) {
-                                        sidebarSelection = ShelfSidebarSelection.All
-                                    }
-                                    scope.launch(Dispatchers.IO) {
-                                        // Unassign notebooks before deleting because NotebookEntity.folderId cascades on delete.
-                                        allNotebooks
-                                            .filter { it.folderId == folder.id }
-                                            .forEach { childNb ->
-                                                database.notebookDao().upsertNotebook(
-                                                    childNb.copy(
-                                                        folderId = null,
-                                                        updatedAtEpochMs = System.currentTimeMillis()
-                                                    )
-                                                )
-                                            }
-                                        database.deleteWithTombstone(SyncTombstoneEntity.TYPE_FOLDER, folder.id)
-                                        CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
-                                    }
+                                    deleteConfirmFolder = folder
                                 },
                                 modifier = Modifier.onGloballyPositioned { coords ->
                                     dropTargetBounds[folder.id] = coords.boundsInWindow()
@@ -1451,6 +1471,215 @@ fun BookshelfScreen(
             onBackupNotice = { shelfNoticeHu = it }
         )
     }
+
+    drivePickerTargetFolder?.let { targetFolder ->
+        DriveFolderPickerDialog(
+            categoryFolder = targetFolder,
+            onSelectDriveFolder = { driveFolderId, driveFolderName ->
+                drivePickerTargetFolder = null
+                scope.launch(Dispatchers.IO) {
+                    database.folderDao().updateFolderDrivePdfMapping(
+                        folderId = targetFolder.id,
+                        drivePdfFolderId = driveFolderId,
+                        drivePdfFolderName = driveFolderName,
+                        updatedAtEpochMs = System.currentTimeMillis()
+                    )
+                    CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
+                }
+                shelfNoticeHu = "„${targetFolder.name}” PDF export mappája: $driveFolderName"
+            },
+            onUnlinkDriveFolder = {
+                drivePickerTargetFolder = null
+                scope.launch(Dispatchers.IO) {
+                    database.folderDao().updateFolderDrivePdfMapping(
+                        folderId = targetFolder.id,
+                        drivePdfFolderId = null,
+                        drivePdfFolderName = null,
+                        updatedAtEpochMs = System.currentTimeMillis()
+                    )
+                    database.categoryPdfSyncDao().deleteByFolderId(targetFolder.id)
+                    CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
+                }
+                shelfNoticeHu = "„${targetFolder.name}” Drive PDF mappa-csatolása megszüntetve."
+            },
+            onDismiss = { drivePickerTargetFolder = null }
+        )
+    }
+
+    deleteConfirmFolder?.let { targetFolder ->
+        DeleteCategoryConfirmDialog(
+            folder = targetFolder,
+            onConfirmDelete = {
+                deleteConfirmFolder = null
+                if ((sidebarSelection as? ShelfSidebarSelection.Category)?.folderId == targetFolder.id) {
+                    sidebarSelection = ShelfSidebarSelection.All
+                }
+                scope.launch(Dispatchers.IO) {
+                    // Unassign local notebooks so user notes stay safe while folder & Drive folder are removed.
+                    allNotebooks
+                        .filter { it.folderId == targetFolder.id }
+                        .forEach { childNb ->
+                            database.notebookDao().upsertNotebook(
+                                childNb.copy(
+                                    folderId = null,
+                                    updatedAtEpochMs = System.currentTimeMillis()
+                                )
+                            )
+                        }
+                    database.categoryPdfSyncDao().deleteByFolderId(targetFolder.id)
+                    val driveIdToDelete = targetFolder.drivePdfFolderId?.takeIf { it.isNotBlank() }
+                    if (driveIdToDelete != null) {
+                        database.pendingDriveFolderDeletionDao().upsert(
+                            PendingDriveFolderDeletionEntity(
+                                driveFolderId = driveIdToDelete,
+                                folderName = targetFolder.drivePdfFolderName ?: targetFolder.name,
+                                queuedAtEpochMs = System.currentTimeMillis()
+                            )
+                        )
+                    }
+                    database.deleteWithTombstone(SyncTombstoneEntity.TYPE_FOLDER, targetFolder.id)
+                    CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
+                    if (driveIdToDelete != null) {
+                        val driveClient = GoogleDriveFolderClient(
+                            accessTokenProvider = {
+                                GoogleDriveAuthorizationHelper.requireSilentAccessToken(context.applicationContext)
+                            }
+                        )
+                        runCatching {
+                            driveClient.trashFolder(driveIdToDelete)
+                            database.pendingDriveFolderDeletionDao().deleteById(driveIdToDelete)
+                        }
+                    }
+                }
+                shelfNoticeHu = if (!targetFolder.drivePdfFolderId.isNullOrBlank()) {
+                    "Kategória és csatolt Drive mappa („${targetFolder.drivePdfFolderName}”) törölve."
+                } else {
+                    "Kategória törölve."
+                }
+            },
+            onDismiss = { deleteConfirmFolder = null }
+        )
+    }
+}
+
+/**
+ * Confirmation modal shown when deleting a category, explicitly warning the user if a linked
+ * Google Drive PDF folder will also be removed from Drive. Supports ESC & backdrop dismissal.
+ */
+@Composable
+fun DeleteCategoryConfirmDialog(
+    folder: FolderEntity,
+    onConfirmDelete: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val focusRequester = remember { FocusRequester() }
+    val linkedDriveName = folder.drivePdfFolderName?.takeIf { !folder.drivePdfFolderId.isNullOrBlank() }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            dismissOnBackPress = true,
+            dismissOnClickOutside = true
+        )
+    ) {
+        val windowInfo = LocalWindowInfo.current
+        LaunchedEffect(windowInfo.isWindowFocused) {
+            if (windowInfo.isWindowFocused) {
+                runCatching { focusRequester.requestFocus() }
+            }
+        }
+        LaunchedEffect(Unit) {
+            runCatching { focusRequester.requestFocus() }
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .onPreviewKeyEvent { keyEvent ->
+                    if (keyEvent.key == Key.Escape && keyEvent.type == KeyEventType.KeyDown) {
+                        onDismiss()
+                        true
+                    } else {
+                        false
+                    }
+                }
+                .focusRequester(focusRequester)
+                .focusable(),
+            contentAlignment = Alignment.Center
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.45f))
+                    .testTag("delete_category_backdrop")
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = onDismiss
+                    )
+            )
+            Surface(
+                modifier = Modifier
+                    .padding(horizontal = 24.dp, vertical = 16.dp)
+                    .widthIn(min = 320.dp, max = 480.dp)
+                    .pointerInput(Unit) { detectTapGestures { } }
+                    .testTag("delete_category_dialog"),
+                shape = RoundedCornerShape(18.dp),
+                color = MaterialTheme.colorScheme.surface,
+                tonalElevation = 8.dp,
+                shadowElevation = 14.dp
+            ) {
+                Column(
+                    modifier = Modifier.padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text(
+                        text = "Kategória törlése: ${folder.name}",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = "A kategóriában lévő jegyzetfüzetek nem törlődnek (a „Kategória nélküliek” közé kerülnek).",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (linkedDriveName != null) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.errorContainer,
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("delete_category_drive_warning")
+                        ) {
+                            Text(
+                                text = "Figyelem: A kategóriához csatolt Google Drive mappa („$linkedDriveName”) és a benne lévő PDF exportok is törlésre (lomtárba) kerülnek a Drive-on!",
+                                style = MaterialTheme.typography.bodySmall,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.padding(10.dp)
+                            )
+                        }
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        TextButton(onClick = onDismiss) {
+                            Text("Mégse")
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Button(
+                            onClick = onConfirmDelete,
+                            modifier = Modifier.testTag("delete_category_confirm")
+                        ) {
+                            Text("Törlés")
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 private val FOLDER_PALETTE = listOf(
@@ -1472,6 +1701,8 @@ private fun SidebarNavItem(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     iconTint: Color? = null,
+    drivePdfLinkedName: String? = null,
+    onConfigureDriveFolder: (() -> Unit)? = null,
     onDelete: (() -> Unit)? = null
 ) {
     val surfacePalette = LocalStylusSurfacePalette.current
@@ -1521,6 +1752,31 @@ private fun SidebarNavItem(
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+            if (onConfigureDriveFolder != null) {
+                IconButton(
+                    onClick = onConfigureDriveFolder,
+                    modifier = Modifier.size(22.dp)
+                ) {
+                    Icon(
+                        imageVector = if (!drivePdfLinkedName.isNullOrBlank()) {
+                            Icons.Filled.CloudDone
+                        } else {
+                            Icons.Filled.CloudUpload
+                        },
+                        contentDescription = if (!drivePdfLinkedName.isNullOrBlank()) {
+                            "Drive PDF mappa: $drivePdfLinkedName"
+                        } else {
+                            "Drive PDF mappa csatolása"
+                        },
+                        tint = if (!drivePdfLinkedName.isNullOrBlank()) {
+                            Color(0xFF1E8E3E)
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f)
+                        },
+                        modifier = Modifier.size(14.dp)
+                    )
+                }
+            }
             if (onDelete != null) {
                 IconButton(
                     onClick = onDelete,
@@ -2004,6 +2260,9 @@ fun NotebookWorkspaceScreen(
     database: AppDatabase,
     target: OpenedPageTarget,
     penButtonToggleTick: Long,
+    pieMenuOpenTick: Long = 0L,
+    pieMenuCommitTick: Long = 0L,
+    onPieMenuTriggerModeChanged: (StylusPieMenuTriggerMode) -> Unit = {},
     isDarkTheme: Boolean,
     onToggleTheme: () -> Unit,
     onSelectPageTarget: (OpenedPageTarget) -> Unit,
@@ -2017,6 +2276,9 @@ fun NotebookWorkspaceScreen(
     val workspaceScope = rememberCoroutineScope()
     val toolDockPrefsStore = remember(context) { ToolDockPreferencesStore(context.applicationContext) }
     val dockPrefs by toolDockPrefsStore.prefsFlow.collectAsState(initial = ToolDockPrefs())
+    LaunchedEffect(dockPrefs.pieMenuTriggerMode) {
+        onPieMenuTriggerModeChanged(dockPrefs.pieMenuTriggerMode)
+    }
     var perToolConfigs by remember(target.notebookId) {
         mutableStateOf(ToolDockPreferencesStore.decodePerToolConfigs(dockPrefs.perToolConfigsRaw))
     }
@@ -2384,6 +2646,35 @@ fun NotebookWorkspaceScreen(
                 onUpdateBrushConfig = ::updateActiveBrushConfig,
                 onSelectTool = ::selectTool,
                 onTogglePenEraser = ::togglePenOrEraserIfAllowed,
+                pieMenuOpenTick = pieMenuOpenTick,
+                pieMenuCommitTick = pieMenuCommitTick,
+                onSelectInkColorFromPie = { colorArgb ->
+                    if (!brushConfig.toolType.isDrawingBrush) {
+                        selectTool(BrushToolType.FOUNTAIN_PEN)
+                    }
+                    updateActiveBrushConfig(brushConfig.copy(
+                        toolType = if (brushConfig.toolType.isDrawingBrush) brushConfig.toolType else BrushToolType.FOUNTAIN_PEN,
+                        colorArgb = colorArgb
+                    ))
+                },
+                onCyclePenSizeFromPie = {
+                    val sizes = listOf(0.5f, 1.0f, 2.0f, 4.0f, 8.0f)
+                    if (!brushConfig.toolType.isDrawingBrush) {
+                        selectTool(lastDrawingTool)
+                    }
+                    val targetCfg = if (brushConfig.toolType.isDrawingBrush) {
+                        brushConfig
+                    } else {
+                        perToolConfigs[lastDrawingTool]
+                            ?: ToolDockPreferencesStore.defaultToolConfig(lastDrawingTool)
+                    }
+                    val nextSize = sizes.firstOrNull { it > targetCfg.clampedSizePt + 0.1f } ?: sizes.first()
+                    updateActiveBrushConfig(targetCfg.copy(sizePt = nextSize))
+                    workspaceBannerHu = "Vastagság: ${nextSize} pt"
+                },
+                onUpdatePieMenuTriggerMode = { mode ->
+                    workspaceScope.launch { toolDockPrefsStore.savePieMenuTriggerMode(mode) }
+                },
                 onUpdateShapeDefaults = { w, c, fill ->
                     shapeStrokeWidthPt = w
                     shapeStrokeColorArgb = c
@@ -2513,6 +2804,11 @@ private fun NotebookPagePane(
     onUpdateBrushConfig: (BrushConfig) -> Unit,
     onSelectTool: (BrushToolType) -> Unit,
     onTogglePenEraser: () -> Unit,
+    pieMenuOpenTick: Long = 0L,
+    pieMenuCommitTick: Long = 0L,
+    onSelectInkColorFromPie: (Int) -> Unit = {},
+    onCyclePenSizeFromPie: () -> Unit = {},
+    onUpdatePieMenuTriggerMode: (StylusPieMenuTriggerMode) -> Unit = {},
     onUpdateShapeDefaults: (Float, Int, Boolean) -> Unit,
     onToggleFullScreen: () -> Unit,
     onShowLeftPageDrawerChange: (Boolean) -> Unit,
@@ -2550,6 +2846,18 @@ private fun NotebookPagePane(
     var showBrushSettings by remember(sessionKey) { mutableStateOf(false) }
     var showShapePicker by remember(sessionKey) { mutableStateOf(false) }
     var showTablePicker by remember(sessionKey) { mutableStateOf(false) }
+    var showPieMenu by remember(sessionKey) { mutableStateOf(false) }
+    var lastCursorScreenPx by remember(sessionKey) { mutableStateOf(Offset.Unspecified) }
+    var handledPieOpenTick by remember(sessionKey) { mutableLongStateOf(pieMenuOpenTick) }
+    LaunchedEffect(pieMenuOpenTick) {
+        if (pieMenuOpenTick > handledPieOpenTick) {
+            handledPieOpenTick = pieMenuOpenTick
+            showBrushSettings = false
+            showShapePicker = false
+            showTablePicker = false
+            showPieMenu = true
+        }
+    }
     var lastTableConfig by remember(target.notebookId) { mutableStateOf(TableCreationConfig()) }
     var pendingTableDraft by remember(sessionKey) { mutableStateOf<PendingTableDraft?>(null) }
     var lassoClipboard by remember(target.notebookId) { mutableStateOf<SelectionTransferSnapshot?>(null) }
@@ -4100,6 +4408,9 @@ private fun NotebookPagePane(
                     topToolbarInteractionTick++
                 }
             },
+            onCursorScreenPositionChanged = { pos ->
+                lastCursorScreenPx = pos
+            },
             onConvertLassoToLatexInPage = { pageId, selectedIds, onDone ->
                 val resolvedPageId = pageId ?: latestTargetPageId
                 val binding = resolveBindingForPage(resolvedPageId)
@@ -4970,121 +5281,311 @@ private fun NotebookPagePane(
             modifier = Modifier.fillMaxSize()
         )
 
-        if (showBrushSettings) {
-            val activeClozeBinding = resolveViewportTargetBinding()
-            val pageClozeTapes = activeClozeBinding?.canvasStateHolder?.allPageObjects()
-                ?.filterIsInstance<PageObject.ClozeTapeObject>()
-                .orEmpty()
-            val pageClozeIds = pageClozeTapes.map { it.id }.toSet()
-            val pageRevealedCount = pageClozeIds.count { it in revealedClozeTapeIds }
+        NotebookPageToolAndPieOverlays(
+            showBrushSettings = showBrushSettings,
+            showShapePicker = showShapePicker,
+            showTablePicker = showTablePicker,
+            showPieMenu = showPieMenu,
+            brushConfig = brushConfig,
+            presets = presets,
+            dockBoundsPx = dockBoundsPx,
+            viewportSize = viewportSize,
+            highlighterAutoSize = dockPrefs.highlighterAutoSize,
+            pieMenuTriggerMode = dockPrefs.pieMenuTriggerMode,
+            clozeTapePattern = clozeTapePattern,
+            revealedClozeTapeIds = revealedClozeTapeIds,
+            shapeStrokeWidthPt = shapeStrokeWidthPt,
+            shapeStrokeColorArgb = shapeStrokeColorArgb,
+            shapeHasFill = shapeHasFill,
+            lastTableConfig = lastTableConfig,
+            pendingTableDraft = pendingTableDraft,
+            continuousLayout = continuousLayout,
+            paperConfig = paperConfig,
+            transformMatrix = transformMatrix,
+            isDarkTheme = isDarkTheme,
+            isOledDeepBlack = palette.isOledDeepBlack,
+            lastCursorScreenPx = lastCursorScreenPx,
+            pieMenuCommitTick = pieMenuCommitTick,
+            coroutineScope = coroutineScope,
+            presetStore = presetStore,
+            resolveViewportTargetBinding = ::resolveViewportTargetBinding,
+            resolveBindingForPage = ::resolveBindingForPage,
+            viewportCenterWorkspacePoint = ::viewportCenterWorkspacePoint,
+            onToggleHighlighterAutoSize = onToggleHighlighterAutoSize,
+            onClozeTapePatternChange = { clozeTapePattern = it },
+            onToggleRevealAllCloze = { revealAll, pageClozeIds ->
+                revealedClozeTapeIds = if (revealAll) {
+                    revealedClozeTapeIds + pageClozeIds
+                } else {
+                    revealedClozeTapeIds - pageClozeIds
+                }
+            },
+            onUpdatePieMenuTriggerMode = onUpdatePieMenuTriggerMode,
+            onUpdateBrushConfig = onUpdateBrushConfig,
+            onUpdateShapeDefaults = onUpdateShapeDefaults,
+            onLastTableConfigChange = { lastTableConfig = it },
+            onPendingTableDraftChange = { pendingTableDraft = it },
+            onSelectTool = onSelectTool,
+            onSelectInkColorFromPie = onSelectInkColorFromPie,
+            onCyclePenSizeFromPie = onCyclePenSizeFromPie,
+            onObjectPlaced = { pageId, objId ->
+                dirtyContinuousPageIds.add(pageId)
+                selectedObjectId = objId
+                selectedObjectPageId = pageId
+                if (objId == null) {
+                    pageThumbnailRenderer.invalidatePage(pageId)
+                    externalDrawTick++
+                    viewportTransformTick++
+                }
+                historyRevisionTick++
+            },
+            onDismissBrushSettings = { showBrushSettings = false },
+            onDismissShapePicker = { showShapePicker = false },
+            onDismissTablePicker = { showTablePicker = false },
+            onDismissPieMenu = { showPieMenu = false }
+        )
 
-            BrushSettingsPopover(
-                currentConfig = brushConfig,
-                presets = presets,
-                anchorBoundsPx = dockBoundsPx,
-                viewportSize = viewportSize,
-                highlighterAutoSize = dockPrefs.highlighterAutoSize,
-                onToggleHighlighterAutoSize = onToggleHighlighterAutoSize,
-                clozeTapePattern = clozeTapePattern,
-                onClozeTapePatternChange = { nextPattern -> clozeTapePattern = nextPattern },
-                revealedClozeCount = pageRevealedCount,
-                totalClozeCount = pageClozeTapes.size,
-                onToggleRevealAllCloze = { revealAll ->
-                    revealedClozeTapeIds = if (revealAll) {
-                        revealedClozeTapeIds + pageClozeIds
+        NotebookPageWorkspaceDialogs(
+            showLeftPageDrawer = showLeftPageDrawer,
+            showPaperSettings = showPaperSettings,
+            showAiCopilot = showAiCopilot,
+            showCloudBackupDialog = showCloudBackupDialog,
+            editingCodeBlockState = editingCodeBlockState,
+            editingLatexState = editingLatexState,
+            paperConfig = paperConfig,
+            notebookPages = notebookPages,
+            target = target,
+            latestTargetPageId = latestTargetPageId,
+            notebookTitle = notebookTitle,
+            pageNumber = pageNumber,
+            currentPageEntity = currentPageEntity,
+            consentState = consentState,
+            isDarkTheme = isDarkTheme,
+            database = database,
+            context = context,
+            coroutineScope = coroutineScope,
+            pageThumbnailRenderer = pageThumbnailRenderer,
+            historyRevisionTick = historyRevisionTick,
+            continuousSessionManager = continuousSessionManager,
+            canvasStateHolder = canvasStateHolder,
+            persistedStrokesFrom = ::persistedStrokesFrom,
+            resolveBindingForPage = ::resolveBindingForPage,
+            switchToPage = { nextId -> switchToPage(nextId) },
+            createAndOpenNextPage = ::createAndOpenNextPage,
+            deletePageSafely = ::deletePageSafely,
+            onExecuteAiFormatting = { aiScope, mode ->
+                runCatching {
+                    val formatText = (mode == AiFormattingMode.FULL_HANDWRITING_AND_FIGURES)
+                    val targets = when (aiScope) {
+                        AiCopilotScope.CURRENT_PAGE -> listOfNotNull(
+                            currentPageEntity ?: notebookPages.firstOrNull { it.id == target.pageId }
+                        )
+                        AiCopilotScope.ENTIRE_WORKBOOK ->
+                            withContext(Dispatchers.IO) {
+                                database.pageDao().getPagesForNotebook(target.notebookId)
+                            }.ifEmpty { notebookPages }.ifEmpty { listOfNotNull(currentPageEntity) }
+                    }
+                    val summary = executeAiFormattingAcrossPages(
+                        targets = targets,
+                        onlyUnformattedOcr = false,
+                        formatText = formatText
+                    )
+                    val total = summary.formattedTextCount + summary.formattedFormulaCount + summary.formattedShapeCount
+                    if (total == 0) {
+                        "Nem található formázható elem a kiválasztott hatókörben."
                     } else {
-                        revealedClozeTapeIds - pageClozeIds
+                        "Kész (${targets.size} oldal): ${summary.formattedTextCount} szöveg, ${summary.formattedFormulaCount} képlet, ${summary.formattedShapeCount} alakzat formázva."
                     }
-                },
-                onConfigChange = onUpdateBrushConfig,
-                onSavePresetSlot = { slot, cfg ->
-                    coroutineScope.launch { presetStore.savePreset(slot, cfg) }
-                },
-                onApplyPreset = onUpdateBrushConfig,
-                onDismiss = { showBrushSettings = false }
-            )
-        }
-
-        if (showShapePicker) {
-            ShapePickerPopover(
-                initialStrokeWidthPt = shapeStrokeWidthPt,
-                initialStrokeColorArgb = shapeStrokeColorArgb,
-                initialHasFill = shapeHasFill,
-                anchorBoundsPx = dockBoundsPx,
-                viewportSize = viewportSize,
-                onInsertShape = { shapeType, strokeWidthPt, strokeColorArgb, hasFill ->
-                    onUpdateShapeDefaults(strokeWidthPt, strokeColorArgb, hasFill)
-                    val binding = resolveViewportTargetBinding()
-                    if (binding != null && !binding.isReadOnly) {
-                        val centerWs = viewportCenterWorkspacePoint()
-                        val centerDoc = DocPoint(
-                            xPt = centerWs.xPt - binding.originXPt,
-                            yPt = centerWs.yPt - binding.originYPt
+                }
+            },
+            onPlotLatexFunction = ::plotFunctionFromLatexObject,
+            onShowLeftPageDrawerChange = onShowLeftPageDrawerChange,
+            onPaperConfigUpdated = { updated ->
+                paperConfig = updated
+                pageThumbnailRenderer.invalidatePage(target.pageId)
+                externalDrawTick++
+                coroutineScope.launch(Dispatchers.IO) {
+                    val existing = database.pageDao().getPageById(target.pageId)
+                    if (existing != null) {
+                        database.pageDao().upsertPage(
+                            existing.copy(
+                                canvasMode = updated.canvasMode,
+                                templateType = updated.templateType,
+                                updatedAtEpochMs = System.currentTimeMillis()
+                            )
                         )
-                        val defaultHalfW = if (
-                            shapeType == GeometricShapeType.LINE ||
-                            shapeType == GeometricShapeType.ARROW ||
-                            shapeType == GeometricShapeType.DOUBLE_ARROW
-                        ) 95f else 68f
-                        val defaultHalfH = if (
-                            shapeType == GeometricShapeType.LINE ||
-                            shapeType == GeometricShapeType.ARROW ||
-                            shapeType == GeometricShapeType.DOUBLE_ARROW
-                        ) 24f else 68f
-                        val shapeObj = PageObject.GeometricShapeObject(
-                            id = UUID.randomUUID().toString(),
-                            zOrder = binding.canvasStateHolder.allocateObjectZOrder(),
-                            bounds = DocRect(
-                                leftPt = centerDoc.xPt - defaultHalfW,
-                                topPt = centerDoc.yPt - defaultHalfH,
-                                rightPt = centerDoc.xPt + defaultHalfW,
-                                bottomPt = centerDoc.yPt + defaultHalfH
-                            ),
-                            shapeType = shapeType,
-                            strokeWidthPt = strokeWidthPt,
-                            canonicalStrokeColorArgb = strokeColorArgb,
-                            hasFill = hasFill,
-                            canonicalFillColorArgb = (strokeColorArgb and 0x00FFFFFF) or 0x28000000
-                        )
-                        binding.canvasStateHolder.addPageObject(shapeObj)
-                        coroutineScope.launch { binding.strokeJournal.appendAddObject(shapeObj) }
-                        dirtyContinuousPageIds.add(binding.pageId)
-                        selectedObjectId = shapeObj.id
-                        selectedObjectPageId = binding.pageId
-                        historyRevisionTick++
+                        CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
                     }
-                },
-                onDismiss = { showShapePicker = false }
-            )
-        }
+                }
+            },
+            onDismissPaperSettings = { showPaperSettings = false },
+            onOpenConsentDialog = onOpenConsentDialog,
+            onDismissAiCopilot = { showAiCopilot = false },
+            onDismissCloudBackupDialog = { showCloudBackupDialog = false },
+            onShowWorkspaceBanner = onShowWorkspaceBanner,
+            onDismissCodeBlockEdit = { editingCodeBlockState = null },
+            onDismissLatexEdit = { editingLatexState = null },
+            onMarkPageMutated = { mutPageId ->
+                pageThumbnailRenderer.invalidatePage(mutPageId)
+                dirtyContinuousPageIds.add(mutPageId)
+                externalDrawTick++
+                historyRevisionTick++
+                viewportTransformTick++
+            }
+        )
+    }
+}
 
-        if (showTablePicker) {
-            TablePickerPopover(
-                initialConfig = lastTableConfig,
-                onDismiss = { showTablePicker = false },
-                onConfirm = { cfg ->
-                    lastTableConfig = cfg
-                    showTablePicker = false
-                    val binding = resolveViewportTargetBinding()
-                    if (binding != null && !binding.isReadOnly) {
-                        val slot = continuousLayout?.slotForPageId(binding.pageId)
-                        val pageW = slot?.widthPt ?: paperConfig.pageDimensions.widthPt
-                        val pageH = slot?.heightPt ?: paperConfig.pageDimensions.heightPt
-                        val centerWs = viewportCenterWorkspacePoint()
-                        val centerX = centerWs.xPt - binding.originXPt
-                        val centerY = centerWs.yPt - binding.originYPt
-                        val minDraftW = (cfg.columns * 44f).coerceAtLeast(120f)
-                        val maxDraftW = (pageW - 32f).coerceAtLeast(minDraftW)
-                        val draftW = (pageW * 0.68f).coerceIn(minDraftW, maxDraftW).coerceAtMost(pageW - 24f)
-                        val minDraftH = (cfg.rows * 24f).coerceAtLeast(72f)
-                        val maxDraftH = (pageH * 0.65f).coerceAtLeast(minDraftH)
-                        val draftH = (cfg.rows * 34f).coerceIn(minDraftH, maxDraftH).coerceAtMost(pageH - 24f)
-                        val margin = 12f
-                        val left = (centerX - draftW * 0.5f).coerceIn(margin, (pageW - draftW - margin).coerceAtLeast(margin))
-                        val top = (centerY - draftH * 0.5f).coerceIn(margin, (pageH - draftH - margin).coerceAtLeast(margin))
-                        selectedObjectId = null
-                        selectedObjectPageId = null
-                        pendingTableDraft = PendingTableDraft(
+@Composable
+private fun NotebookPageToolAndPieOverlays(
+    showBrushSettings: Boolean,
+    showShapePicker: Boolean,
+    showTablePicker: Boolean,
+    showPieMenu: Boolean,
+    brushConfig: BrushConfig,
+    presets: List<BrushConfig>,
+    dockBoundsPx: Rect,
+    viewportSize: IntSize,
+    highlighterAutoSize: Boolean,
+    pieMenuTriggerMode: StylusPieMenuTriggerMode,
+    clozeTapePattern: ClozeTapePattern,
+    revealedClozeTapeIds: Set<String>,
+    shapeStrokeWidthPt: Float,
+    shapeStrokeColorArgb: Int,
+    shapeHasFill: Boolean,
+    lastTableConfig: TableCreationConfig,
+    pendingTableDraft: PendingTableDraft?,
+    continuousLayout: ContinuousPageLayout?,
+    paperConfig: PagePaperConfig,
+    transformMatrix: CanvasTransformMatrix,
+    isDarkTheme: Boolean,
+    isOledDeepBlack: Boolean,
+    lastCursorScreenPx: Offset,
+    pieMenuCommitTick: Long,
+    coroutineScope: CoroutineScope,
+    presetStore: BrushPresetStore,
+    resolveViewportTargetBinding: () -> ActivePageBinding?,
+    resolveBindingForPage: (String) -> ActivePageBinding?,
+    viewportCenterWorkspacePoint: () -> DocPoint,
+    onToggleHighlighterAutoSize: (Boolean) -> Unit,
+    onClozeTapePatternChange: (ClozeTapePattern) -> Unit,
+    onToggleRevealAllCloze: (Boolean, Set<String>) -> Unit,
+    onUpdatePieMenuTriggerMode: (StylusPieMenuTriggerMode) -> Unit,
+    onUpdateBrushConfig: (BrushConfig) -> Unit,
+    onUpdateShapeDefaults: (Float, Int, Boolean) -> Unit,
+    onLastTableConfigChange: (TableCreationConfig) -> Unit,
+    onPendingTableDraftChange: (PendingTableDraft?) -> Unit,
+    onSelectTool: (BrushToolType) -> Unit,
+    onSelectInkColorFromPie: (Int) -> Unit,
+    onCyclePenSizeFromPie: () -> Unit,
+    onObjectPlaced: (pageId: String, selectObjectId: String?) -> Unit,
+    onDismissBrushSettings: () -> Unit,
+    onDismissShapePicker: () -> Unit,
+    onDismissTablePicker: () -> Unit,
+    onDismissPieMenu: () -> Unit
+) {
+    if (showBrushSettings) {
+        val activeClozeBinding = resolveViewportTargetBinding()
+        val pageClozeTapes = activeClozeBinding?.canvasStateHolder?.allPageObjects()
+            ?.filterIsInstance<PageObject.ClozeTapeObject>()
+            .orEmpty()
+        val pageClozeIds = pageClozeTapes.map { it.id }.toSet()
+        val pageRevealedCount = pageClozeIds.count { it in revealedClozeTapeIds }
+
+        BrushSettingsPopover(
+            currentConfig = brushConfig,
+            presets = presets,
+            anchorBoundsPx = dockBoundsPx,
+            viewportSize = viewportSize,
+            highlighterAutoSize = highlighterAutoSize,
+            onToggleHighlighterAutoSize = onToggleHighlighterAutoSize,
+            clozeTapePattern = clozeTapePattern,
+            onClozeTapePatternChange = onClozeTapePatternChange,
+            revealedClozeCount = pageRevealedCount,
+            totalClozeCount = pageClozeTapes.size,
+            onToggleRevealAllCloze = { revealAll -> onToggleRevealAllCloze(revealAll, pageClozeIds) },
+            pieMenuTriggerMode = pieMenuTriggerMode,
+            onPieMenuTriggerModeChange = onUpdatePieMenuTriggerMode,
+            onConfigChange = onUpdateBrushConfig,
+            onSavePresetSlot = { slot, cfg ->
+                coroutineScope.launch { presetStore.savePreset(slot, cfg) }
+            },
+            onApplyPreset = onUpdateBrushConfig,
+            onDismiss = onDismissBrushSettings
+        )
+    }
+
+    if (showShapePicker) {
+        ShapePickerPopover(
+            initialStrokeWidthPt = shapeStrokeWidthPt,
+            initialStrokeColorArgb = shapeStrokeColorArgb,
+            initialHasFill = shapeHasFill,
+            anchorBoundsPx = dockBoundsPx,
+            viewportSize = viewportSize,
+            onInsertShape = { shapeType, strokeWidthPt, strokeColorArgb, hasFill ->
+                onUpdateShapeDefaults(strokeWidthPt, strokeColorArgb, hasFill)
+                val binding = resolveViewportTargetBinding()
+                if (binding != null && !binding.isReadOnly) {
+                    val centerWs = viewportCenterWorkspacePoint()
+                    val centerDoc = DocPoint(
+                        xPt = centerWs.xPt - binding.originXPt,
+                        yPt = centerWs.yPt - binding.originYPt
+                    )
+                    val isLinear = shapeType == GeometricShapeType.LINE ||
+                        shapeType == GeometricShapeType.ARROW ||
+                        shapeType == GeometricShapeType.DOUBLE_ARROW
+                    val defaultHalfW = if (isLinear) 95f else 68f
+                    val defaultHalfH = if (isLinear) 24f else 68f
+                    val shapeObj = PageObject.GeometricShapeObject(
+                        id = UUID.randomUUID().toString(),
+                        zOrder = binding.canvasStateHolder.allocateObjectZOrder(),
+                        bounds = DocRect(
+                            leftPt = centerDoc.xPt - defaultHalfW,
+                            topPt = centerDoc.yPt - defaultHalfH,
+                            rightPt = centerDoc.xPt + defaultHalfW,
+                            bottomPt = centerDoc.yPt + defaultHalfH
+                        ),
+                        shapeType = shapeType,
+                        strokeWidthPt = strokeWidthPt,
+                        canonicalStrokeColorArgb = strokeColorArgb,
+                        hasFill = hasFill,
+                        canonicalFillColorArgb = (strokeColorArgb and 0x00FFFFFF) or 0x28000000
+                    )
+                    binding.canvasStateHolder.addPageObject(shapeObj)
+                    coroutineScope.launch { binding.strokeJournal.appendAddObject(shapeObj) }
+                    onObjectPlaced(binding.pageId, shapeObj.id)
+                }
+            },
+            onDismiss = onDismissShapePicker
+        )
+    }
+
+    if (showTablePicker) {
+        TablePickerPopover(
+            initialConfig = lastTableConfig,
+            onDismiss = onDismissTablePicker,
+            onConfirm = { cfg ->
+                onLastTableConfigChange(cfg)
+                onDismissTablePicker()
+                val binding = resolveViewportTargetBinding()
+                if (binding != null && !binding.isReadOnly) {
+                    val slot = continuousLayout?.slotForPageId(binding.pageId)
+                    val pageW = slot?.widthPt ?: paperConfig.pageDimensions.widthPt
+                    val pageH = slot?.heightPt ?: paperConfig.pageDimensions.heightPt
+                    val centerWs = viewportCenterWorkspacePoint()
+                    val centerX = centerWs.xPt - binding.originXPt
+                    val centerY = centerWs.yPt - binding.originYPt
+                    val minDraftW = (cfg.columns * 44f).coerceAtLeast(120f)
+                    val maxDraftW = (pageW - 32f).coerceAtLeast(minDraftW)
+                    val draftW = (pageW * 0.68f).coerceIn(minDraftW, maxDraftW).coerceAtMost(pageW - 24f)
+                    val minDraftH = (cfg.rows * 24f).coerceAtLeast(72f)
+                    val maxDraftH = (pageH * 0.65f).coerceAtLeast(minDraftH)
+                    val draftH = (cfg.rows * 34f).coerceIn(minDraftH, maxDraftH).coerceAtMost(pageH - 24f)
+                    val margin = 12f
+                    val left = (centerX - draftW * 0.5f).coerceIn(margin, (pageW - draftW - margin).coerceAtLeast(margin))
+                    val top = (centerY - draftH * 0.5f).coerceIn(margin, (pageH - draftH - margin).coerceAtLeast(margin))
+                    onPendingTableDraftChange(
+                        PendingTableDraft(
                             pageId = binding.pageId,
                             bounds = DocRect(
                                 leftPt = left,
@@ -5098,230 +5599,237 @@ private fun NotebookPagePane(
                             canonicalBorderColorArgb = cfg.canonicalBorderColorArgb,
                             hasHeaderRow = cfg.hasHeaderRow
                         )
-                    }
+                    )
                 }
-            )
-        }
+            }
+        )
+    }
 
-        val activeTableDraft = pendingTableDraft
-        if (activeTableDraft != null) {
-            val draftSlot = continuousLayout?.slotForPageId(activeTableDraft.pageId)
-            val draftOriginX = draftSlot?.leftPt ?: 0f
-            val draftOriginY = draftSlot?.topPt ?: 0f
-            val draftPageW = draftSlot?.widthPt ?: paperConfig.pageDimensions.widthPt
-            val draftPageH = draftSlot?.heightPt ?: paperConfig.pageDimensions.heightPt
-            PendingTableDraftOverlay(
-                draft = activeTableDraft,
-                pageOriginXPt = draftOriginX,
-                pageOriginYPt = draftOriginY,
-                pageWidthPt = draftPageW,
-                pageHeightPt = draftPageH,
-                transformMatrix = transformMatrix,
-                isOledMode = isDarkTheme,
-                onUpdateBounds = { nextBounds ->
-                    pendingTableDraft = activeTableDraft.copy(bounds = nextBounds)
-                },
-                onCancel = { pendingTableDraft = null },
-                onConfirmPlacement = { finalized ->
-                    pendingTableDraft = null
-                    val binding = resolveBindingForPage(finalized.pageId)
-                    if (binding != null && !binding.isReadOnly) {
-                        val tableObj = PageObject.TableObject(
-                            id = UUID.randomUUID().toString(),
-                            zOrder = binding.canvasStateHolder.allocateObjectZOrder(),
-                            bounds = finalized.bounds,
-                            rows = finalized.rows,
-                            columns = finalized.columns,
-                            borderStrokeWidthPt = finalized.borderStrokeWidthPt,
-                            canonicalBorderColorArgb = finalized.canonicalBorderColorArgb,
-                            hasHeaderRow = finalized.hasHeaderRow
-                        )
-                        binding.canvasStateHolder.addPageObject(tableObj)
-                        binding.dryInkRasterCache.invalidateDocRect(tableObj.bounds)
-                        coroutineScope.launch { binding.strokeJournal.appendAddObject(tableObj) }
-                        pageThumbnailRenderer.invalidatePage(binding.pageId)
-                        dirtyContinuousPageIds.add(binding.pageId)
-                        // Deliberately keep selectedObjectId null so the table locks permanently upon placement.
-                        externalDrawTick++
-                        historyRevisionTick++
-                        viewportTransformTick++
-                    }
-                },
-                modifier = Modifier.fillMaxSize()
-            )
-        }
-
-        if (showLeftPageDrawer && paperConfig.canvasMode == CanvasMode.FIXED_PAGE) {
-            LeftPageDrawerOverlay(
-                pages = notebookPages,
-                activePageId = target.pageId,
-                onSelectPage = { nextPageId -> switchToPage(nextPageId) },
-                onAddNewPage = { createAndOpenNextPage() },
-                onReorderPages = { orderedIds ->
-                    coroutineScope.launch(Dispatchers.IO) {
-                        database.pageDao().reorderPagesInNotebook(
-                            notebookId = target.notebookId,
-                            orderedPageIds = orderedIds,
-                            updatedAtMs = System.currentTimeMillis()
-                        )
-                        CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
-                    }
-                },
-                onRenamePage = { pageId, newTitle ->
-                    val sanitized = newTitle?.trim()?.takeIf { it.isNotEmpty() }
-                    coroutineScope.launch(Dispatchers.IO) {
-                        database.pageDao().renamePage(
-                            pageId = pageId,
-                            title = sanitized,
-                            updatedAtMs = System.currentTimeMillis()
-                        )
-                        CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
-                    }
-                },
-                onDeletePage = { pageId -> deletePageSafely(pageId) },
-                thumbnailRenderer = pageThumbnailRenderer,
-                pageThumbnailVersionProvider = { pageId ->
-                    if (pageId == latestTargetPageId) historyRevisionTick else pageThumbnailRenderer.versionFor(pageId)
-                },
-                livePageSnapshotProvider = { pageId ->
-                    val holder = if (continuousSessionManager != null) {
-                        continuousSessionManager.getReadyRuntime(pageId)?.canvasStateHolder
-                    } else if (pageId == latestTargetPageId) {
-                        canvasStateHolder
-                    } else {
-                        null
-                    }
-                    holder?.let {
-                        PageThumbnailSourceSnapshot(
-                            strokes = persistedStrokesFrom(it),
-                            objects = it.allPageObjects(),
-                            liveInkStrokesById = it.allStrokesSorted().associate { entry -> entry.id to entry.stroke }
-                        )
-                    }
-                },
-                onDismiss = { onShowLeftPageDrawerChange(false) }
-            )
-        }
-
-        if (showPaperSettings) {
-            PaperSettingsDialog(
-                currentConfig = paperConfig,
-                onConfigChange = { updated ->
-                    paperConfig = updated
-                    pageThumbnailRenderer.invalidatePage(target.pageId)
-                    externalDrawTick++
-                    coroutineScope.launch(Dispatchers.IO) {
-                        val existing = database.pageDao().getPageById(target.pageId)
-                        if (existing != null) {
-                            database.pageDao().upsertPage(
-                                existing.copy(
-                                    canvasMode = updated.canvasMode,
-                                    templateType = updated.templateType,
-                                    updatedAtEpochMs = System.currentTimeMillis()
-                                )
-                            )
-                            CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
-                        }
-                    }
-                },
-                onDismiss = { showPaperSettings = false }
-            )
-        }
-
-        if (showAiCopilot) {
-            AiCopilotSheet(
-                notebookTitle = notebookTitle,
-                pageNumber = pageNumber,
-                totalPageCount = notebookPages.size.coerceAtLeast(1),
-                consentState = consentState,
-                onOpenConsentSettings = onOpenConsentDialog,
-                onFormatWithAi = { aiScope, mode ->
-                    runCatching {
-                        val formatText = (mode == AiFormattingMode.FULL_HANDWRITING_AND_FIGURES)
-                        val targets = when (aiScope) {
-                            AiCopilotScope.CURRENT_PAGE -> listOfNotNull(
-                                currentPageEntity ?: notebookPages.firstOrNull { it.id == target.pageId }
-                            )
-                            AiCopilotScope.ENTIRE_WORKBOOK ->
-                                withContext(Dispatchers.IO) {
-                                    database.pageDao().getPagesForNotebook(target.notebookId)
-                                }.ifEmpty { notebookPages }.ifEmpty { listOfNotNull(currentPageEntity) }
-                        }
-                        val summary = executeAiFormattingAcrossPages(
-                            targets = targets,
-                            onlyUnformattedOcr = false,
-                            formatText = formatText
-                        )
-                        val total = summary.formattedTextCount + summary.formattedFormulaCount + summary.formattedShapeCount
-                        if (total == 0) {
-                            "Nem található formázható elem a kiválasztott hatókörben."
-                        } else {
-                            "Kész (${targets.size} oldal): ${summary.formattedTextCount} szöveg, ${summary.formattedFormulaCount} képlet, ${summary.formattedShapeCount} alakzat formázva."
-                        }
-                    }
-                },
-                onDismiss = { showAiCopilot = false }
-            )
-        }
-
-        if (showCloudBackupDialog) {
-            CloudBackupDialog(
-                database = database,
-                onDismiss = { showCloudBackupDialog = false },
-                onBackupNotice = { msg -> onShowWorkspaceBanner(msg) }
-            )
-        }
-
-        editingCodeBlockState?.let { (editPageId, initialBlock) ->
-            CodeBlockEditorDialog(
-                initialBlock = initialBlock,
-                isOledMode = isDarkTheme,
-                onDismiss = { editingCodeBlockState = null },
-                onSave = { updatedBlock ->
-                    val b = resolveBindingForPage(editPageId)
-                    if (b != null && !b.isReadOnly) {
-                        b.canvasStateHolder.updatePageObject(updatedBlock)
-                        coroutineScope.launch { b.strokeJournal.appendUpdateObject(updatedBlock) }
-                        pageThumbnailRenderer.invalidatePage(b.pageId)
-                        dirtyContinuousPageIds.add(b.pageId)
-                        externalDrawTick++
-                        historyRevisionTick++
-                        viewportTransformTick++
-                    }
-                    editingCodeBlockState = null
+    if (pendingTableDraft != null) {
+        val draftSlot = continuousLayout?.slotForPageId(pendingTableDraft.pageId)
+        val draftOriginX = draftSlot?.leftPt ?: 0f
+        val draftOriginY = draftSlot?.topPt ?: 0f
+        val draftPageW = draftSlot?.widthPt ?: paperConfig.pageDimensions.widthPt
+        val draftPageH = draftSlot?.heightPt ?: paperConfig.pageDimensions.heightPt
+        PendingTableDraftOverlay(
+            draft = pendingTableDraft,
+            pageOriginXPt = draftOriginX,
+            pageOriginYPt = draftOriginY,
+            pageWidthPt = draftPageW,
+            pageHeightPt = draftPageH,
+            transformMatrix = transformMatrix,
+            isOledMode = isDarkTheme,
+            onUpdateBounds = { nextBounds ->
+                onPendingTableDraftChange(pendingTableDraft.copy(bounds = nextBounds))
+            },
+            onCancel = { onPendingTableDraftChange(null) },
+            onConfirmPlacement = { finalized ->
+                onPendingTableDraftChange(null)
+                val binding = resolveBindingForPage(finalized.pageId)
+                if (binding != null && !binding.isReadOnly) {
+                    val tableObj = PageObject.TableObject(
+                        id = UUID.randomUUID().toString(),
+                        zOrder = binding.canvasStateHolder.allocateObjectZOrder(),
+                        bounds = finalized.bounds,
+                        rows = finalized.rows,
+                        columns = finalized.columns,
+                        borderStrokeWidthPt = finalized.borderStrokeWidthPt,
+                        canonicalBorderColorArgb = finalized.canonicalBorderColorArgb,
+                        hasHeaderRow = finalized.hasHeaderRow
+                    )
+                    binding.canvasStateHolder.addPageObject(tableObj)
+                    binding.dryInkRasterCache.invalidateDocRect(tableObj.bounds)
+                    coroutineScope.launch { binding.strokeJournal.appendAddObject(tableObj) }
+                    onObjectPlaced(binding.pageId, null)
                 }
-            )
-        }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+    }
 
-        editingLatexState?.let { (editPageId, initialLatex) ->
-            LatexEditDialog(
-                initialObject = initialLatex,
-                isOledMode = isDarkTheme,
-                onDismiss = { editingLatexState = null },
-                onSave = { updatedLatex ->
-                    val b = resolveBindingForPage(editPageId)
-                    if (b != null && !b.isReadOnly) {
-                        b.canvasStateHolder.updatePageObject(updatedLatex)
-                        coroutineScope.launch { b.strokeJournal.appendUpdateObject(updatedLatex) }
-                        pageThumbnailRenderer.invalidatePage(b.pageId)
-                        dirtyContinuousPageIds.add(b.pageId)
-                        externalDrawTick++
-                        historyRevisionTick++
-                        viewportTransformTick++
-                    }
-                    editingLatexState = null
-                },
-                onPlotFunction = { updatedLatex ->
-                    val b = resolveBindingForPage(editPageId)
-                    if (b != null && !b.isReadOnly) {
-                        b.canvasStateHolder.updatePageObject(updatedLatex)
-                        coroutineScope.launch { b.strokeJournal.appendUpdateObject(updatedLatex) }
-                        plotFunctionFromLatexObject(b, updatedLatex)
-                    }
-                    editingLatexState = null
-                }
-            )
+    if (showPieMenu) {
+        val anchor = if (lastCursorScreenPx != Offset.Unspecified) {
+            lastCursorScreenPx
+        } else {
+            Offset(viewportSize.width * 0.5f, viewportSize.height * 0.5f)
         }
+        RadialPieMenuOverlay(
+            anchorScreenPx = anchor,
+            viewportSize = viewportSize,
+            brushConfig = brushConfig,
+            isOledMode = isOledDeepBlack,
+            commitTick = pieMenuCommitTick,
+            onSelectTool = onSelectTool,
+            onSelectInkColor = onSelectInkColorFromPie,
+            onCyclePenSize = onCyclePenSizeFromPie,
+            onDismiss = onDismissPieMenu
+        )
+    }
+}
+
+@Composable
+private fun NotebookPageWorkspaceDialogs(
+    showLeftPageDrawer: Boolean,
+    showPaperSettings: Boolean,
+    showAiCopilot: Boolean,
+    showCloudBackupDialog: Boolean,
+    editingCodeBlockState: Pair<String, PageObject.CodeBlockObject>?,
+    editingLatexState: Pair<String, PageObject.LatexObject>?,
+    paperConfig: PagePaperConfig,
+    notebookPages: List<PageEntity>,
+    target: OpenedPageTarget,
+    latestTargetPageId: String,
+    notebookTitle: String,
+    pageNumber: Int,
+    currentPageEntity: PageEntity?,
+    consentState: AiConsentState,
+    isDarkTheme: Boolean,
+    database: AppDatabase,
+    context: android.content.Context,
+    coroutineScope: CoroutineScope,
+    pageThumbnailRenderer: PageThumbnailRenderer,
+    historyRevisionTick: Long,
+    continuousSessionManager: MultiPageSessionManager?,
+    canvasStateHolder: CanvasStateHolder,
+    persistedStrokesFrom: (CanvasStateHolder) -> List<PersistedStrokeRecord>,
+    resolveBindingForPage: (String) -> ActivePageBinding?,
+    switchToPage: (String) -> Unit,
+    createAndOpenNextPage: () -> Unit,
+    deletePageSafely: (String) -> Unit,
+    onExecuteAiFormatting: suspend (AiCopilotScope, AiFormattingMode) -> Result<String>,
+    onPlotLatexFunction: (ActivePageBinding, PageObject.LatexObject) -> Unit,
+    onShowLeftPageDrawerChange: (Boolean) -> Unit,
+    onPaperConfigUpdated: (PagePaperConfig) -> Unit,
+    onDismissPaperSettings: () -> Unit,
+    onOpenConsentDialog: () -> Unit,
+    onDismissAiCopilot: () -> Unit,
+    onDismissCloudBackupDialog: () -> Unit,
+    onShowWorkspaceBanner: (String) -> Unit,
+    onDismissCodeBlockEdit: () -> Unit,
+    onDismissLatexEdit: () -> Unit,
+    onMarkPageMutated: (String) -> Unit
+) {
+    if (showLeftPageDrawer && paperConfig.canvasMode == CanvasMode.FIXED_PAGE) {
+        LeftPageDrawerOverlay(
+            pages = notebookPages,
+            activePageId = target.pageId,
+            onSelectPage = switchToPage,
+            onAddNewPage = createAndOpenNextPage,
+            onReorderPages = { orderedIds ->
+                coroutineScope.launch(Dispatchers.IO) {
+                    database.pageDao().reorderPagesInNotebook(
+                        notebookId = target.notebookId,
+                        orderedPageIds = orderedIds,
+                        updatedAtMs = System.currentTimeMillis()
+                    )
+                    CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
+                }
+            },
+            onRenamePage = { pageId, newTitle ->
+                val sanitized = newTitle?.trim()?.takeIf { it.isNotEmpty() }
+                coroutineScope.launch(Dispatchers.IO) {
+                    database.pageDao().renamePage(
+                        pageId = pageId,
+                        title = sanitized,
+                        updatedAtMs = System.currentTimeMillis()
+                    )
+                    CloudSyncScheduler.notifyDatabaseMetadataChanged(context)
+                }
+            },
+            onDeletePage = deletePageSafely,
+            thumbnailRenderer = pageThumbnailRenderer,
+            pageThumbnailVersionProvider = { pageId ->
+                if (pageId == latestTargetPageId) historyRevisionTick else pageThumbnailRenderer.versionFor(pageId)
+            },
+            livePageSnapshotProvider = { pageId ->
+                val holder = if (continuousSessionManager != null) {
+                    continuousSessionManager.getReadyRuntime(pageId)?.canvasStateHolder
+                } else if (pageId == latestTargetPageId) {
+                    canvasStateHolder
+                } else {
+                    null
+                }
+                holder?.let {
+                    PageThumbnailSourceSnapshot(
+                        strokes = persistedStrokesFrom(it),
+                        objects = it.allPageObjects(),
+                        liveInkStrokesById = it.allStrokesSorted().associate { entry -> entry.id to entry.stroke }
+                    )
+                }
+            },
+            onDismiss = { onShowLeftPageDrawerChange(false) }
+        )
+    }
+
+    if (showPaperSettings) {
+        PaperSettingsDialog(
+            currentConfig = paperConfig,
+            onConfigChange = onPaperConfigUpdated,
+            onDismiss = onDismissPaperSettings
+        )
+    }
+
+    if (showAiCopilot) {
+        AiCopilotSheet(
+            notebookTitle = notebookTitle,
+            pageNumber = pageNumber,
+            totalPageCount = notebookPages.size.coerceAtLeast(1),
+            consentState = consentState,
+            onOpenConsentSettings = onOpenConsentDialog,
+            onFormatWithAi = onExecuteAiFormatting,
+            onDismiss = onDismissAiCopilot
+        )
+    }
+
+    if (showCloudBackupDialog) {
+        CloudBackupDialog(
+            database = database,
+            onDismiss = onDismissCloudBackupDialog,
+            onBackupNotice = onShowWorkspaceBanner
+        )
+    }
+
+    editingCodeBlockState?.let { (editPageId, initialBlock) ->
+        CodeBlockEditorDialog(
+            initialBlock = initialBlock,
+            isOledMode = isDarkTheme,
+            onDismiss = onDismissCodeBlockEdit,
+            onSave = { updatedBlock ->
+                val b = resolveBindingForPage(editPageId)
+                if (b != null && !b.isReadOnly) {
+                    b.canvasStateHolder.updatePageObject(updatedBlock)
+                    coroutineScope.launch { b.strokeJournal.appendUpdateObject(updatedBlock) }
+                    onMarkPageMutated(b.pageId)
+                }
+                onDismissCodeBlockEdit()
+            }
+        )
+    }
+
+    editingLatexState?.let { (editPageId, initialLatex) ->
+        LatexEditDialog(
+            initialObject = initialLatex,
+            isOledMode = isDarkTheme,
+            onDismiss = onDismissLatexEdit,
+            onSave = { updatedLatex ->
+                val b = resolveBindingForPage(editPageId)
+                if (b != null && !b.isReadOnly) {
+                    b.canvasStateHolder.updatePageObject(updatedLatex)
+                    coroutineScope.launch { b.strokeJournal.appendUpdateObject(updatedLatex) }
+                    onMarkPageMutated(b.pageId)
+                }
+                onDismissLatexEdit()
+            },
+            onPlotFunction = { updatedLatex ->
+                val b = resolveBindingForPage(editPageId)
+                if (b != null && !b.isReadOnly) {
+                    b.canvasStateHolder.updatePageObject(updatedLatex)
+                    coroutineScope.launch { b.strokeJournal.appendUpdateObject(updatedLatex) }
+                    onPlotLatexFunction(b, updatedLatex)
+                }
+                onDismissLatexEdit()
+            }
+        )
     }
 }
 

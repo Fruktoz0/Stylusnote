@@ -3,6 +3,7 @@ package hu.bdev.stylusnote.core.hardware
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
+import hu.bdev.stylusnote.ui.components.StylusPieMenuTriggerMode
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -123,6 +124,129 @@ object StylusHardwareShortcutDetector {
     ): Boolean {
         val mask = relevantMotionButtonMask(deviceMeta)
         return (actionButton and mask) != 0
+    }
+
+    fun shouldHandleActionButtonRelease(
+        actionButton: Int,
+        deviceMeta: StylusInputDeviceMeta? = null
+    ): Boolean = shouldToggleEraserForActionButtonPress(actionButton, deviceMeta)
+}
+
+enum class StylusButtonGestureAction {
+    NONE,
+    TOGGLE_ERASER,
+    OPEN_PIE_MENU,
+    COMMIT_PIE_MENU_ON_RELEASE
+}
+
+/**
+ * Pure-Kotlin state machine distinguishing short clicks (Pen ↔ Eraser) from long-press or
+ * double-press gestures that open [hu.bdev.stylusnote.ui.components.RadialPieMenuOverlay],
+ * while deduplicating dual `KeyEvent` + `MotionEvent` delivery on the Focus Pen Pro.
+ */
+class StylusButtonGestureStateMachine(
+    val longPressThresholdMs: Long = 320L,
+    val doublePressWindowMs: Long = 340L
+) {
+    private var isPressed: Boolean = false
+    private var pressStartMs: Long = Long.MIN_VALUE
+    private var longPressOpenedPie: Boolean = false
+    private var doublePressOpenedPie: Boolean = false
+    private var waitingForSecondPress: Boolean = false
+    private var firstPressReleaseMs: Long = Long.MIN_VALUE
+    private var lastEventMs: Long = Long.MIN_VALUE
+
+    @Synchronized
+    fun onButtonDown(nowMs: Long, mode: StylusPieMenuTriggerMode): StylusButtonGestureAction {
+        if (isPressed) return StylusButtonGestureAction.NONE
+        if (lastEventMs != Long.MIN_VALUE && (nowMs - lastEventMs) in 0L until 35L) {
+            return StylusButtonGestureAction.NONE
+        }
+        lastEventMs = nowMs
+        isPressed = true
+        pressStartMs = nowMs
+        longPressOpenedPie = false
+        doublePressOpenedPie = false
+
+        return when (mode) {
+            StylusPieMenuTriggerMode.OFF -> StylusButtonGestureAction.TOGGLE_ERASER
+            StylusPieMenuTriggerMode.LONG_PRESS -> StylusButtonGestureAction.NONE
+            StylusPieMenuTriggerMode.DOUBLE_PRESS -> {
+                if (waitingForSecondPress && (nowMs - firstPressReleaseMs) in 0L..doublePressWindowMs) {
+                    waitingForSecondPress = false
+                    doublePressOpenedPie = true
+                    StylusButtonGestureAction.OPEN_PIE_MENU
+                } else {
+                    StylusButtonGestureAction.NONE
+                }
+            }
+        }
+    }
+
+    @Synchronized
+    fun onTimerElapsed(nowMs: Long, mode: StylusPieMenuTriggerMode): StylusButtonGestureAction {
+        return when (mode) {
+            StylusPieMenuTriggerMode.OFF -> StylusButtonGestureAction.NONE
+            StylusPieMenuTriggerMode.LONG_PRESS -> {
+                if (isPressed && !longPressOpenedPie && (nowMs - pressStartMs) >= longPressThresholdMs) {
+                    longPressOpenedPie = true
+                    StylusButtonGestureAction.OPEN_PIE_MENU
+                } else {
+                    StylusButtonGestureAction.NONE
+                }
+            }
+            StylusPieMenuTriggerMode.DOUBLE_PRESS -> {
+                if (waitingForSecondPress && !isPressed && (nowMs - firstPressReleaseMs) >= doublePressWindowMs) {
+                    waitingForSecondPress = false
+                    StylusButtonGestureAction.TOGGLE_ERASER
+                } else {
+                    StylusButtonGestureAction.NONE
+                }
+            }
+        }
+    }
+
+    @Synchronized
+    fun onButtonUp(nowMs: Long, mode: StylusPieMenuTriggerMode): StylusButtonGestureAction {
+        if (!isPressed) return StylusButtonGestureAction.NONE
+        isPressed = false
+        lastEventMs = nowMs
+        val heldMs = (nowMs - pressStartMs).coerceAtLeast(0L)
+
+        return when (mode) {
+            StylusPieMenuTriggerMode.OFF -> StylusButtonGestureAction.NONE
+            StylusPieMenuTriggerMode.LONG_PRESS -> when {
+                longPressOpenedPie -> {
+                    longPressOpenedPie = false
+                    StylusButtonGestureAction.COMMIT_PIE_MENU_ON_RELEASE
+                }
+                heldMs >= longPressThresholdMs -> {
+                    StylusButtonGestureAction.OPEN_PIE_MENU
+                }
+                else -> StylusButtonGestureAction.TOGGLE_ERASER
+            }
+            StylusPieMenuTriggerMode.DOUBLE_PRESS -> {
+                if (doublePressOpenedPie) {
+                    doublePressOpenedPie = false
+                    StylusButtonGestureAction.NONE
+                } else {
+                    waitingForSecondPress = true
+                    firstPressReleaseMs = nowMs
+                    StylusButtonGestureAction.NONE
+                }
+            }
+        }
+    }
+
+    @Synchronized
+    fun reset() {
+        isPressed = false
+        pressStartMs = Long.MIN_VALUE
+        longPressOpenedPie = false
+        doublePressOpenedPie = false
+        waitingForSecondPress = false
+        firstPressReleaseMs = Long.MIN_VALUE
+        lastEventMs = Long.MIN_VALUE
     }
 }
 
