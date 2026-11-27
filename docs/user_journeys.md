@@ -265,7 +265,7 @@ flowchart LR
 ```mermaid
 flowchart LR
     DELNB["Füzet törlése tableten"] --> SY["CloudSyncEngine → cloud-trash.json (7 napos védelem)"]
-    SY -- "< 7 nap" --> RES["Felhő → Lomtár (CloudTrashRestoreDialog): Visszaállít / Végleges törlés"]
+    SY -- "< 7 nap" --> RES["Felhő lenyíló szekció vagy Főoldal → Kuka: Checkbox többes kijelölés + Visszaállítás (kézi törlés nélkül)"]
     SY -- "≥ 7 nap" --> PRG["Automatikus távoli blob + rekord törlés következő szinkronkor"]
     CAT["Kategória → Drive-mappa tallózása (DriveFolderPickerDialog)"] --> BG["App háttérbe lép (onStop) / periodikus szinkron"]
     BG --> EX["CategoryPdfSyncEngine → <Cím>_YYYY-MM-DD.pdf felülírása helyben"]

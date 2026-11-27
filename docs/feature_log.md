@@ -442,3 +442,21 @@ flowchart TD
   - `.\gradlew testDebugUnitTest --no-daemon`: **155/155** JVM unit teszt sikeres **30** tesztosztályban (`0` hiba, `0` errors, `0` kihagyás — benne a `XvPhaseValidationUnitTest` 4 tesztjével).
   - `.\gradlew :app:connectedDebugAndroidTest --no-daemon`: **45/45** műszerezett teszt sikeres (`25097RP43G - 17`, `0` hiba, `0` errors, `0` kihagyás — benne a `XvPhaseValidationInstrumentedTest` 4 tesztjével és a Room `MIGRATION_4_5` ellenőrzéssel).
   - `.\gradlew :app:installDebug --no-daemon` + hidegindítás (`25097RP43G - 17`): `LaunchState: COLD`, `Status: ok`, `TotalTime: 745 ms`, `WaitTime: 749 ms`, üres crash `logcat`.
+
+---
+
+### [2026-11-27] — XVI. Ütem (`Lépés 113–117`): Lenyíló Checkboxos Lomtár, Könyvespolc „Kuka”, Jobb Alsó Lapozó Kivétele & Töltőtoll `0.5 / 0.75 / 1 / 2 / 4 pt`
+
+- **Lenyíló Checkboxos Lomtár & Végleges Törlés Tiltása (`Lépés 113` — `CloudBackupDialog.kt`):**
+  - Külön ablak helyett a `CloudBackupDialog` `cloud_trash_open_button` gombja helyben lenyíló `AnimatedVisibility` panelt (`cloud_trash_dropdown_panel`) nyit meg, benne a közös `CloudTrashSelectableList` komponenssel (`cloud_trash_checkbox_*`, `"Összes kijelölése"`, `"Kijelöltek helyreállítása (N)"`, hátralévő nap kijelzés). Kézi végleges törlés gomb szándékosan nincs: a tételek 7 napig védve maradnak, utána automatikusan törlődnek.
+  - Megnyitáskor függő `TYPE_NOTEBOOK` tombstone esetén automatikus elő-szinkron fut, így a frissen törölt jegyzetek azonnal listázódnak.
+- **Főoldali „Kuka” Menüpont (`Lépés 114` — `BookshelfScreen.kt`):**
+  - A bal oldalsávban közvetlenül a `Könyvjelzők` alatt megjelent a `Kuka` (`ShelfSidebarSelection.Trash`, `sidebar_trash_item`), amely a különálló `BookshelfTrashPane` (`bookshelf_trash_view`) nézetben listázza a 7 napos lomtárat (hátralévő napokkal, checkboxos visszaállítással, frissítéssel, végleges törlés nélkül).
+- **Jobb Alsó Lapozó Eltávolítása & Töltőtoll Gyorsméretek (`Lépés 115–116` — `BookshelfScreen.kt`, `BrushSettingsPopover.kt`, `FloatingToolDock.kt`):**
+  - Eltávolítottuk a nyitott jegyzet jobb alsó sarkából az oldalszámlálót, léptető nyilakat és `+` gombot (a bal oldali `LeftPagePullTab` + `LeftPageDrawerOverlay` megmaradt).
+  - A töltőtoll gyorsméretei `listOf(0.5f, 0.75f, 1.0f, 2.0f, 4.0f)` értékre módosultak (`8 pt` kikerült), pontos `formatBrushSizePt` megjelenítéssel a dokkon és az ecsetpalettán, valamint `< 0.1f` kijelölési toleranciával.
+  - A `NotebookPagePane` végén lévő állapotmezők (`LassoPreviewTransformState`) és `LiveMathSuggestionOverlay` kiemelésével véglegesen megszüntettük az Android 17 ART `VerifyError` hibát.
+- **XVI. Ütem Verifikáció (`Lépés 117` — `25097RP43G - 17` Xiaomi Pad 8, Android 17):**
+  - `.\gradlew testDebugUnitTest --no-daemon`: **156/156** JVM unit teszt sikeres **30** tesztosztályban (`0` hiba, `0` errors, `0` kihagyás — benne a `formatBrushSizePtPreservesQuarterPointAndDropsTrailingZeroes` teszttel).
+  - `.\gradlew :app:connectedDebugAndroidTest --no-daemon`: **47/47** műszerezett teszt sikeres (`25097RP43G - 17`, `0` hiba, `0` errors, `0` kihagyás).
+  - `.\gradlew :app:installDebug --no-daemon` + hidegindítás (`25097RP43G - 17`): `LaunchState: COLD`, `Status: ok`, `TotalTime: 746 ms`, `WaitTime: 750 ms`, üres crash `logcat`.

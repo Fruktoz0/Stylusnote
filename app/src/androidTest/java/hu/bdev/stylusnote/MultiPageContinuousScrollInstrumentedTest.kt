@@ -307,31 +307,37 @@ class MultiPageContinuousScrollInstrumentedTest {
             composeRule.waitUntil(timeoutMillis = 5_000L) {
                 findAllInProgressViews(rootHostView).size == 1
             }
-            composeRule.onNodeWithText("1 / 9").assertIsDisplayed()
+            composeRule.onNodeWithText("1/9").assertIsDisplayed()
+            composeRule.onNodeWithContentDescription("Új oldal hozzáadása").assertDoesNotExist()
+            composeRule.onNodeWithContentDescription("Következő oldal").assertDoesNotExist()
             val initialWetView = findAllInProgressViews(rootHostView).single()
             assertNotNull(initialWetView)
 
-            // Step to page 2 via bottom-end stepper -> same AndroidView instance
-            composeRule.onNodeWithContentDescription("Következő oldal").performClick()
-            composeRule.onNodeWithText("2 / 9").assertIsDisplayed()
+            // Open left drawer via pull tab -> step to page 2 -> same AndroidView instance
+            composeRule.onNodeWithContentDescription("Oldalak panel megnyitása").performClick()
+            composeRule.onNodeWithText("Oldalak (9)").assertIsDisplayed()
+            composeRule.onNodeWithTag("left_page_drawer_list", useUnmergedTree = true)
+                .performScrollToNode(hasText("2. oldal"))
+            composeRule.onNodeWithText("2. oldal").performClick()
+            composeRule.onNodeWithText("2/9").assertIsDisplayed()
             val wetViewAfterStep2 = findAllInProgressViews(rootHostView).single()
             assertSame("Page 1->2 must keep the exact same AndroidView", initialWetView, wetViewAfterStep2)
 
-            // Open drawer and jump directly to page 5 -> same AndroidView instance
-            composeRule.onNodeWithText("2 / 9").performClick()
-            composeRule.onNodeWithText("Oldalak (9)").assertIsDisplayed()
+            // Jump to page 5 via left drawer -> same AndroidView instance
+            composeRule.onNodeWithContentDescription("Oldalak panel megnyitása").performClick()
             composeRule.onNodeWithTag("left_page_drawer_list", useUnmergedTree = true)
                 .performScrollToNode(hasText("5. oldal"))
             composeRule.onNodeWithText("5. oldal").performClick()
-            composeRule.onNodeWithText("5 / 9").assertIsDisplayed()
+            composeRule.onNodeWithText("5/9").assertIsDisplayed()
             val wetViewAfterJump5 = findAllInProgressViews(rootHostView).single()
             assertSame("Jump to page 5 must keep the exact same AndroidView", initialWetView, wetViewAfterJump5)
 
-            // Step sequentially all the way to page 9 -> same AndroidView instance
-            repeat(4) {
-                composeRule.onNodeWithContentDescription("Következő oldal").performClick()
-            }
-            composeRule.onNodeWithText("9 / 9").assertIsDisplayed()
+            // Jump all the way to page 9 via left drawer -> same AndroidView instance
+            composeRule.onNodeWithContentDescription("Oldalak panel megnyitása").performClick()
+            composeRule.onNodeWithTag("left_page_drawer_list", useUnmergedTree = true)
+                .performScrollToNode(hasText("9. oldal"))
+            composeRule.onNodeWithText("9. oldal").performClick()
+            composeRule.onNodeWithText("9/9").assertIsDisplayed()
             val wetViewAfterPage9 = findAllInProgressViews(rootHostView).single()
             assertSame("Reaching page 9 must keep the exact same AndroidView", initialWetView, wetViewAfterPage9)
         } finally {

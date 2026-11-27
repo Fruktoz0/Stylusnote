@@ -47,6 +47,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
@@ -64,6 +65,7 @@ import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ExpandMore
@@ -77,6 +79,7 @@ import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.ShowChart
@@ -260,6 +263,7 @@ import hu.bdev.stylusnote.ui.components.AiCopilotSheet
 import hu.bdev.stylusnote.ui.components.AiFormattingMode
 import hu.bdev.stylusnote.ui.components.BrushPresetStore
 import hu.bdev.stylusnote.ui.components.BrushSettingsPopover
+import hu.bdev.stylusnote.ui.components.formatBrushSizePt
 import hu.bdev.stylusnote.ui.components.ConsentDialog
 import hu.bdev.stylusnote.ui.components.FloatingToolDock
 import hu.bdev.stylusnote.ui.components.InNotebookSearchToolbarSection
@@ -347,6 +351,7 @@ private sealed interface ShelfSidebarSelection {
     data object All : ShelfSidebarSelection
     data object Uncategorized : ShelfSidebarSelection
     data object Bookmarks : ShelfSidebarSelection
+    data object Trash : ShelfSidebarSelection
     data class Category(val folderId: String) : ShelfSidebarSelection
 }
 
@@ -401,6 +406,8 @@ fun BookshelfScreen(
     var drivePickerTargetFolder by remember { mutableStateOf<FolderEntity?>(null) }
     var deleteConfirmFolder by remember { mutableStateOf<FolderEntity?>(null) }
     var shelfNoticeHu by remember { mutableStateOf<String?>(null) }
+    var trashItemCount by remember { mutableStateOf<Int?>(null) }
+    var trashRefreshTick by remember { mutableIntStateOf(0) }
     val cloudPrefsStore = remember(context) { CloudSyncPreferencesStore(context.applicationContext) }
     val cloudSettings by cloudPrefsStore.settingsFlow.collectAsState(initial = CloudSyncSettings())
 
@@ -484,6 +491,7 @@ fun BookshelfScreen(
                 ShelfSidebarSelection.All -> allNotebooks
                 ShelfSidebarSelection.Uncategorized -> allNotebooks.filter { it.folderId == null }
                 ShelfSidebarSelection.Bookmarks -> allNotebooks
+                ShelfSidebarSelection.Trash -> emptyList()
                 is ShelfSidebarSelection.Category -> allNotebooks.filter { it.folderId == sel.folderId }
             }
         }
@@ -498,6 +506,7 @@ fun BookshelfScreen(
         ShelfSidebarSelection.All -> "Minden jegyzet"
         ShelfSidebarSelection.Uncategorized -> "Kategorizálatlan"
         ShelfSidebarSelection.Bookmarks -> "Könyvjelzők"
+        ShelfSidebarSelection.Trash -> "Kuka"
         is ShelfSidebarSelection.Category -> folderById[sel.folderId]?.name ?: "Kategória"
     }
 
@@ -716,6 +725,19 @@ fun BookshelfScreen(
                     onClick = { sidebarSelection = ShelfSidebarSelection.Bookmarks }
                 )
 
+                SidebarNavItem(
+                    label = "Kuka",
+                    icon = Icons.Filled.DeleteOutline,
+                    count = trashItemCount,
+                    selected = sidebarSelection == ShelfSidebarSelection.Trash,
+                    isDropHovered = false,
+                    onClick = {
+                        sidebarSelection = ShelfSidebarSelection.Trash
+                        trashRefreshTick++
+                    },
+                    modifier = Modifier.testTag("sidebar_trash_item")
+                )
+
                 HorizontalDivider(
                     color = MaterialTheme.colorScheme.outlineVariant,
                     modifier = Modifier.padding(vertical = 4.dp)
@@ -827,10 +849,13 @@ fun BookshelfScreen(
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onBackground
                         )
-                        val countLabel = if (sidebarSelection == ShelfSidebarSelection.Bookmarks && searchQuery.isBlank()) {
-                            "${allBookmarks.size} könyvjelző"
-                        } else {
-                            "${visibleNotebooks.size} elem"
+                        val countLabel = when {
+                            sidebarSelection == ShelfSidebarSelection.Bookmarks && searchQuery.isBlank() ->
+                                "${allBookmarks.size} könyvjelző"
+                            sidebarSelection == ShelfSidebarSelection.Trash && searchQuery.isBlank() ->
+                                trashItemCount?.let { "$it jegyzet a 7 napos lomtárban" } ?: "7 napos lomtár"
+                            else ->
+                                "${visibleNotebooks.size} elem"
                         }
                         Text(
                             text = countLabel,
@@ -843,63 +868,80 @@ fun BookshelfScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        // StarNote-style Segmented Pill Tabs: MIND | JEGYZET | PDF
-                        Surface(
-                            shape = RoundedCornerShape(12.dp),
-                            color = surfacePalette.groupedCardBackground
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(4.dp),
-                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        if (sidebarSelection == ShelfSidebarSelection.Trash && searchQuery.isBlank()) {
+                            FilledTonalButton(
+                                onClick = { trashRefreshTick++ },
+                                shape = RoundedCornerShape(12.dp),
+                                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 0.dp),
+                                modifier = Modifier.height(40.dp)
                             ) {
-                                ShelfTypeFilter.entries.forEach { filter ->
-                                    val selected = typeFilter == filter
-                                    Surface(
-                                        onClick = { typeFilter = filter },
-                                        shape = RoundedCornerShape(9.dp),
-                                        color = if (selected) {
-                                            MaterialTheme.colorScheme.surface
-                                        } else {
-                                            Color.Transparent
-                                        },
-                                        shadowElevation = if (selected) 2.dp else 0.dp
-                                    ) {
-                                        Text(
-                                            text = filter.label,
-                                            style = MaterialTheme.typography.labelLarge,
-                                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                                Icon(
+                                    imageVector = Icons.Filled.Refresh,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Frissítés", maxLines = 1, softWrap = false)
+                            }
+                        } else {
+                            // StarNote-style Segmented Pill Tabs: MIND | JEGYZET | PDF
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = surfacePalette.groupedCardBackground
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(4.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    ShelfTypeFilter.entries.forEach { filter ->
+                                        val selected = typeFilter == filter
+                                        Surface(
+                                            onClick = { typeFilter = filter },
+                                            shape = RoundedCornerShape(9.dp),
                                             color = if (selected) {
-                                                MaterialTheme.colorScheme.primary
+                                                MaterialTheme.colorScheme.surface
                                             } else {
-                                                MaterialTheme.colorScheme.onSurfaceVariant
+                                                Color.Transparent
                                             },
-                                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 7.dp)
-                                        )
+                                            shadowElevation = if (selected) 2.dp else 0.dp
+                                        ) {
+                                            Text(
+                                                text = filter.label,
+                                                style = MaterialTheme.typography.labelLarge,
+                                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                                                color = if (selected) {
+                                                    MaterialTheme.colorScheme.primary
+                                                } else {
+                                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                                },
+                                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 7.dp)
+                                            )
+                                        }
                                     }
                                 }
                             }
-                        }
 
-                        FilledTonalButton(
-                            onClick = {
-                                pdfImportTargetNotebook = null
-                                showPdfImportDialog = true
-                            },
-                            shape = RoundedCornerShape(12.dp),
-                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 0.dp),
-                            modifier = Modifier.height(40.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Filled.PictureAsPdf,
-                                contentDescription = null,
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = "PDF import",
-                                maxLines = 1,
-                                softWrap = false
-                            )
+                            FilledTonalButton(
+                                onClick = {
+                                    pdfImportTargetNotebook = null
+                                    showPdfImportDialog = true
+                                },
+                                shape = RoundedCornerShape(12.dp),
+                                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 0.dp),
+                                modifier = Modifier.height(40.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.PictureAsPdf,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "PDF import",
+                                    maxLines = 1,
+                                    softWrap = false
+                                )
+                            }
                         }
                     }
                 }
@@ -980,7 +1022,24 @@ fun BookshelfScreen(
                     }
                 }
 
-                if (sidebarSelection == ShelfSidebarSelection.Bookmarks && searchQuery.isBlank()) {
+                if (sidebarSelection == ShelfSidebarSelection.Trash && searchQuery.isBlank()) {
+                    BookshelfTrashPane(
+                        database = database,
+                        settings = cloudSettings,
+                        prefsStore = cloudPrefsStore,
+                        refreshTrigger = trashRefreshTick,
+                        onOpenCloudSettings = { showCloudBackupDialog = true },
+                        onEntriesLoaded = { loadedCount -> trashItemCount = loadedCount },
+                        onRestoredNotebooks = { titles ->
+                            shelfNoticeHu = if (titles.size == 1) {
+                                "\"${titles.first()}\" helyreállítva a kukából."
+                            } else {
+                                "${titles.size} jegyzet helyreállítva a kukából."
+                            }
+                            trashRefreshTick++
+                        }
+                    )
+                } else if (sidebarSelection == ShelfSidebarSelection.Bookmarks && searchQuery.isBlank()) {
                     if (allBookmarks.isEmpty()) {
                         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                             Text(
@@ -1695,7 +1754,7 @@ private val FOLDER_PALETTE = listOf(
 private fun SidebarNavItem(
     label: String,
     icon: ImageVector,
-    count: Int,
+    count: Int?,
     selected: Boolean,
     isDropHovered: Boolean,
     onClick: () -> Unit,
@@ -1747,11 +1806,13 @@ private fun SidebarNavItem(
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f)
             )
-            Text(
-                text = count.toString(),
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+            if (count != null) {
+                Text(
+                    text = count.toString(),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
             if (onConfigureDriveFolder != null) {
                 IconButton(
                     onClick = onConfigureDriveFolder,
@@ -1791,6 +1852,52 @@ private fun SidebarNavItem(
                 }
             }
         }
+    }
+}
+
+/**
+ * Bookshelf right-pane view for the "Kuka" (7-day cloud trash) navigation item.
+ * Keeps trash recovery UI cleanly separated and disallows manual permanent deletion.
+ */
+@Composable
+private fun BookshelfTrashPane(
+    database: AppDatabase,
+    settings: CloudSyncSettings,
+    prefsStore: CloudSyncPreferencesStore,
+    refreshTrigger: Int,
+    onOpenCloudSettings: () -> Unit,
+    onEntriesLoaded: (Int) -> Unit,
+    onRestoredNotebooks: (List<String>) -> Unit
+) {
+    val surfacePalette = LocalStylusSurfacePalette.current
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .testTag("bookshelf_trash_view"),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Surface(
+            shape = RoundedCornerShape(14.dp),
+            color = surfacePalette.groupedCardBackground,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(
+                text = "A törölt jegyzetek 7 napig megmaradnak a felhőben, utána automatikusan végleg törlődnek. Kézi végleges törlés nem lehetséges.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+            )
+        }
+        CloudTrashSelectableList(
+            database = database,
+            settings = settings,
+            prefsStore = prefsStore,
+            refreshTrigger = refreshTrigger,
+            onOpenCloudSettings = onOpenCloudSettings,
+            onEntriesLoaded = onEntriesLoaded,
+            onRestoredNotebooks = onRestoredNotebooks
+        )
     }
 }
 
@@ -2658,7 +2765,7 @@ fun NotebookWorkspaceScreen(
                     ))
                 },
                 onCyclePenSizeFromPie = {
-                    val sizes = listOf(0.5f, 1.0f, 2.0f, 4.0f, 8.0f)
+                    val sizes = listOf(0.5f, 0.75f, 1.0f, 2.0f, 4.0f)
                     if (!brushConfig.toolType.isDrawingBrush) {
                         selectTool(lastDrawingTool)
                     }
@@ -2670,7 +2777,7 @@ fun NotebookWorkspaceScreen(
                     }
                     val nextSize = sizes.firstOrNull { it > targetCfg.clampedSizePt + 0.1f } ?: sizes.first()
                     updateActiveBrushConfig(targetCfg.copy(sizePt = nextSize))
-                    workspaceBannerHu = "Vastagság: ${nextSize} pt"
+                    workspaceBannerHu = "Vastagság: ${formatBrushSizePt(nextSize)} pt"
                 },
                 onUpdatePieMenuTriggerMode = { mode ->
                     workspaceScope.launch { toolDockPrefsStore.savePieMenuTriggerMode(mode) }
@@ -2771,6 +2878,226 @@ private data class LiveMathOverlayState(
     val suggestion: LiveMathSuggestion,
     val colorArgb: Int
 )
+
+private data class LassoPreviewTransformState(
+    val pageId: String? = null,
+    val objectIds: Set<String> = emptySet(),
+    val deltaXPt: Float = 0f,
+    val deltaYPt: Float = 0f,
+    val rotationRad: Float = 0f,
+    val rotationCenter: DocPoint? = null
+)
+
+@Composable
+private fun LiveMathSuggestionOverlay(
+    banner: LiveMathOverlayState,
+    continuousLayout: ContinuousPageLayout?,
+    transformMatrix: CanvasTransformMatrix,
+    viewportSize: IntSize,
+    brushConfig: BrushConfig,
+    geminiClient: GeminiClient,
+    context: android.content.Context,
+    coroutineScope: CoroutineScope,
+    resolveBindingForPage: (String) -> ActivePageBinding?,
+    onPlotFunctionFromLatex: (ActivePageBinding, PageObject.LatexObject) -> Unit,
+    onMutatedPage: (pageId: String, selectObjId: String?) -> Unit,
+    onNotice: (String?) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val slot = continuousLayout?.slotForPageId(banner.pageId)
+    val eqRightDocX = (slot?.leftPt ?: 0f) + banner.triggerContext.equalsBounds.rightPt + 10f
+    val eqTopDocY = (slot?.topPt ?: 0f) + banner.triggerContext.equalsBounds.topPt - 8f
+    val anchorScreen = transformMatrix.docToScreen(eqRightDocX, eqTopDocY)
+    val maxXPx = (viewportSize.width - 240).coerceAtLeast(12)
+    val maxYPx = (viewportSize.height - 80).coerceAtLeast(12)
+    val pillX = anchorScreen.xPx.roundToInt().coerceIn(12, maxXPx)
+    val pillY = anchorScreen.yPx.roundToInt().coerceIn(12, maxYPx)
+
+    Surface(
+        modifier = Modifier
+            .offset { IntOffset(pillX, pillY) }
+            .testTag("live_math_suggestion_pill"),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.88f),
+        tonalElevation = 4.dp,
+        shadowElevation = 4.dp,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            when (val sug = banner.suggestion) {
+                is LiveMathSuggestion.NumericResult -> {
+                    Text(
+                        text = "= ${sug.formattedResult}",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.86f)
+                    )
+                    Surface(
+                        onClick = {
+                            val b = resolveBindingForPage(banner.pageId)
+                            if (b != null && !b.isReadOnly) {
+                                val eqBounds = banner.triggerContext.equalsBounds
+                                val resWidth = maxOf(44f, sug.formattedResult.length * 14f)
+                                val resHeight = maxOf(24f, eqBounds.heightPt * 1.4f)
+                                val cy = eqBounds.centerYPt
+                                val latexObj = PageObject.LatexObject(
+                                    id = UUID.randomUUID().toString(),
+                                    zOrder = b.canvasStateHolder.allocateObjectZOrder(),
+                                    bounds = DocRect(
+                                        leftPt = eqBounds.rightPt + 8f,
+                                        topPt = cy - resHeight * 0.5f,
+                                        rightPt = eqBounds.rightPt + 8f + resWidth,
+                                        bottomPt = cy + resHeight * 0.5f
+                                    ),
+                                    latexSource = sug.formattedResult,
+                                    fontSizePt = 18f,
+                                    canonicalColorArgb = banner.colorArgb
+                                )
+                                b.canvasStateHolder.addPageObject(latexObj)
+                                coroutineScope.launch { b.strokeJournal.appendAddObject(latexObj) }
+                                onMutatedPage(b.pageId, null)
+                            }
+                            onDismiss()
+                        },
+                        shape = CircleShape,
+                        color = MaterialTheme.colorScheme.primary
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Check,
+                            contentDescription = "Eredmény beillesztése",
+                            tint = MaterialTheme.colorScheme.onPrimary,
+                            modifier = Modifier
+                                .padding(4.dp)
+                                .size(14.dp)
+                        )
+                    }
+                }
+                is LiveMathSuggestion.FunctionPlotOffer -> {
+                    Text(
+                        text = "y = ${sug.plotExpression}",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.86f)
+                    )
+                    Surface(
+                        onClick = {
+                            val b = resolveBindingForPage(banner.pageId)
+                            if (b != null && !b.isReadOnly) {
+                                val eb = banner.triggerContext.expressionBounds
+                                val plotObj = PageObject.FunctionPlotObject(
+                                    id = UUID.randomUUID().toString(),
+                                    zOrder = b.canvasStateHolder.allocateObjectZOrder(),
+                                    bounds = DocRect(
+                                        leftPt = eb.leftPt.coerceAtLeast(16f),
+                                        topPt = eb.bottomPt + 12f,
+                                        rightPt = eb.leftPt.coerceAtLeast(16f) + 220f,
+                                        bottomPt = eb.bottomPt + 160f
+                                    ),
+                                    expression = sug.plotExpression,
+                                    canonicalColorArgb = banner.colorArgb
+                                )
+                                b.canvasStateHolder.addPageObject(plotObj)
+                                coroutineScope.launch { b.strokeJournal.appendAddObject(plotObj) }
+                                onMutatedPage(b.pageId, plotObj.id)
+                            }
+                            onDismiss()
+                        },
+                        shape = RoundedCornerShape(10.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(3.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.ShowChart,
+                                contentDescription = null,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Text("Grafikon", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+                is LiveMathSuggestion.OfferAiSolve -> {
+                    Surface(
+                        onClick = {
+                            val b = resolveBindingForPage(banner.pageId)
+                            onDismiss()
+                            if (b != null && !b.isReadOnly) {
+                                val targetIds = banner.triggerContext.expressionStrokeIds +
+                                    banner.triggerContext.equalsStrokeIds
+                                coroutineScope.launch {
+                                    val recs = targetIds.distinct().mapNotNull { id ->
+                                        b.canvasStateHolder.getStroke(id)?.let { entry ->
+                                            StrokeBinarySerializer.fromIndexedDryStroke(
+                                                entry = entry,
+                                                brushConfig = brushConfig.copy(colorArgb = entry.stroke.brush.colorIntArgb),
+                                                shapeMeta = b.canvasStateHolder.getShapeMeta(id)
+                                            )
+                                        }
+                                    }
+                                    if (recs.isNotEmpty()) {
+                                        onNotice("AI megoldás folyamatban...")
+                                        when (
+                                            val conv = HandwritingToLatexConverter.convertLassoToLatex(
+                                                selectedStrokes = recs,
+                                                geminiClient = geminiClient,
+                                                canvasStateHolder = b.canvasStateHolder,
+                                                context = context,
+                                                journalSink = b.strokeJournal
+                                            )
+                                        ) {
+                                            is LatexConversionResult.Success -> {
+                                                onMutatedPage(b.pageId, conv.latexObject.id)
+                                                HandwritingToLatexConverter.generateStepByStepDerivationCard(
+                                                    latexObject = conv.latexObject,
+                                                    geminiClient = geminiClient,
+                                                    canvasStateHolder = b.canvasStateHolder,
+                                                    journalSink = b.strokeJournal
+                                                )
+                                                onMutatedPage(b.pageId, conv.latexObject.id)
+                                                onNotice(null)
+                                            }
+                                            is LatexConversionResult.InvalidLatexError -> {
+                                                onNotice(conv.messageHu)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        shape = RoundedCornerShape(10.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(14.dp))
+                            Text("AI megoldás", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+            IconButton(
+                onClick = onDismiss,
+                modifier = Modifier.size(22.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Close,
+                    contentDescription = "Elvetés",
+                    modifier = Modifier.size(14.dp)
+                )
+            }
+        }
+    }
+}
 
 @Composable
 private fun NotebookPagePane(
@@ -4031,12 +4358,7 @@ private fun NotebookPagePane(
     val currentIdxOneBased = if (activePageIdx >= 0) activePageIdx + 1 else pageNumber
     val totalPageCount = notebookPages.size.coerceAtLeast(currentIdxOneBased)
 
-    var lassoPreviewPageId by remember(sessionKey) { mutableStateOf<String?>(null) }
-    var lassoPreviewObjectIds by remember(sessionKey) { mutableStateOf<Set<String>>(emptySet()) }
-    var lassoPreviewDeltaXPt by remember(sessionKey) { mutableFloatStateOf(0f) }
-    var lassoPreviewDeltaYPt by remember(sessionKey) { mutableFloatStateOf(0f) }
-    var lassoPreviewRotationRad by remember(sessionKey) { mutableFloatStateOf(0f) }
-    var lassoPreviewRotationCenter by remember(sessionKey) { mutableStateOf<DocPoint?>(null) }
+    var lassoPreview by remember(sessionKey) { mutableStateOf(LassoPreviewTransformState()) }
 
     val fallbackJournalForSingleSurface = strokeJournal ?: remember(sessionKey) {
         StrokeJournal(pageDirectory = File(context.filesDir, "pages/${target.pageId}"))
@@ -4193,12 +4515,14 @@ private fun NotebookPagePane(
                 selectedObjectPageId = target.pageId
             },
             onLassoObjectPreviewChanged = { ids, dx, dy, rot, center ->
-                lassoPreviewPageId = target.pageId
-                lassoPreviewObjectIds = ids
-                lassoPreviewDeltaXPt = dx
-                lassoPreviewDeltaYPt = dy
-                lassoPreviewRotationRad = rot
-                lassoPreviewRotationCenter = center
+                lassoPreview = LassoPreviewTransformState(
+                    pageId = target.pageId,
+                    objectIds = ids,
+                    deltaXPt = dx,
+                    deltaYPt = dy,
+                    rotationRad = rot,
+                    rotationCenter = center
+                )
             },
             multiPageSessionManager = continuousSessionManager,
             multiPageLayout = continuousLayout,
@@ -4322,12 +4646,14 @@ private fun NotebookPagePane(
                 }
             },
             onLassoObjectPreviewChangedInPage = { pageId, ids, dx, dy, rot, center ->
-                lassoPreviewPageId = pageId
-                lassoPreviewObjectIds = ids
-                lassoPreviewDeltaXPt = dx
-                lassoPreviewDeltaYPt = dy
-                lassoPreviewRotationRad = rot
-                lassoPreviewRotationCenter = center
+                lassoPreview = LassoPreviewTransformState(
+                    pageId = pageId,
+                    objectIds = ids,
+                    deltaXPt = dx,
+                    deltaYPt = dy,
+                    rotationRad = rot,
+                    rotationCenter = center
+                )
             },
             isCodeBlockPlaceMode = isCodeBlockPlaceMode,
             clozeTapePattern = clozeTapePattern,
@@ -4617,15 +4943,15 @@ private fun NotebookPagePane(
                             historyRevisionTick++
                         },
                         liveObjectInteractionController = liveObjectController,
-                        lassoPreviewObjectIds = if (lassoPreviewPageId == slot.pageId) {
-                            lassoPreviewObjectIds
+                        lassoPreviewObjectIds = if (lassoPreview.pageId == slot.pageId) {
+                            lassoPreview.objectIds
                         } else {
                             emptySet()
                         },
-                        lassoPreviewDeltaXPt = lassoPreviewDeltaXPt,
-                        lassoPreviewDeltaYPt = lassoPreviewDeltaYPt,
-                        lassoPreviewRotationRadians = lassoPreviewRotationRad,
-                        lassoPreviewRotationCenter = lassoPreviewRotationCenter,
+                        lassoPreviewDeltaXPt = lassoPreview.deltaXPt,
+                        lassoPreviewDeltaYPt = lassoPreview.deltaYPt,
+                        lassoPreviewRotationRadians = lassoPreview.rotationRad,
+                        lassoPreviewRotationCenter = lassoPreview.rotationCenter,
                         viewportTransformTick = viewportTransformTick,
                         revealedClozeTapeIds = revealedClozeTapeIds,
                         onToggleRevealClozeTape = { tapeId ->
@@ -4672,11 +4998,11 @@ private fun NotebookPagePane(
                         historyRevisionTick++
                     },
                     liveObjectInteractionController = liveObjectController,
-                    lassoPreviewObjectIds = lassoPreviewObjectIds,
-                    lassoPreviewDeltaXPt = lassoPreviewDeltaXPt,
-                    lassoPreviewDeltaYPt = lassoPreviewDeltaYPt,
-                    lassoPreviewRotationRadians = lassoPreviewRotationRad,
-                    lassoPreviewRotationCenter = lassoPreviewRotationCenter,
+                    lassoPreviewObjectIds = lassoPreview.objectIds,
+                    lassoPreviewDeltaXPt = lassoPreview.deltaXPt,
+                    lassoPreviewDeltaYPt = lassoPreview.deltaYPt,
+                    lassoPreviewRotationRadians = lassoPreview.rotationRad,
+                    lassoPreviewRotationCenter = lassoPreview.rotationCenter,
                     viewportTransformTick = viewportTransformTick,
                     revealedClozeTapeIds = revealedClozeTapeIds,
                     onToggleRevealClozeTape = { tapeId ->
@@ -4820,88 +5146,6 @@ private fun NotebookPagePane(
                     .align(Alignment.TopStart)
                     .padding(start = 0.dp)
             )
-
-            if (!isFullScreenCanvas) {
-                Surface(
-                    modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        .safeDrawingPadding()
-                        .padding(end = 14.dp, bottom = 12.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f),
-                    tonalElevation = 4.dp,
-                    shadowElevation = 4.dp,
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(2.dp)
-                    ) {
-                        IconButton(
-                            onClick = {
-                                if (activePageIdx > 0) {
-                                    switchToPage(notebookPages[activePageIdx - 1].id)
-                                }
-                            },
-                            enabled = activePageIdx > 0,
-                            modifier = Modifier.size(30.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.KeyboardArrowLeft,
-                                contentDescription = "Előző oldal",
-                                modifier = Modifier.size(18.dp)
-                            )
-                        }
-                        val activePageEntity = notebookPages.firstOrNull { it.id == target.pageId }
-                            ?: currentPageEntity
-                        val customPageTitle = activePageEntity?.title?.trim()?.takeIf { it.isNotEmpty() }
-                        val stepperLabel = if (customPageTitle != null) {
-                            "$customPageTitle • $currentIdxOneBased/$totalPageCount"
-                        } else {
-                            "$currentIdxOneBased / $totalPageCount"
-                        }
-                        Text(
-                            text = stepperLabel,
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier
-                                .clickable { onShowLeftPageDrawerChange(true) }
-                                .widthIn(max = 180.dp)
-                                .padding(horizontal = 6.dp, vertical = 4.dp)
-                        )
-                        IconButton(
-                            onClick = {
-                                if (activePageIdx >= 0 && activePageIdx + 1 < notebookPages.size) {
-                                    switchToPage(notebookPages[activePageIdx + 1].id)
-                                }
-                            },
-                            enabled = activePageIdx >= 0 && activePageIdx + 1 < notebookPages.size,
-                            modifier = Modifier.size(30.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                                contentDescription = "Következő oldal",
-                                modifier = Modifier.size(18.dp)
-                            )
-                        }
-                        IconButton(
-                            onClick = { createAndOpenNextPage() },
-                            enabled = !isCreatingPage,
-                            modifier = Modifier.size(30.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Filled.Add,
-                                contentDescription = "Új oldal hozzáadása",
-                                tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(18.dp)
-                            )
-                        }
-                    }
-                }
-            }
         }
 
         copilotNoticeBannerHu?.let { notice ->
@@ -5035,213 +5279,31 @@ private fun NotebookPagePane(
 
         activeLiveMathBanner?.let { banner ->
             viewportTransformTick
-            val slot = continuousLayout?.slotForPageId(banner.pageId)
-            val eqRightDocX = (slot?.leftPt ?: 0f) + banner.triggerContext.equalsBounds.rightPt + 10f
-            val eqTopDocY = (slot?.topPt ?: 0f) + banner.triggerContext.equalsBounds.topPt - 8f
-            val anchorScreen = transformMatrix.docToScreen(eqRightDocX, eqTopDocY)
-            val maxXPx = (viewportSize.width - 240).coerceAtLeast(12)
-            val maxYPx = (viewportSize.height - 80).coerceAtLeast(12)
-            val pillX = anchorScreen.xPx.roundToInt().coerceIn(12, maxXPx)
-            val pillY = anchorScreen.yPx.roundToInt().coerceIn(12, maxYPx)
-
-            Surface(
-                modifier = Modifier
-                    .offset { IntOffset(pillX, pillY) }
-                    .testTag("live_math_suggestion_pill"),
-                shape = RoundedCornerShape(16.dp),
-                color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.88f),
-                tonalElevation = 4.dp,
-                shadowElevation = 4.dp,
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    when (val sug = banner.suggestion) {
-                        is LiveMathSuggestion.NumericResult -> {
-                            Text(
-                                text = "= ${sug.formattedResult}",
-                                style = MaterialTheme.typography.labelLarge,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.86f)
-                            )
-                            Surface(
-                                onClick = {
-                                    val b = resolveBindingForPage(banner.pageId)
-                                    if (b != null && !b.isReadOnly) {
-                                        val eqBounds = banner.triggerContext.equalsBounds
-                                        val resWidth = maxOf(44f, sug.formattedResult.length * 14f)
-                                        val resHeight = maxOf(24f, eqBounds.heightPt * 1.4f)
-                                        val cy = eqBounds.centerYPt
-                                        val latexObj = PageObject.LatexObject(
-                                            id = UUID.randomUUID().toString(),
-                                            zOrder = b.canvasStateHolder.allocateObjectZOrder(),
-                                            bounds = DocRect(
-                                                leftPt = eqBounds.rightPt + 8f,
-                                                topPt = cy - resHeight * 0.5f,
-                                                rightPt = eqBounds.rightPt + 8f + resWidth,
-                                                bottomPt = cy + resHeight * 0.5f
-                                            ),
-                                            latexSource = sug.formattedResult,
-                                            fontSizePt = 18f,
-                                            canonicalColorArgb = banner.colorArgb
-                                        )
-                                        b.canvasStateHolder.addPageObject(latexObj)
-                                        coroutineScope.launch { b.strokeJournal.appendAddObject(latexObj) }
-                                        pageThumbnailRenderer.invalidatePage(b.pageId)
-                                        dirtyContinuousPageIds.add(b.pageId)
-                                        externalDrawTick++
-                                        historyRevisionTick++
-                                        viewportTransformTick++
-                                    }
-                                    activeLiveMathBanner = null
-                                },
-                                shape = CircleShape,
-                                color = MaterialTheme.colorScheme.primary
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Check,
-                                    contentDescription = "Eredmény beillesztése",
-                                    tint = MaterialTheme.colorScheme.onPrimary,
-                                    modifier = Modifier
-                                        .padding(4.dp)
-                                        .size(14.dp)
-                                )
-                            }
-                        }
-                        is LiveMathSuggestion.FunctionPlotOffer -> {
-                            Text(
-                                text = "y = ${sug.plotExpression}",
-                                style = MaterialTheme.typography.labelMedium,
-                                fontWeight = FontWeight.SemiBold,
-                                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.86f)
-                            )
-                            Surface(
-                                onClick = {
-                                    val b = resolveBindingForPage(banner.pageId)
-                                    if (b != null && !b.isReadOnly) {
-                                        val eb = banner.triggerContext.expressionBounds
-                                        val plotObj = PageObject.FunctionPlotObject(
-                                            id = UUID.randomUUID().toString(),
-                                            zOrder = b.canvasStateHolder.allocateObjectZOrder(),
-                                            bounds = DocRect(
-                                                leftPt = eb.leftPt.coerceAtLeast(16f),
-                                                topPt = eb.bottomPt + 12f,
-                                                rightPt = eb.leftPt.coerceAtLeast(16f) + 220f,
-                                                bottomPt = eb.bottomPt + 160f
-                                            ),
-                                            expression = sug.plotExpression,
-                                            canonicalColorArgb = banner.colorArgb
-                                        )
-                                        b.canvasStateHolder.addPageObject(plotObj)
-                                        coroutineScope.launch { b.strokeJournal.appendAddObject(plotObj) }
-                                        pageThumbnailRenderer.invalidatePage(b.pageId)
-                                        dirtyContinuousPageIds.add(b.pageId)
-                                        selectedObjectId = plotObj.id
-                                        selectedObjectPageId = b.pageId
-                                        externalDrawTick++
-                                        historyRevisionTick++
-                                        viewportTransformTick++
-                                    }
-                                    activeLiveMathBanner = null
-                                },
-                                shape = RoundedCornerShape(10.dp),
-                                color = MaterialTheme.colorScheme.primaryContainer
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(3.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.ShowChart,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(14.dp)
-                                    )
-                                    Text("Grafikon", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
-                                }
-                            }
-                        }
-                        is LiveMathSuggestion.OfferAiSolve -> {
-                            Surface(
-                                onClick = {
-                                    val b = resolveBindingForPage(banner.pageId)
-                                    activeLiveMathBanner = null
-                                    if (b != null && !b.isReadOnly) {
-                                        val targetIds = banner.triggerContext.expressionStrokeIds +
-                                            banner.triggerContext.equalsStrokeIds
-                                        coroutineScope.launch {
-                                            val recs = targetIds.distinct().mapNotNull { id ->
-                                                b.canvasStateHolder.getStroke(id)?.let { entry ->
-                                                    StrokeBinarySerializer.fromIndexedDryStroke(
-                                                        entry = entry,
-                                                        brushConfig = brushConfig.copy(colorArgb = entry.stroke.brush.colorIntArgb),
-                                                        shapeMeta = b.canvasStateHolder.getShapeMeta(id)
-                                                    )
-                                                }
-                                            }
-                                            if (recs.isNotEmpty()) {
-                                                copilotNoticeBannerHu = "AI megoldás folyamatban..."
-                                                when (
-                                                    val conv = HandwritingToLatexConverter.convertLassoToLatex(
-                                                        selectedStrokes = recs,
-                                                        geminiClient = geminiClient,
-                                                        canvasStateHolder = b.canvasStateHolder,
-                                                        context = context,
-                                                        journalSink = b.strokeJournal
-                                                    )
-                                                ) {
-                                                    is LatexConversionResult.Success -> {
-                                                        dirtyContinuousPageIds.add(b.pageId)
-                                                        selectedObjectId = conv.latexObject.id
-                                                        selectedObjectPageId = b.pageId
-                                                        historyRevisionTick++
-                                                        viewportTransformTick++
-                                                        HandwritingToLatexConverter.generateStepByStepDerivationCard(
-                                                            latexObject = conv.latexObject,
-                                                            geminiClient = geminiClient,
-                                                            canvasStateHolder = b.canvasStateHolder,
-                                                            journalSink = b.strokeJournal
-                                                        )
-                                                        historyRevisionTick++
-                                                        copilotNoticeBannerHu = null
-                                                    }
-                                                    is LatexConversionResult.InvalidLatexError -> {
-                                                        copilotNoticeBannerHu = conv.messageHu
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                },
-                                shape = RoundedCornerShape(10.dp),
-                                color = MaterialTheme.colorScheme.primaryContainer
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                                ) {
-                                    Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(14.dp))
-                                    Text("AI megoldás", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
-                                }
-                            }
-                        }
+            LiveMathSuggestionOverlay(
+                banner = banner,
+                continuousLayout = continuousLayout,
+                transformMatrix = transformMatrix,
+                viewportSize = viewportSize,
+                brushConfig = brushConfig,
+                geminiClient = geminiClient,
+                context = context,
+                coroutineScope = coroutineScope,
+                resolveBindingForPage = ::resolveBindingForPage,
+                onPlotFunctionFromLatex = ::plotFunctionFromLatexObject,
+                onMutatedPage = { mutPageId, selId ->
+                    pageThumbnailRenderer.invalidatePage(mutPageId)
+                    dirtyContinuousPageIds.add(mutPageId)
+                    if (selId != null) {
+                        selectedObjectId = selId
+                        selectedObjectPageId = mutPageId
                     }
-                    IconButton(
-                        onClick = { activeLiveMathBanner = null },
-                        modifier = Modifier.size(22.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Close,
-                            contentDescription = "Elvetés",
-                            modifier = Modifier.size(14.dp)
-                        )
-                    }
-                }
-            }
+                    externalDrawTick++
+                    historyRevisionTick++
+                    viewportTransformTick++
+                },
+                onNotice = { msg -> copilotNoticeBannerHu = msg },
+                onDismiss = { activeLiveMathBanner = null }
+            )
         }
 
         FloatingToolDock(

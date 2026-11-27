@@ -5,10 +5,12 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.longClick
-import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTouchInput
@@ -115,7 +117,8 @@ class CloudSyncUiAndDatabaseInstrumentedTest {
                 var open by remember { mutableStateOf(false) }
                 StylusNoteTheme {
                     CloudSyncStatusBadgeButton(
-                        onOpenSettingsDialog = { open = true }
+                        onOpenSettingsDialog = { open = true },
+                        modifier = Modifier.testTag("cloud_sync_badge_test")
                     )
                     if (open) {
                         CloudBackupDialog(
@@ -126,9 +129,7 @@ class CloudSyncUiAndDatabaseInstrumentedTest {
                 }
             }
 
-            composeRule.onNodeWithContentDescription(
-                "Felhőmentés nincs beállítva (hosszan: beállítások)"
-            ).performTouchInput { longClick() }
+            composeRule.onNodeWithTag("cloud_sync_badge_test").performTouchInput { longClick() }
 
             composeRule.onNodeWithText("Felhőszinkron és Biztonsági Mentés").assertIsDisplayed()
             composeRule.onNodeWithText("Okos automata").assertIsDisplayed()

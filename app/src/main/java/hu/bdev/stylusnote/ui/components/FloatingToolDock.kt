@@ -610,12 +610,7 @@ private fun ToolButtonsGroup(
                     text = if (brushConfig.toolType.isEraser) {
                         "${brushConfig.eraserRadiusDp.roundToInt()}dp"
                     } else {
-                        val sz = brushConfig.clampedSizePt
-                        if (kotlin.math.abs(sz - sz.roundToInt()) < 0.05f) {
-                            "${sz.roundToInt()}pt"
-                        } else {
-                            "${"%.1f".format(java.util.Locale.US, sz)}pt"
-                        }
+                        "${formatBrushSizePt(brushConfig.clampedSizePt)}pt"
                     },
                     style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.SemiBold,
@@ -639,7 +634,7 @@ private fun ToolButtonsGroup(
                     text = if (brushConfig.toolType.isEraser) {
                         "${brushConfig.eraserRadiusDp.roundToInt()} dp"
                     } else {
-                        "${"%.1f".format(brushConfig.clampedSizePt)} pt"
+                        "${formatBrushSizePt(brushConfig.clampedSizePt)} pt"
                     },
                     style = MaterialTheme.typography.labelMedium,
                     fontWeight = FontWeight.SemiBold,

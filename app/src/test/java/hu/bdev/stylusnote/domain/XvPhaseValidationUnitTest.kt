@@ -304,4 +304,13 @@ class XvPhaseValidationUnitTest {
         assertTrue(clampedBottomRight.x + 128f <= 1920f - 16f + 0.01f)
         assertTrue(clampedBottomRight.y + 128f <= 1200f - 16f + 0.01f)
     }
+
+    @Test
+    fun formatBrushSizePtPreservesQuarterPointAndDropsTrailingZeroes() {
+        assertEquals("0.5", hu.bdev.stylusnote.ui.components.formatBrushSizePt(0.5f))
+        assertEquals("0.75", hu.bdev.stylusnote.ui.components.formatBrushSizePt(0.75f))
+        assertEquals("1", hu.bdev.stylusnote.ui.components.formatBrushSizePt(1.0f))
+        assertEquals("2", hu.bdev.stylusnote.ui.components.formatBrushSizePt(2.0f))
+        assertEquals("4", hu.bdev.stylusnote.ui.components.formatBrushSizePt(4.0f))
+    }
 }

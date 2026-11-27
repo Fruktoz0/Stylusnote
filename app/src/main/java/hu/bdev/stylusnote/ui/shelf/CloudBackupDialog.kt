@@ -4,6 +4,7 @@ import android.app.Activity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -41,13 +42,17 @@ import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.CloudSync
 import androidx.compose.material.icons.filled.CloudUpload
-import androidx.compose.material.icons.filled.DeleteForever
+import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.FolderZip
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.RestoreFromTrash
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material.icons.outlined.Cloud
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -110,6 +115,7 @@ import hu.bdev.stylusnote.data.export.RemoteCloudSummary
 import hu.bdev.stylusnote.data.export.SyncExecutionMode
 import hu.bdev.stylusnote.data.export.TrashedNotebookRecord
 import hu.bdev.stylusnote.data.local.AppDatabase
+import hu.bdev.stylusnote.data.local.SyncTombstoneEntity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -273,7 +279,8 @@ fun CloudBackupDialog(
     var feedbackIsError by remember { mutableStateOf(false) }
     var discoveredRemoteBackup by remember { mutableStateOf<RemoteCloudSummary?>(null) }
     var confirmOverwriteRestore by remember { mutableStateOf(false) }
-    var showTrashRestoreDialog by remember { mutableStateOf(false) }
+    var isTrashExpanded by remember { mutableStateOf(false) }
+    var trashRefreshTick by remember { mutableStateOf(0) }
 
     suspend fun probeAfterConnect() {
         runCatching {
@@ -869,7 +876,7 @@ fun CloudBackupDialog(
                         }
                         OutlinedButton(
                             enabled = !isSyncing && busyActionMessage == null,
-                            onClick = { showTrashRestoreDialog = true },
+                            onClick = { isTrashExpanded = !isTrashExpanded },
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .testTag("cloud_trash_open_button")
@@ -877,10 +884,45 @@ fun CloudBackupDialog(
                             Icon(Icons.Filled.RestoreFromTrash, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(Modifier.size(6.dp))
                             Text(
-                                "Törölt jegyzetek helyreállítása (7 napos lomtár)",
+                                text = "Törölt jegyzetek helyreállítása (7 napos lomtár)",
                                 maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
                             )
+                            Icon(
+                                imageVector = if (isTrashExpanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                        AnimatedVisibility(visible = isTrashExpanded) {
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = MaterialTheme.colorScheme.surfaceContainerLow,
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("cloud_trash_dropdown_panel")
+                            ) {
+                                CloudTrashSelectableList(
+                                    database = database,
+                                    settings = settings,
+                                    prefsStore = prefsStore,
+                                    refreshTrigger = trashRefreshTick,
+                                    onRestoredNotebooks = { titles ->
+                                        val msg = if (titles.size == 1) {
+                                            "\"${titles.first()}\" helyreállítva a felhőből."
+                                        } else {
+                                            "${titles.size} jegyzet helyreállítva a felhőből."
+                                        }
+                                        feedbackMessage = msg
+                                        feedbackIsError = false
+                                        trashRefreshTick++
+                                        onBackupNotice(msg)
+                                    },
+                                    modifier = Modifier.padding(12.dp)
+                                )
+                            }
                         }
                         if (confirmOverwriteRestore) {
                             Surface(
@@ -966,27 +1008,344 @@ fun CloudBackupDialog(
             }
         }
     }
+}
 
-    if (showTrashRestoreDialog) {
-        CloudTrashRestoreDialog(
-            database = database,
-            settings = settings,
-            prefsStore = prefsStore,
-            onRestoredNotebook = { title ->
-                val msg = "\"$title\" helyreállítva a felhőből."
-                feedbackMessage = msg
-                feedbackIsError = false
-                onBackupNotice(msg)
-            },
-            onDismiss = { showTrashRestoreDialog = false }
-        )
+/**
+ * Reusable checkbox-based 7-day cloud trash browser used both inside [CloudBackupDialog]'s
+ * expandable recovery section and inside the main Bookshelf "Kuka" sidebar view.
+ * Permanent manual deletion is intentionally omitted: items auto-purge after 7 days.
+ */
+@Composable
+fun CloudTrashSelectableList(
+    database: AppDatabase,
+    settings: CloudSyncSettings,
+    prefsStore: CloudSyncPreferencesStore,
+    onRestoredNotebooks: (List<String>) -> Unit,
+    modifier: Modifier = Modifier,
+    refreshTrigger: Int = 0,
+    onOpenCloudSettings: (() -> Unit)? = null,
+    onEntriesLoaded: ((Int) -> Unit)? = null,
+    preloadedEntriesForPreview: List<TrashedNotebookRecord>? = null,
+    onRestoreActionOverride: (suspend (TrashedNotebookRecord) -> Unit)? = null
+) {
+    val context = LocalContext.current
+    val appContext = context.applicationContext
+    val scope = rememberCoroutineScope()
+    var entries by remember { mutableStateOf(preloadedEntriesForPreview ?: emptyList()) }
+    var selectedNotebookIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var isLoading by remember { mutableStateOf(preloadedEntriesForPreview == null) }
+    var isRestoring by remember { mutableStateOf(false) }
+    var statusError by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(preloadedEntriesForPreview, settings, refreshTrigger) {
+        if (preloadedEntriesForPreview != null) {
+            entries = preloadedEntriesForPreview
+            selectedNotebookIds = selectedNotebookIds.intersect(
+                preloadedEntriesForPreview.mapTo(HashSet()) { it.notebookId }
+            )
+            onEntriesLoaded?.invoke(preloadedEntriesForPreview.size)
+            isLoading = false
+            return@LaunchedEffect
+        }
+        if (!settings.isConfigured) {
+            entries = emptyList()
+            selectedNotebookIds = emptySet()
+            onEntriesLoaded?.invoke(0)
+            statusError = null
+            isLoading = false
+            return@LaunchedEffect
+        }
+        isLoading = true
+        statusError = null
+        runCatching {
+            val remoteClient = CloudSyncScheduler.createRemoteClient(appContext, settings, prefsStore)
+            val engine = CloudSyncEngine(appContext.filesDir, database)
+            // Flush pending notebook deletions first so recently deleted notes appear immediately in Trash.
+            val hasPendingNotebookDeletes = withContext(Dispatchers.IO) {
+                database.syncMetadataDao().getAllTombstones()
+                    .any { it.entityType == SyncTombstoneEntity.TYPE_NOTEBOOK }
+            }
+            if (hasPendingNotebookDeletes) {
+                runCatching { engine.syncNow(remoteClient) }
+            }
+            engine.listTrashedNotebooks(remoteClient)
+        }.onSuccess { loaded ->
+            entries = loaded
+            selectedNotebookIds = selectedNotebookIds.intersect(loaded.mapTo(HashSet()) { it.notebookId })
+            onEntriesLoaded?.invoke(loaded.size)
+        }.onFailure { err ->
+            statusError = err.message ?: "Nem sikerült lekérdezni a felhős lomtárat."
+        }
+        isLoading = false
+    }
+
+    suspend fun restoreRecords(targets: List<TrashedNotebookRecord>) {
+        if (targets.isEmpty()) return
+        isRestoring = true
+        statusError = null
+        val restoredIds = LinkedHashSet<String>()
+        val restoredTitles = ArrayList<String>(targets.size)
+        var firstError: Throwable? = null
+        val client = if (onRestoreActionOverride == null) {
+            runCatching { CloudSyncScheduler.createRemoteClient(appContext, settings, prefsStore) }
+                .getOrElse { err ->
+                    statusError = err.message ?: "Helyreállítás sikertelen."
+                    isRestoring = false
+                    return
+                }
+        } else {
+            null
+        }
+        val engine = CloudSyncEngine(appContext.filesDir, database)
+        for (rec in targets) {
+            val res = runCatching {
+                val customRestore = onRestoreActionOverride
+                if (customRestore != null) {
+                    customRestore(rec)
+                } else {
+                    engine.restoreTrashedNotebook(requireNotNull(client), rec.notebookId)
+                }
+            }
+            res.onSuccess {
+                restoredIds.add(rec.notebookId)
+                restoredTitles.add(rec.title)
+            }.onFailure { err ->
+                if (firstError == null) firstError = err
+            }
+        }
+        if (restoredIds.isNotEmpty()) {
+            val remaining = entries.filterNot { it.notebookId in restoredIds }
+            entries = remaining
+            selectedNotebookIds = selectedNotebookIds - restoredIds
+            onEntriesLoaded?.invoke(remaining.size)
+            CloudSyncScheduler.notifyDatabaseMetadataChanged(appContext)
+            onRestoredNotebooks(restoredTitles)
+        }
+        if (firstError != null) {
+            statusError = firstError?.message ?: "Helyreállítás sikertelen."
+        }
+        isRestoring = false
+    }
+
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        if (!statusError.isNullOrBlank()) {
+            Surface(
+                color = MaterialTheme.colorScheme.errorContainer,
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = statusError.orEmpty(),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    modifier = Modifier.padding(10.dp)
+                )
+            }
+        }
+
+        when {
+            !settings.isConfigured && preloadedEntriesForPreview == null -> {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "A 7 napos felhős lomtárhoz előbb csatlakoztasd a Google Drive vagy WebDAV fiókodat.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (onOpenCloudSettings != null) {
+                        Spacer(Modifier.size(8.dp))
+                        FilledTonalButtonFallback(
+                            label = "Felhő beállítása",
+                            onClick = onOpenCloudSettings
+                        )
+                    }
+                }
+            }
+            isLoading -> {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 16.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.size(10.dp))
+                    Text("Lomtár lekérdezése...", style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+            entries.isEmpty() -> {
+                Text(
+                    text = "Nincs 7 napon belül törölt jegyzet a felhős lomtárban.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(vertical = 8.dp)
+                )
+            }
+            else -> {
+                val allSelected = entries.isNotEmpty() && selectedNotebookIds.size == entries.size
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.clickable(enabled = !isRestoring) {
+                            selectedNotebookIds = if (allSelected) {
+                                emptySet()
+                            } else {
+                                entries.mapTo(LinkedHashSet()) { it.notebookId }
+                            }
+                        }
+                    ) {
+                        Checkbox(
+                            checked = allSelected,
+                            onCheckedChange = { checked ->
+                                selectedNotebookIds = if (checked) {
+                                    entries.mapTo(LinkedHashSet()) { it.notebookId }
+                                } else {
+                                    emptySet()
+                                }
+                            },
+                            enabled = !isRestoring,
+                            modifier = Modifier.testTag("cloud_trash_select_all_checkbox")
+                        )
+                        Text(
+                            text = if (selectedNotebookIds.isEmpty()) {
+                                "Összes kijelölése (${entries.size})"
+                            } else {
+                                "${selectedNotebookIds.size} kijelölve"
+                            },
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                    Button(
+                        enabled = selectedNotebookIds.isNotEmpty() && !isRestoring,
+                        onClick = {
+                            val chosen = entries.filter { it.notebookId in selectedNotebookIds }
+                            scope.launch { restoreRecords(chosen) }
+                        },
+                        modifier = Modifier.testTag("cloud_trash_restore_selected_button")
+                    ) {
+                        if (isRestoring) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp,
+                                color = MaterialTheme.colorScheme.onPrimary
+                            )
+                        } else {
+                            Icon(Icons.Filled.RestoreFromTrash, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.size(6.dp))
+                            Text("Kijelöltek helyreállítása (${selectedNotebookIds.size})")
+                        }
+                    }
+                }
+
+                val nowMs = System.currentTimeMillis()
+                entries.forEach { rec ->
+                    val isChecked = rec.notebookId in selectedNotebookIds
+                    val remDays = rec.remainingDaysRoundedUp(nowMs)
+                    val remainingLabel = if (remDays > 0) {
+                        "$remDays nap múlva törlődik végleg (${rec.formatRemainingTimeHu(nowMs)})"
+                    } else {
+                        "Lejárt • következő szinkronkor törlődik"
+                    }
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = if (isChecked) {
+                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f)
+                        } else {
+                            MaterialTheme.colorScheme.surface
+                        },
+                        border = BorderStroke(
+                            width = if (isChecked) 1.25.dp else 1.dp,
+                            color = if (isChecked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("cloud_trash_item_${rec.notebookId}")
+                            .clickable(enabled = !isRestoring) {
+                                selectedNotebookIds = if (isChecked) {
+                                    selectedNotebookIds - rec.notebookId
+                                } else {
+                                    selectedNotebookIds + rec.notebookId
+                                }
+                            }
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Checkbox(
+                                checked = isChecked,
+                                onCheckedChange = { checked ->
+                                    selectedNotebookIds = if (checked) {
+                                        selectedNotebookIds + rec.notebookId
+                                    } else {
+                                        selectedNotebookIds - rec.notebookId
+                                    }
+                                },
+                                enabled = !isRestoring,
+                                modifier = Modifier.testTag("cloud_trash_checkbox_${rec.notebookId}")
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = rec.title,
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = "${rec.pageCount} oldal • Törölve: ${formatEpochDateTime(rec.deletedAtEpochMs)}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Text(
+                                    text = remainingLabel,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            }
+                            OutlinedButton(
+                                enabled = !isRestoring,
+                                onClick = { scope.launch { restoreRecords(listOf(rec)) } },
+                                modifier = Modifier.testTag("cloud_trash_restore_${rec.notebookId}")
+                            ) {
+                                Text("Visszaállít")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FilledTonalButtonFallback(
+    label: String,
+    onClick: () -> Unit
+) {
+    OutlinedButton(onClick = onClick) {
+        Text(label, maxLines = 1, softWrap = false)
     }
 }
 
 /**
- * Recovery modal listing notebooks retained in the 7-day cloud trash (`cloud-trash.json`),
- * showing remaining retention days/hours and allowing 1-tap restore or permanent deletion.
- * Supports ESC key and backdrop click dismissal.
+ * Recovery modal wrapping [CloudTrashSelectableList] with multi-select checkboxes and
+ * 7-day retention readout. Supports ESC key and backdrop click dismissal.
  */
 @Composable
 fun CloudTrashRestoreDialog(
@@ -996,41 +1355,9 @@ fun CloudTrashRestoreDialog(
     onRestoredNotebook: (String) -> Unit,
     onDismiss: () -> Unit,
     preloadedEntriesForPreview: List<TrashedNotebookRecord>? = null,
-    onRestoreActionOverride: (suspend (TrashedNotebookRecord) -> Unit)? = null,
-    onPermanentDeleteActionOverride: (suspend (TrashedNotebookRecord) -> Unit)? = null
+    onRestoreActionOverride: (suspend (TrashedNotebookRecord) -> Unit)? = null
 ) {
-    val context = LocalContext.current
-    val appContext = context.applicationContext
-    val scope = rememberCoroutineScope()
-    var entries by remember { mutableStateOf(preloadedEntriesForPreview ?: emptyList()) }
-    var isLoading by remember { mutableStateOf(preloadedEntriesForPreview == null) }
-    var actionInProgressId by remember { mutableStateOf<String?>(null) }
-    var statusError by remember { mutableStateOf<String?>(null) }
     val focusRequester = remember { FocusRequester() }
-
-    suspend fun reloadTrashEntries() {
-        if (preloadedEntriesForPreview != null) {
-            isLoading = false
-            return
-        }
-        isLoading = true
-        statusError = null
-        runCatching {
-            val remoteClient = CloudSyncScheduler.createRemoteClient(appContext, settings, prefsStore)
-            CloudSyncEngine(appContext.filesDir, database).listTrashedNotebooks(remoteClient)
-        }.onSuccess { loaded ->
-            entries = loaded
-        }.onFailure { err ->
-            statusError = err.message ?: "Nem sikerült lekérdezni a felhős lomtárat."
-        }
-        isLoading = false
-    }
-
-    LaunchedEffect(preloadedEntriesForPreview, settings) {
-        if (preloadedEntriesForPreview == null) {
-            reloadTrashEntries()
-        }
-    }
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -1078,7 +1405,7 @@ fun CloudTrashRestoreDialog(
             Surface(
                 modifier = Modifier
                     .padding(horizontal = 24.dp, vertical = 16.dp)
-                    .widthIn(min = 340.dp, max = 560.dp)
+                    .widthIn(min = 340.dp, max = 580.dp)
                     .heightIn(max = 680.dp)
                     .pointerInput(Unit) { detectTapGestures { } }
                     .testTag("cloud_trash_dialog"),
@@ -1105,7 +1432,7 @@ fun CloudTrashRestoreDialog(
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = "A törölt jegyzetek 7 napig megmaradnak a felhőben, utána szinkronkor automatikusan törlődnek.",
+                                text = "A törölt jegyzetek 7 napig megmaradnak a felhőben, utána automatikusan törlődnek.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -1117,159 +1444,16 @@ fun CloudTrashRestoreDialog(
 
                     HorizontalDivider()
 
-                    if (!statusError.isNullOrBlank()) {
-                        Surface(
-                            color = MaterialTheme.colorScheme.errorContainer,
-                            shape = RoundedCornerShape(10.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text(
-                                text = statusError.orEmpty(),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onErrorContainer,
-                                modifier = Modifier.padding(10.dp)
-                            )
-                        }
-                    }
-
-                    when {
-                        isLoading -> {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 20.dp),
-                                horizontalArrangement = Arrangement.Center,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                CircularProgressIndicator(modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
-                                Spacer(Modifier.size(10.dp))
-                                Text("Lomtár lekérdezése...", style = MaterialTheme.typography.bodyMedium)
-                            }
-                        }
-                        entries.isEmpty() -> {
-                            Text(
-                                text = "Nincs 7 napon belül törölt jegyzet a felhős lomtárban.",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(vertical = 18.dp)
-                            )
-                        }
-                        else -> {
-                            val nowMs = System.currentTimeMillis()
-                            entries.forEach { rec ->
-                                val busyHere = actionInProgressId == rec.notebookId
-                                Surface(
-                                    shape = RoundedCornerShape(12.dp),
-                                    color = MaterialTheme.colorScheme.surfaceContainerLow,
-                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .testTag("cloud_trash_item_${rec.notebookId}")
-                                ) {
-                                    Row(
-                                        modifier = Modifier.padding(12.dp),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                    ) {
-                                        Column(modifier = Modifier.weight(1f)) {
-                                            Text(
-                                                text = rec.title,
-                                                style = MaterialTheme.typography.titleSmall,
-                                                fontWeight = FontWeight.SemiBold,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis
-                                            )
-                                            Text(
-                                                text = "${rec.pageCount} oldal • Törölve: ${formatEpochDateTime(rec.deletedAtEpochMs)}",
-                                                style = MaterialTheme.typography.bodySmall,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                                            )
-                                            Text(
-                                                text = "${rec.formatRemainingTimeHu(nowMs)} (lejárat: ${formatEpochDateTime(rec.expiresAtEpochMs)})",
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = MaterialTheme.colorScheme.primary
-                                            )
-                                        }
-                                        Button(
-                                            enabled = actionInProgressId == null,
-                                            onClick = {
-                                                scope.launch {
-                                                    actionInProgressId = rec.notebookId
-                                                    statusError = null
-                                                    runCatching {
-                                                        val customRestore = onRestoreActionOverride
-                                                        if (customRestore != null) {
-                                                            customRestore(rec)
-                                                        } else {
-                                                            val client = CloudSyncScheduler.createRemoteClient(
-                                                                appContext,
-                                                                settings,
-                                                                prefsStore
-                                                            )
-                                                            CloudSyncEngine(appContext.filesDir, database)
-                                                                .restoreTrashedNotebook(client, rec.notebookId)
-                                                        }
-                                                    }.onSuccess {
-                                                        entries = entries.filterNot { it.notebookId == rec.notebookId }
-                                                        CloudSyncScheduler.notifyDatabaseMetadataChanged(appContext)
-                                                        onRestoredNotebook(rec.title)
-                                                    }.onFailure { err ->
-                                                        statusError = err.message ?: "Helyreállítás sikertelen."
-                                                    }
-                                                    actionInProgressId = null
-                                                }
-                                            },
-                                            modifier = Modifier.testTag("cloud_trash_restore_${rec.notebookId}")
-                                        ) {
-                                            if (busyHere) {
-                                                CircularProgressIndicator(
-                                                    modifier = Modifier.size(16.dp),
-                                                    strokeWidth = 2.dp
-                                                )
-                                            } else {
-                                                Text("Visszaállít")
-                                            }
-                                        }
-                                        IconButton(
-                                            enabled = actionInProgressId == null,
-                                            onClick = {
-                                                scope.launch {
-                                                    actionInProgressId = rec.notebookId
-                                                    statusError = null
-                                                    runCatching {
-                                                        val customDel = onPermanentDeleteActionOverride
-                                                        if (customDel != null) {
-                                                            customDel(rec)
-                                                        } else {
-                                                            val client = CloudSyncScheduler.createRemoteClient(
-                                                                appContext,
-                                                                settings,
-                                                                prefsStore
-                                                            )
-                                                            CloudSyncEngine(appContext.filesDir, database)
-                                                                .permanentlyDeleteTrashedNotebook(client, rec.notebookId)
-                                                        }
-                                                    }.onSuccess {
-                                                        entries = entries.filterNot { it.notebookId == rec.notebookId }
-                                                    }.onFailure { err ->
-                                                        statusError = err.message ?: "Végleges törlés sikertelen."
-                                                    }
-                                                    actionInProgressId = null
-                                                }
-                                            },
-                                            modifier = Modifier.testTag("cloud_trash_purge_${rec.notebookId}")
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Filled.DeleteForever,
-                                                contentDescription = "Végleges törlés",
-                                                tint = MaterialTheme.colorScheme.error
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    CloudTrashSelectableList(
+                        database = database,
+                        settings = settings,
+                        prefsStore = prefsStore,
+                        onRestoredNotebooks = { titles ->
+                            titles.forEach { onRestoredNotebook(it) }
+                        },
+                        preloadedEntriesForPreview = preloadedEntriesForPreview,
+                        onRestoreActionOverride = onRestoreActionOverride
+                    )
                 }
             }
         }

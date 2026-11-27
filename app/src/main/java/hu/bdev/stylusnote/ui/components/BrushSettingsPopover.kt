@@ -90,6 +90,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.datastore.core.DataStore
@@ -235,10 +236,20 @@ private val QUICK_COLOR_PALETTE = listOf(
     0xFFFACC15.toInt()
 )
 
-private val QUICK_SIZE_PRESETS_PT = listOf(0.5f, 1.0f, 2.0f, 4.0f, 8.0f)
+private val QUICK_SIZE_PRESETS_PT = listOf(0.5f, 0.75f, 1.0f, 2.0f, 4.0f)
 private val QUICK_HIGHLIGHTER_SIZE_PRESETS_PT = listOf(8.0f, 12.0f, 16.0f, 24.0f)
 private val QUICK_CLOZE_HEIGHT_PRESETS_PT = listOf(12.0f, 18.0f, 24.0f, 34.0f)
 private val QUICK_ERASER_RADII_DP = listOf(12f, 20f, 32f, 44f)
+
+/** Formats stroke point sizes without rounding `0.75` to `0.8`, omitting trailing `.0`. */
+internal fun formatBrushSizePt(sizePt: Float): String {
+    val hundredths = kotlin.math.round(sizePt * 100f).toInt()
+    return when {
+        hundredths % 100 == 0 -> "${hundredths / 100}"
+        hundredths % 10 == 0 -> java.lang.String.format(java.util.Locale.US, "%.1f", hundredths / 100f)
+        else -> java.lang.String.format(java.util.Locale.US, "%.2f", hundredths / 100f)
+    }
+}
 
 /**
  * Computes an anchored viewport offset placing the popover adjacent to [anchorBoundsPx]
@@ -776,7 +787,7 @@ fun BrushSettingsPopover(
                             StudioSectionCard {
                                 SettingSliderHeader(
                                     title = "Vastagság",
-                                    valueBadge = "${"%.1f".format(java.util.Locale.US, currentConfig.clampedSizePt)} pt"
+                                    valueBadge = "${formatBrushSizePt(currentConfig.clampedSizePt)} pt"
                                 )
                                 if (currentConfig.toolType.isHighlighter) {
                                     Row(
@@ -817,7 +828,7 @@ fun BrushSettingsPopover(
                                         QUICK_SIZE_PRESETS_PT
                                     }
                                     sizePresets.forEach { presetPt ->
-                                        val isSelected = kotlin.math.abs(currentConfig.clampedSizePt - presetPt) < 0.2f
+                                        val isSelected = kotlin.math.abs(currentConfig.clampedSizePt - presetPt) < 0.1f
                                         Surface(
                                             onClick = {
                                                 if (currentConfig.toolType.isHighlighter && highlighterAutoSize) {
@@ -840,7 +851,8 @@ fun BrushSettingsPopover(
                                         ) {
                                             Row(
                                                 verticalAlignment = Alignment.CenterVertically,
-                                                horizontalArrangement = Arrangement.Center
+                                                horizontalArrangement = Arrangement.Center,
+                                                modifier = Modifier.padding(horizontal = 2.dp)
                                             ) {
                                                 Box(
                                                     modifier = Modifier
@@ -850,10 +862,12 @@ fun BrushSettingsPopover(
                                                 )
                                                 Spacer(modifier = Modifier.width(2.dp))
                                                 Text(
-                                                    text = if (presetPt % 1f == 0f) "${presetPt.toInt()}" else "$presetPt",
-                                                    style = MaterialTheme.typography.labelMedium,
+                                                    text = formatBrushSizePt(presetPt),
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    fontSize = 11.sp,
                                                     fontWeight = FontWeight.SemiBold,
-                                                    maxLines = 1
+                                                    maxLines = 1,
+                                                    softWrap = false
                                                 )
                                             }
                                         }

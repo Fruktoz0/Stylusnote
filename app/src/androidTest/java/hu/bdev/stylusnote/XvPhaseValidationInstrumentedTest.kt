@@ -13,12 +13,17 @@ import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.click
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performKeyInput
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.pressKey
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.geometry.Rect
 import androidx.room.Room
 import androidx.room.testing.MigrationTestHelper
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -34,8 +39,11 @@ import hu.bdev.stylusnote.data.local.FolderEntity
 import hu.bdev.stylusnote.data.local.PendingDriveFolderDeletionEntity
 import hu.bdev.stylusnote.domain.model.BrushConfig
 import hu.bdev.stylusnote.domain.model.BrushToolType
+import hu.bdev.stylusnote.ui.components.BrushSettingsPopover
 import hu.bdev.stylusnote.ui.components.RadialPieMenuOverlay
+import hu.bdev.stylusnote.ui.shelf.BookshelfScreen
 import hu.bdev.stylusnote.ui.shelf.CloudTrashRestoreDialog
+import hu.bdev.stylusnote.ui.shelf.CloudTrashSelectableList
 import hu.bdev.stylusnote.ui.shelf.DeleteCategoryConfirmDialog
 import hu.bdev.stylusnote.ui.theme.StylusNoteTheme
 import kotlinx.coroutines.runBlocking
@@ -133,8 +141,8 @@ class XvPhaseValidationInstrumentedTest {
         val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java).build()
         val prefsStore = CloudSyncPreferencesStore(context)
         val now = System.currentTimeMillis()
-        val sampleEntry = TrashedNotebookRecord(
-            notebookId = "nb-trash-ui",
+        val sampleEntry1 = TrashedNotebookRecord(
+            notebookId = "nb-trash-ui-1",
             title = "Kémia ZH",
             folderId = null,
             pageCount = 4,
@@ -142,8 +150,17 @@ class XvPhaseValidationInstrumentedTest {
             expiresAtEpochMs = now - 3_600_000L + TRASH_RETENTION_MS,
             manifestSnapshotBase64 = "AAAA"
         )
+        val sampleEntry2 = TrashedNotebookRecord(
+            notebookId = "nb-trash-ui-2",
+            title = "Biológia Jegyzet",
+            folderId = null,
+            pageCount = 2,
+            deletedAtEpochMs = now - 7_200_000L,
+            expiresAtEpochMs = now - 7_200_000L + TRASH_RETENTION_MS,
+            manifestSnapshotBase64 = "BBBB"
+        )
         var showDialog by mutableStateOf(true)
-        var restoredTitle by mutableStateOf<String?>(null)
+        val restoredTitles = mutableListOf<String>()
 
         try {
             composeRule.setContent {
@@ -157,9 +174,9 @@ class XvPhaseValidationInstrumentedTest {
                                     googleDriveAccountEmail = "teszt@example.com"
                                 ),
                                 prefsStore = prefsStore,
-                                onRestoredNotebook = { title -> restoredTitle = title },
+                                onRestoredNotebook = { title -> restoredTitles.add(title) },
                                 onDismiss = { showDialog = false },
-                                preloadedEntriesForPreview = listOf(sampleEntry),
+                                preloadedEntriesForPreview = listOf(sampleEntry1, sampleEntry2),
                                 onRestoreActionOverride = {}
                             )
                         }
@@ -167,10 +184,17 @@ class XvPhaseValidationInstrumentedTest {
                 }
             }
             composeRule.waitForIdle()
-            composeRule.onNodeWithTag("cloud_trash_item_nb-trash-ui").assertIsDisplayed()
-            composeRule.onNodeWithTag("cloud_trash_restore_nb-trash-ui").performClick()
+            composeRule.onNodeWithTag("cloud_trash_item_nb-trash-ui-1").assertIsDisplayed()
+            composeRule.onNodeWithTag("cloud_trash_item_nb-trash-ui-2").assertIsDisplayed()
+            // Permanent delete must NEVER be present in Trash UI
+            composeRule.onNodeWithTag("cloud_trash_purge_nb-trash-ui-1").assertDoesNotExist()
+            composeRule.onNodeWithContentDescription("Végleges törlés").assertDoesNotExist()
+            // Multi-select checkboxes + batch restore
+            composeRule.onNodeWithTag("cloud_trash_checkbox_nb-trash-ui-1").performClick()
+            composeRule.onNodeWithTag("cloud_trash_checkbox_nb-trash-ui-2").performClick()
+            composeRule.onNodeWithTag("cloud_trash_restore_selected_button").performClick()
             composeRule.waitForIdle()
-            assertEquals("Kémia ZH", restoredTitle)
+            assertEquals(listOf("Kémia ZH", "Biológia Jegyzet"), restoredTitles)
 
             // Backdrop click dismisses cleanly
             composeRule.onNodeWithTag("cloud_trash_backdrop").performTouchInput { click(Offset(8f, 8f)) }
@@ -186,6 +210,58 @@ class XvPhaseValidationInstrumentedTest {
         } finally {
             db.close()
         }
+    }
+
+    @Test
+    fun xviBookshelfTrashSidebarNavigatesAndHidesPermanentDelete() {
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java).build()
+        try {
+            composeRule.setContent {
+                StylusNoteTheme {
+                    BookshelfScreen(
+                        database = db,
+                        isDarkTheme = false,
+                        onToggleTheme = {},
+                        onOpenSinglePage = {}
+                    )
+                }
+            }
+            composeRule.waitForIdle()
+            composeRule.onNodeWithText("Könyvjelzők").assertIsDisplayed()
+            composeRule.onNodeWithTag("sidebar_trash_item").assertIsDisplayed().performClick()
+            composeRule.waitForIdle()
+            composeRule.onNodeWithTag("bookshelf_trash_view").assertIsDisplayed()
+            composeRule.onNodeWithContentDescription("Végleges törlés").assertDoesNotExist()
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
+    fun xviFountainPenQuickSizesShowHalfToFourPointWithoutEight() {
+        var currentBrush by mutableStateOf(BrushConfig(toolType = BrushToolType.FOUNTAIN_PEN, sizePt = 0.75f))
+        composeRule.setContent {
+            StylusNoteTheme {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    BrushSettingsPopover(
+                        currentConfig = currentBrush,
+                        presets = emptyList(),
+                        anchorBoundsPx = Rect(16f, 16f, 200f, 80f),
+                        viewportSize = IntSize(1200, 900),
+                        onConfigChange = { currentBrush = it },
+                        onSavePresetSlot = { _, _ -> },
+                        onApplyPreset = { currentBrush = it },
+                        onDismiss = {}
+                    )
+                }
+            }
+        }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("0.5").assertIsDisplayed()
+        composeRule.onNodeWithText("0.75").assertIsDisplayed()
+        composeRule.onNodeWithText("0.75 pt").assertIsDisplayed()
+        composeRule.onNodeWithText("4").assertIsDisplayed()
+        assertEquals(0, composeRule.onAllNodesWithText("8").fetchSemanticsNodes().size)
     }
 
     @OptIn(ExperimentalTestApi::class)
